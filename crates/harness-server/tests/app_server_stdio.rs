@@ -504,6 +504,40 @@ fn fake_amp_blocks_mode_accepts_user_blocks_by_default() {
 }
 
 #[test]
+fn fake_claude_blocks_mode_steers_active_turn() {
+    let fake_claude = concat!(
+        "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"claude-session\"}'; ",
+        "IFS= read -r _; ",
+        "IFS= read -r steer; ",
+        "printf '%s\\n' ",
+        "'{\"type\":\"assistant\",\"is_partial\":false,\"message\":{\"id\":\"msg_1\",\"content\":[{\"type\":\"text\",\"text\":\"steered blocks\"}]}}' ",
+        "'{\"type\":\"result\",\"subtype\":\"success\",\"result\":\"steered blocks\"}'"
+    );
+    let mut bridge = BridgeProcess::spawn_harness_blocks(
+        Harness::ClaudeCode,
+        Some(fake_claude.to_string()),
+        None,
+    );
+    let turn = bridge.run_blocks_steered_turn(
+        "start a long turn",
+        "use this update",
+        Duration::from_secs(10),
+    );
+    let _ = bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.text_from_deltas, "steered blocks");
+    assert_eq!(
+        turn.methods
+            .iter()
+            .filter(|method| method.as_str() == "item/started")
+            .count(),
+        3,
+        "initial user, steered user, and assistant items should all start"
+    );
+}
+
+#[test]
 fn fake_claude_blocks_mode_interrupts_back_to_back_stop() {
     let fake_claude = concat!(
         "printf '%s\\n' ",
@@ -658,6 +692,65 @@ fn fake_codex_blocks_mode_interrupts_active_turn() {
     assert_eq!(
         interrupt.pointer("/params/turnId").and_then(Value::as_str),
         Some("turn-1")
+    );
+
+    let _ = std::fs::remove_file(fake_codex);
+    let _ = std::fs::remove_file(fake_codex_log);
+}
+
+#[test]
+fn fake_codex_blocks_mode_steers_active_turn() {
+    let fake_codex = temp_path("fake-steerable-codex.sh");
+    let fake_codex_log = temp_path("fake-steerable-codex-requests.jsonl");
+    let script = fake_codex_steerable_app_server_script(&fake_codex_log);
+    std::fs::write(&fake_codex, script).expect("write fake codex script");
+    let mut permissions = std::fs::metadata(&fake_codex)
+        .expect("fake codex metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&fake_codex, permissions).expect("chmod fake codex script");
+
+    let mut bridge = BridgeProcess::spawn_harness_blocks(
+        Harness::Codex,
+        None,
+        Some((
+            "CODEX_BIN",
+            fake_codex.to_str().expect("utf-8 fake codex path"),
+        )),
+    );
+    let turn = bridge.run_blocks_steered_turn(
+        "start a long turn",
+        "use this update",
+        Duration::from_secs(10),
+    );
+    let _ = bridge.finish_successfully();
+
+    assert_completed_turn(&turn);
+    assert_eq!(turn.text_from_deltas, "steered answer");
+    let requests = std::fs::read_to_string(&fake_codex_log).expect("read fake codex request log");
+    let requests: Vec<Value> = requests
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("fake codex request JSON"))
+        .collect();
+    let steer = requests
+        .iter()
+        .find(|value| value.get("method").and_then(Value::as_str) == Some("turn/steer"))
+        .unwrap_or_else(|| panic!("blocks mode did not send turn/steer; requests={requests:?}"));
+    assert_eq!(
+        steer.pointer("/params/threadId").and_then(Value::as_str),
+        Some("thread-1")
+    );
+    assert_eq!(
+        steer
+            .pointer("/params/expectedTurnId")
+            .and_then(Value::as_str),
+        Some("turn-1")
+    );
+    assert_eq!(
+        steer
+            .pointer("/params/input/0/text")
+            .and_then(Value::as_str),
+        Some("use this update")
     );
 
     let _ = std::fs::remove_file(fake_codex);
@@ -1752,6 +1845,42 @@ impl BridgeProcess {
         capture
     }
 
+    fn run_blocks_steered_turn(
+        &mut self,
+        prompt: &str,
+        steer: &str,
+        timeout: Duration,
+    ) -> TurnCapture {
+        for (text, action) in [(prompt, "execute"), (steer, "steer_active_execution")] {
+            self.send(json!({
+                "type": "user",
+                "thread_key": "slack:C123:123.456",
+                "trace_metadata": { "source": "test", "action": action },
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "text", "text": text}],
+                },
+            }));
+        }
+
+        let deadline = Instant::now() + timeout;
+        let mut capture = TurnCapture::default();
+        loop {
+            let value = self.read_json(deadline);
+            assert!(
+                response_id(&value).is_none(),
+                "blocks mode emitted response: {value}"
+            );
+            if let Some(method) = value.get("method").and_then(Value::as_str) {
+                capture.consume_notification(method, &value);
+                if method == "turn/completed" {
+                    break;
+                }
+            }
+        }
+        capture
+    }
+
     fn send(&mut self, value: Value) {
         eprintln!("stdin JSON: {value}");
         let stdin = self.stdin.as_mut().expect("stdin still open");
@@ -2277,6 +2406,55 @@ while IFS= read -r line; do
       printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"answer-1","delta":"codex blocks"}}'
       printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"type":"agentMessage","id":"answer-1","text":"codex blocks","phase":null,"memoryCitation":null},"completedAtMs":2}}'
       printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[{"type":"agentMessage","id":"answer-1","text":"codex blocks","phase":null,"memoryCitation":null}],"itemsView":"full","status":"completed","error":null,"startedAt":1,"completedAt":2,"durationMs":1}}}'
+      ;;
+    *)
+      printf '%s\n' "unexpected request: $line" >&2
+      exit 65
+      ;;
+  esac
+done
+"#,
+    );
+    script
+}
+
+fn fake_codex_steerable_app_server_script(log_path: &Path) -> String {
+    let mut script = String::new();
+    script.push_str("#!/bin/sh\n");
+    script.push_str("log=");
+    script.push_str(&shell_quote(log_path));
+    script.push_str(
+        r#"
+touch "$log"
+if [ "${1:-}" = "app-server" ] && [ "${2:-}" = "--help" ]; then
+  printf '%s\n' '--listen stdio://'
+  exit 0
+fi
+request_id() {
+  printf '%s' "$1" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'
+}
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$log"
+  case "$line" in
+    *'"method":"initialize"'*)
+      id=$(request_id "$line")
+      printf '{"id":%s,"result":{"userAgent":"fake-codex"}}\n' "$id"
+      ;;
+    *'"method":"thread/start"'*)
+      id=$(request_id "$line")
+      printf '{"id":%s,"result":{"thread":{"id":"thread-1"}}}\n' "$id"
+      ;;
+    *'"method":"turn/start"'*)
+      id=$(request_id "$line")
+      printf '{"id":%s,"result":{"turn":{"id":"turn-1"}}}\n' "$id"
+      printf '%s\n' '{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[],"itemsView":"full","status":"inProgress","error":null,"startedAt":1,"completedAt":null,"durationMs":null}}}'
+      ;;
+    *'"method":"turn/steer"'*)
+      id=$(request_id "$line")
+      printf '{"id":%s,"result":{"turnId":"turn-1"}}\n' "$id"
+      printf '%s\n' '{"method":"item/agentMessage/delta","params":{"threadId":"thread-1","turnId":"turn-1","itemId":"answer-1","delta":"steered answer"}}'
+      printf '%s\n' '{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"type":"agentMessage","id":"answer-1","text":"steered answer","phase":null,"memoryCitation":null},"completedAtMs":2}}'
+      printf '%s\n' '{"method":"turn/completed","params":{"threadId":"thread-1","turn":{"id":"turn-1","items":[{"type":"agentMessage","id":"answer-1","text":"steered answer","phase":null,"memoryCitation":null}],"itemsView":"full","status":"completed","error":null,"startedAt":1,"completedAt":2,"durationMs":1}}}'
       ;;
     *)
       printf '%s\n' "unexpected request: $line" >&2

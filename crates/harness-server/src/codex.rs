@@ -153,6 +153,21 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                             break;
                         }
                     }
+                    Ok(BlocksCommand::User {
+                        input,
+                        client_user_message_id,
+                        ..
+                    }) if turn_active.load(Ordering::SeqCst) => {
+                        if active_turn_tx
+                            .send(CodexActiveTurnRequest::Steer {
+                                input,
+                                client_user_message_id,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Ok(command @ BlocksCommand::User { .. }) => {
                         turn_active.store(true, Ordering::SeqCst);
                         if command_tx
@@ -258,6 +273,10 @@ enum CodexBlocksReaderInput {
 }
 
 enum CodexActiveTurnRequest {
+    Steer {
+        input: Vec<UserInput>,
+        client_user_message_id: Option<String>,
+    },
     Interrupt,
 }
 
@@ -588,10 +607,18 @@ impl CodexJsonRpcChild {
         let mut guard = TurnGuard::default();
         let mut interrupt_request_id = None;
         loop {
+            self.forward_pending_active_turn_requests(
+                active_turn_rx,
+                &mut interrupt_request_id,
+                request_id,
+                thread_id,
+                turn_id,
+                traceparent,
+            )?;
             let value = match self.read_value_timeout(Duration::from_millis(50))? {
                 Some(value) => value,
                 None => {
-                    self.forward_pending_interrupt(
+                    self.forward_pending_active_turn_requests(
                         active_turn_rx,
                         &mut interrupt_request_id,
                         request_id,
@@ -637,7 +664,7 @@ impl CodexJsonRpcChild {
                     return Ok(TurnTermination::Done);
                 }
             }
-            self.forward_pending_interrupt(
+            self.forward_pending_active_turn_requests(
                 active_turn_rx,
                 &mut interrupt_request_id,
                 request_id,
@@ -648,7 +675,7 @@ impl CodexJsonRpcChild {
         }
     }
 
-    fn forward_pending_interrupt(
+    fn forward_pending_active_turn_requests(
         &mut self,
         active_turn_rx: &Receiver<CodexActiveTurnRequest>,
         interrupt_request_id: &mut Option<i64>,
@@ -657,22 +684,41 @@ impl CodexJsonRpcChild {
         turn_id: &str,
         traceparent: Option<&str>,
     ) -> Result<()> {
-        while let Ok(CodexActiveTurnRequest::Interrupt) = active_turn_rx.try_recv() {
-            if interrupt_request_id.is_some() {
-                eprintln!("Codex blocks interrupt ignored: interrupt already requested");
-                continue;
+        while let Ok(request) = active_turn_rx.try_recv() {
+            match request {
+                CodexActiveTurnRequest::Steer {
+                    input,
+                    client_user_message_id,
+                } => {
+                    let id = next_request_id(request_id);
+                    let mut params = json!({
+                        "threadId": thread_id,
+                        "expectedTurnId": turn_id,
+                        "input": input,
+                    });
+                    if let Some(client_user_message_id) = client_user_message_id {
+                        params["clientUserMessageId"] = Value::String(client_user_message_id);
+                    }
+                    self.send_request(id, "turn/steer", params, traceparent)?;
+                }
+                CodexActiveTurnRequest::Interrupt => {
+                    if interrupt_request_id.is_some() {
+                        eprintln!("Codex blocks interrupt ignored: interrupt already requested");
+                        continue;
+                    }
+                    let id = next_request_id(request_id);
+                    self.send_request(
+                        id,
+                        "turn/interrupt",
+                        json!({
+                            "threadId": thread_id,
+                            "turnId": turn_id,
+                        }),
+                        traceparent,
+                    )?;
+                    *interrupt_request_id = Some(id);
+                }
             }
-            let id = next_request_id(request_id);
-            self.send_request(
-                id,
-                "turn/interrupt",
-                json!({
-                    "threadId": thread_id,
-                    "turnId": turn_id,
-                }),
-                traceparent,
-            )?;
-            *interrupt_request_id = Some(id);
         }
         Ok(())
     }

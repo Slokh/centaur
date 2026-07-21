@@ -108,6 +108,21 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                             break;
                         }
                     }
+                    Ok(BlocksCommand::User {
+                        input,
+                        client_user_message_id,
+                        ..
+                    }) if turn_active.load(Ordering::SeqCst) => {
+                        if request_tx
+                            .send(ActiveTurnRequest::BlocksSteer {
+                                input,
+                                client_user_message_id,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                     Ok(command @ BlocksCommand::User { .. }) => {
                         turn_active.store(true, Ordering::SeqCst);
                         if command_tx
@@ -230,6 +245,9 @@ pub(crate) fn run_app_server<H: HarnessServer>(harness: &H) -> Result<()> {
             ActiveTurnRequest::BlocksInterrupt => {
                 eprintln!("blocks interrupt ignored: no active turn runs");
             }
+            ActiveTurnRequest::BlocksSteer { .. } => {
+                eprintln!("blocks steer ignored: no active turn runs");
+            }
         }
     }
 
@@ -276,6 +294,10 @@ enum BlocksReaderInput {
 
 enum ActiveTurnRequest {
     JsonRpc(JSONRPCRequest),
+    BlocksSteer {
+        input: Vec<UserInput>,
+        client_user_message_id: Option<String>,
+    },
     BlocksInterrupt,
 }
 
@@ -1088,9 +1110,23 @@ fn handle_active_turn_request<H: HarnessServer, W: Write>(
     request: ActiveTurnRequest,
     stdout: &mut W,
 ) -> Result<bool> {
-    let ActiveTurnRequest::JsonRpc(request) = request else {
-        process.kill_and_wait()?;
-        return Ok(true);
+    let request = match request {
+        ActiveTurnRequest::BlocksSteer {
+            input,
+            client_user_message_id,
+        } => {
+            process.stdin.write_all(&harness.stdin_for_steer(&input)?)?;
+            process.stdin.flush()?;
+            for notification in normalizer.emit_user_message(client_user_message_id, input)? {
+                write_value(stdout, &notification_to_wire_value(&notification)?)?;
+            }
+            return Ok(false);
+        }
+        ActiveTurnRequest::BlocksInterrupt => {
+            process.kill_and_wait()?;
+            return Ok(true);
+        }
+        ActiveTurnRequest::JsonRpc(request) => request,
     };
 
     match request.method.as_str() {
