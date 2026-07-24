@@ -1,11 +1,12 @@
 diff --git a/dist/index.js b/dist/index.js
-index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f32ccc951 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -31,6 +31,216 @@ import {
-   toModalElement,
-   toPlainText
- } from "chat";
+@@ -81,7 +81,218 @@
+   const raw = message.raw;
+   const context = raw?.app_context;
+   return context ? normalizeAppContextEntities(context) : [];
++}
++
 +var STREAM_BUFFER_SIZE = 256;
 +var STREAM_SEGMENT_LIMIT = 11500;
 +var STREAM_CHUNK_LIMIT = 256;
@@ -193,7 +194,7 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
 +  }
 +  const suffix = `:part:${index + 1}`;
 +  return `${truncateText(id, STREAM_CHUNK_LIMIT - suffix.length)}${suffix}`;
-+}
+ }
 +function taskTitle(title, index, total) {
 +  if (total === 1) {
 +    return truncateText(title, STREAM_CHUNK_LIMIT);
@@ -219,10 +220,10 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
  
  // src/cards.ts
  import {
-@@ -352,6 +562,15 @@ import {
+@@ -507,6 +718,15 @@
+   stringifyMarkdown,
+   tableToAscii
  } from "chat";
- var BARE_MENTION_PATTERN = /(?<![<\w/])@(\w+)/g;
- var URL_PATTERN = /\bhttps?:\/\/[^\s<>]+/g;
 +function plainTextPreservingBlocks(node) {
 +  if (node.type === "root" || node.type === "blockquote") {
 +    return getNodeChildren(node).map(plainTextPreservingBlocks).filter(Boolean).join(node.type === "root" ? "\n\n" : "\n");
@@ -235,25 +236,25 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
  var SlackFormatConverter = class extends BaseFormatConverter {
    /**
     * Render an AST to standard markdown. Slack accepts this directly via
-@@ -366,6 +585,17 @@ var SlackFormatConverter = class extends BaseFormatConverter {
-   toAst(mrkdwn) {
+@@ -522,6 +742,17 @@
      return parseMarkdown(slackMrkdwnToMarkdown(mrkdwn));
    }
-+  /**
+   /**
 +   * Extract plain text for incoming `message` events. The base implementation
 +   * flattens the whole AST with mdast-util-to-string, which concatenates
 +   * sibling block nodes with NO separator: `--model=fable\n\nexamine ...`
 +   * became `--model=fableexamine ...`, gluing every paragraph boundary in the
-+   * message. Preserve block boundaries instead — paragraphs join with a blank
++   * message. Preserve block boundaries instead: paragraphs join with a blank
 +   * line, list items and blockquote lines with a newline.
 +   */
 +  extractPlainText(mrkdwn) {
 +    return plainTextPreservingBlocks(this.toAst(mrkdwn));
 +  }
-   /**
++  /**
     * Build the Slack API payload fields for a message.
     *
-@@ -2004,7 +2234,10 @@ var SlackAdapter = class _SlackAdapter {
+    * - `string` / `{ raw }` → `{ text }` (plain — preserves literal `*`, `_`, etc.)
+@@ -2233,7 +2464,10 @@
        channel: event.channel,
        threadTs
      });
@@ -262,10 +263,10 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
 +      this._botUserId && typeof event.text === "string" && (event.text.includes(`<@${this._botUserId}>`) || event.text.includes(`<@${this._botUserId}|`))
 +    );
 +    const isMention = event.type === "app_mention" || botMentioned && (event.bot_id || event.subtype === "bot_message");
-     const factory = async () => {
-       const msg = await this.parseSlackMessage(event, threadId);
+     const makeFactory = (id) => async () => {
+       const msg = await this.parseSlackMessage(event, id);
        if (isMention) {
-@@ -2520,10 +2753,10 @@ var SlackAdapter = class _SlackAdapter {
+@@ -2860,10 +3094,10 @@
        formatted: this.formatConverter.toAst(text),
        raw: event,
        author: {
@@ -278,16 +279,20 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
          isMe
        },
        metadata: {
-@@ -3452,26 +3685,251 @@ var SlackAdapter = class _SlackAdapter {
+@@ -3789,158 +4023,406 @@
      }
      this.logger.debug("Slack: starting stream", { channel, threadTs });
      const token = await this.getToken();
 -    const streamer = this._client.chatStream({
 -      channel,
 -      thread_ts: threadTs,
--      recipient_user_id: options.recipientUserId,
--      recipient_team_id: options.recipientTeamId,
--      ...options.taskDisplayMode && {
+-      ...options?.recipientUserId && {
+-        recipient_user_id: options.recipientUserId
+-      },
+-      ...options?.recipientTeamId && {
+-        recipient_team_id: options.recipientTeamId
+-      },
+-      ...options?.taskDisplayMode && {
 -        task_display_mode: options.taskDisplayMode
 -      }
 +    const createSegment = () => ({
@@ -302,10 +307,14 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
 +      streamer: this._client.chatStream({
 +        channel,
 +        thread_ts: threadTs,
-+        recipient_user_id: options.recipientUserId,
-+        recipient_team_id: options.recipientTeamId,
-+        ...options.taskDisplayMode && {
-+          task_display_mode: options.taskDisplayMode
++        ...options?.recipientUserId && {
++          recipient_user_id: options.recipientUserId
++        },
++        ...options?.recipientTeamId && {
++          recipient_team_id: options.recipientTeamId
++        },
++        ...options?.taskDisplayMode && {
++          task_display_mode: options?.taskDisplayMode
 +        },
 +        buffer_size: STREAM_BUFFER_SIZE
 +      })
@@ -323,6 +332,14 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
      const renderer = new StreamingMarkdownRenderer({
        wrapTablesForAppend: false
      });
+-    const fallback = { message: null, mode: "native", nativeRendered: false };
+-    const updateIntervalMs = options?.updateIntervalMs ?? 1e3;
+-    let fallbackSent = "";
+-    let lastFallbackEditAt = 0;
+-    const flushFallback = async (force) => {
+-      const committable = renderer.getCommittableText();
+-      if (committable.length === 0 || committable === fallbackSent) {
+-        return;
 +    const isExpired = (segment) => Date.now() - segment.startedAt >= streamSegmentMaxAgeMs();
 +    const taskIsOpen = (chunk) => chunk.type === "task_update" && (chunk.status === "in_progress" || chunk.status === "pending");
 +    const appendSegmentTaskChunk = async (segment, chunk) => {
@@ -334,13 +351,19 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
 +      if (size > previous) {
 +        segment.taskCharsTotal += size - previous;
 +        segment.taskChars.set(key, size);
-+      }
+       }
+-      const now = Date.now();
+-      if (!(force || now - lastFallbackEditAt >= updateIntervalMs)) {
 +      segment.tasks.set(key, chunk);
 +    };
 +    const completeSegmentOpenTasks = async (segment) => {
 +      if (segment.stopped) {
-+        return;
-+      }
+         return;
+       }
+-      if (fallback.message) {
+-        await this.editMessage(threadId, fallback.message.id, committable);
+-      } else {
+-        fallback.message = await this.postMessage(threadId, committable);
 +      for (const task of Array.from(segment.tasks.values())) {
 +        if (!taskIsOpen(task)) {
 +          continue;
@@ -349,12 +372,23 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
 +          ...task,
 +          status: "complete"
 +        });
-+      }
-+    };
+       }
+-      fallbackSent = committable;
+-      lastFallbackEditAt = now;
+     };
+-    const switchToFallback = (error) => {
+-      fallback.mode = "fallback";
+-      const platformError = slackPlatformErrorCode(error);
+-      if (platformError && NATIVE_STREAMING_UNSUPPORTED_ERRORS.has(platformError)) {
+-        this.nativeStreamingBroken = true;
 +    const stopSegment = async (segment, blocks, force = false, sealProgress = true) => {
 +      if (segment.stopped || !(segment.hasContent || force)) {
 +        return void 0;
-+      }
+       }
+-      this.logger.warn(
+-        "Slack native streaming unavailable, falling back to post-and-edit",
+-        { channel, error }
+-      );
 +      let result;
 +      try {
 +        if (sealProgress) {
@@ -373,14 +407,20 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
 +        provisionalResult = result;
 +      }
 +      return result;
-+    };
+     };
+-    const flushCommitted = async (force = false) => {
+-      if (fallback.mode === "fallback") {
+-        await flushFallback(force);
+-        return;
 +    const unmapSegment = (segment) => {
 +      structured.delete(segment);
 +      for (const [id, taskSegment] of taskSegments) {
 +        if (taskSegment === segment) {
 +          taskSegments.delete(id);
 +        }
-+      }
+       }
+-      const committable = renderer.getCommittableText();
+-      const delta = committable.slice(lastAppended.length);
 +    };
 +    const retireSegment = async (segment, reason) => {
 +      try {
@@ -443,19 +483,31 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
 +        current.length += opening.length;
 +      }
 +    };
-     const flushMarkdownDelta = async (delta) => {
++    const flushMarkdownDelta = async (delta) => {
        if (delta.length === 0) {
          return;
        }
--      await streamer.append({ markdown_text: delta, token });
+-      try {
+-        const response = await streamer.append({
+-          markdown_text: delta,
+-          token
+-        });
+-        if (response) {
+-          fallback.nativeRendered = true;
 +      let remaining = delta;
 +      while (remaining.length > 0) {
 +        if (isExpired(current)) {
 +          await rotateCurrentForAge();
-+        }
+         }
+-        lastAppended = committable;
+-      } catch (error) {
+-        if (fallback.nativeRendered) {
+-          throw error;
 +        if (current.length === STREAM_SEGMENT_LIMIT || segmentMarkdownAvailable(current) === 0 && current.hasContent) {
 +          await rotateSegment(fence.closing, fence.opening);
-+        }
+         }
+-        switchToFallback(error);
+-        await flushFallback(force);
 +        const available = segmentMarkdownAvailable(current);
 +        const first = remaining.codePointAt(0);
 +        const width = first !== void 0 && first > 65535 ? 2 : 1;
@@ -480,7 +532,7 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
 +        if (remaining.length > 0) {
 +          await rotateSegment(fence.closing, fence.opening);
 +        }
-+      }
+       }
      };
      let structuredChunksSupported = true;
 +    const appendStructuredChunk = async (segment, chunk) => {
@@ -537,13 +589,25 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
 +      return current;
 +    };
      const sendStructuredChunk = async (chunk) => {
-       if (!structuredChunksSupported) {
+-      await flushCommitted();
+-      if (fallback.mode === "fallback" || !structuredChunksSupported) {
+-        this.logger.debug("Slack: structured chunk skipped", {
+-          chunkType: chunk.type,
+-          mode: fallback.mode
+-        });
++      if (!structuredChunksSupported) {
          return;
-@@ -3481,8 +3939,45 @@ var SlackAdapter = class _SlackAdapter {
-       await flushMarkdownDelta(delta);
-       lastAppended = committable;
+       }
++      const committable = renderer.getCommittableText();
++      const delta = committable.slice(lastAppended.length);
++      await flushMarkdownDelta(delta);
++      lastAppended = committable;
        try {
--        await streamer.append({ chunks: [chunk], token });
+-        await streamer.append({
+-          chunks: [chunk],
+-          token
+-        });
+-        fallback.nativeRendered = true;
 +        if (chunk.type === "plan_update") {
 +          plan = {
 +            ...chunk,
@@ -585,19 +649,64 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
 +        }
          structuredChunksSupported = false;
          this.logger.warn(
-           "Structured streaming chunk failed, falling back to text-only streaming. Ensure your Slack app manifest includes assistant_view, assistant:write scope, and @slack/web-api >= 7.14.0",
-@@ -3497,31 +3992,91 @@ var SlackAdapter = class _SlackAdapter {
-       await flushMarkdownDelta(delta);
-       lastAppended = committable;
+-          "Structured streaming chunk failed, falling back to text-only streaming. Ensure your Slack app manifest includes the agent/assistant feature and the assistant:write scope",
++          "Structured streaming chunk failed, falling back to text-only streaming. Ensure your Slack app manifest includes assistant_view, assistant:write scope, and @slack/web-api >= 7.14.0",
+           { chunkType: chunk.type, error }
+         );
+       }
      };
 -    for await (const chunk of textStream) {
 -      if (typeof chunk === "string") {
--        await pushTextAndFlush(chunk);
+-        renderer.push(chunk);
+-        await flushCommitted();
 -      } else if (chunk.type === "markdown_text") {
--        await pushTextAndFlush(chunk.text);
+-        renderer.push(chunk.text);
+-        await flushCommitted();
 -      } else {
 -        await sendStructuredChunk(chunk);
-+    try {
+-      }
+-    }
+-    renderer.finish();
+-    await flushCommitted(true);
+-    if (fallback.mode === "fallback") {
+-      if (options?.stopBlocks || this.feedbackButtons) {
+-        this.logger.warn(
+-          "Slack: stream-end blocks (stopBlocks/feedbackButtons) skipped - post-and-edit fallback cannot attach stream blocks",
+-          { channel }
+-        );
+-      }
+-      this.logger.debug("Slack: fallback stream complete", {
+-        messageId: fallback.message?.id
+-      });
+-      return fallback.message;
+-    }
+-    const stopBlocks = [
+-      ...options?.stopBlocks ?? [],
+-      ...this.feedbackButtons ? [buildFeedbackButtonsBlock(this.feedbackButtons)] : []
+-    ];
+-    let result;
++    const pushTextAndFlush = async (text) => {
++      renderer.push(text);
++      const committable = renderer.getCommittableText();
++      const delta = committable.slice(lastAppended.length);
++      await flushMarkdownDelta(delta);
++      lastAppended = committable;
++    };
+     try {
+-      result = await streamer.stop({
+-        token,
+-        ...stopBlocks.length > 0 ? { blocks: stopBlocks } : {}
+-      });
+-    } catch (error) {
+-      if (fallback.nativeRendered) {
+-        throw error;
+-      }
+-      switchToFallback(error);
+-      await flushFallback(true);
+-      this.logger.debug("Slack: fallback stream complete", {
+-        messageId: fallback.message?.id
+-      });
+-      return fallback.message;
 +      for await (const chunk of textStream) {
 +        if (typeof chunk === "string") {
 +          await pushTextAndFlush(chunk);
@@ -606,7 +715,7 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
 +        } else {
 +          await sendStructuredChunk(chunk);
 +        }
-       }
++      }
 +      renderer.finish();
 +      const finalCommittable = renderer.getCommittableText();
 +      const finalDelta = finalCommittable.slice(lastAppended.length);
@@ -621,9 +730,13 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
 +        current.hasContent = true;
 +        current.length += fence.closing.length;
 +      }
++      const stopBlocks = [
++        ...options?.stopBlocks ?? [],
++        ...this.feedbackButtons ? [buildFeedbackButtonsBlock(this.feedbackButtons)] : []
++      ];
 +      lastResult = await stopSegment(
 +        current,
-+        options?.stopBlocks,
++        stopBlocks.length > 0 ? stopBlocks : void 0,
 +        !provisionalResult
 +      ) ?? provisionalResult;
 +      for (const segment of Array.from(structured)) {
@@ -673,16 +786,6 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
 +      annotateSlackAnswerLost(error, !sourceConsumed || answerStopFailed);
 +      throw error;
      }
--    renderer.finish();
--    const finalCommittable = renderer.getCommittableText();
--    const finalDelta = finalCommittable.slice(lastAppended.length);
--    await flushMarkdownDelta(finalDelta);
--    const result = await streamer.stop({
--      token,
--      ...options?.stopBlocks ? {
--        blocks: options.stopBlocks
--      } : {}
--    });
 -    const messageTs = result.message?.ts ?? result.ts;
 +    if (!lastResult) {
 +      throw new NetworkError("slack", "Slack stream returned no result");
@@ -697,7 +800,7 @@ index a7048fd884020cfd96a51c48b7071fa7293f3dc4..e5bd30bb8f2d41f8f836e7dee742a67f
      };
    }
    /**
-@@ -3798,10 +4353,10 @@ var SlackAdapter = class _SlackAdapter {
+@@ -4217,10 +4699,10 @@
        formatted: this.formatConverter.toAst(text),
        raw: event,
        author: {

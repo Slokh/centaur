@@ -5087,7 +5087,11 @@ async function postUserMessage(
   threadTs?: string,
   client: WebClient = slack
 ): Promise<{ ts: string }> {
-  const response = await client.chat.postMessage({ channel: CHANNEL_ID, text, thread_ts: threadTs })
+  const response = await client.chat.postMessage({
+    channel: CHANNEL_ID,
+    text: text || ' ',
+    thread_ts: threadTs
+  })
   expect(response.ok).toBe(true)
   return { ts: String(response.ts) }
 }
@@ -5895,6 +5899,9 @@ async function sendWebResponse(res: ServerResponse, response: Response): Promise
   res.statusCode = response.status
   res.statusMessage = response.statusText
   response.headers.forEach((value, key) => {
+    if (key === 'content-encoding' || key === 'content-length' || key === 'transfer-encoding') {
+      return
+    }
     res.setHeader(key, value)
   })
   if (response.body === null || response.status === 204) {
