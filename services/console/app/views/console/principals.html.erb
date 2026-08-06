@@ -27,10 +27,9 @@
           <td class="console-td-nowrap">
             <% if p.foreign_id.present? %>
               <div class="text-centaur-400 group-hover:glow" title="<%= p.foreign_id %>"><%= truncate_middle(p.foreign_id) %></div>
-              <%= id_meta_line(p.namespace, oid: p.oid) %>
+              <%= id_meta_line(p.oid) %>
             <% else %>
               <span class="text-centaur-400 group-hover:glow"><%= p.oid %></span>
-              <%= id_meta_line(p.namespace) %>
             <% end %>
           </td>
           <td class="console-td-nowrap text-zinc-100">

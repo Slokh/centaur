@@ -358,7 +358,6 @@ class PrincipalCredentialReconciliationTest < ActiveSupport::TestCase
 
   test "matches credentials through first-class Slack email" do
     principal = Principal.create!(
-      namespace: "acme",
       foreign_id: "slack-email-user",
       slack_email: "member.slack@example.com",
       created_by: users(:acme_admin)
@@ -374,9 +373,8 @@ class PrincipalCredentialReconciliationTest < ActiveSupport::TestCase
     assert_empty principal.reload.labels.slice("slack_email")
   end
 
-  test "does not reconcile matching Slack identities across namespaces" do
+  test "reconciles matching Slack identities globally" do
     principal = create_slack_user_principal(
-      namespace: "globex",
       foreign_id: "globex-slack-user",
       slack_user_id: "U11123456789",
       slack_team_id: "T11123456789",
@@ -390,7 +388,7 @@ class PrincipalCredentialReconciliationTest < ActiveSupport::TestCase
       { requested: 0, created: 0 },
       PrincipalCredentialReconciliation.new.apply_for_principal(principal)
     )
-    refute principal.grants.exists?(static_secret: secret)
+    assert principal.grants.exists?(static_secret: secret)
   end
 
   test "console user principal ignores a spoofed cached email" do
@@ -477,7 +475,6 @@ class PrincipalCredentialReconciliationTest < ActiveSupport::TestCase
   # which matching must ignore for console-user principals.
   def create_console_user_principal(user, foreign_id:, email: nil, extra_labels: {})
     Principal.create!(
-      namespace: "acme",
       foreign_id: foreign_id,
       name: user.name.presence || user.email,
       kind: "console_user",
@@ -494,11 +491,9 @@ class PrincipalCredentialReconciliationTest < ActiveSupport::TestCase
     foreign_id:,
     slack_user_id:,
     slack_team_id:,
-    namespace: "acme",
     created_by: users(:acme_admin)
   )
     Principal.create!(
-      namespace: namespace,
       foreign_id: foreign_id,
       kind: PrincipalCredentialReconciliation::USER_KIND,
       slack_user_id: slack_user_id,
@@ -509,7 +504,6 @@ class PrincipalCredentialReconciliationTest < ActiveSupport::TestCase
 
   def create_credential(app, subject, email)
     BrokerCredential.create!(
-      namespace: app.credential_namespace,
       oauth_app: app,
       provider_subject: subject,
       provider_email: email,
@@ -524,7 +518,6 @@ class PrincipalCredentialReconciliationTest < ActiveSupport::TestCase
 
   def wrap(credential)
     StaticSecret.create!(
-      namespace: credential.namespace,
       name: "#{credential.name || credential.provider_subject} token",
       inject_config: { "header" => "Authorization", "formatter" => "Bearer {{ .Value }}" },
       broker_credential: credential

@@ -3,7 +3,6 @@ require "test_helper"
 class PgDsnSecretTest < ActiveSupport::TestCase
   def base_attrs(overrides = {})
     {
-      namespace: "acme",
       foreign_id: "new-pg",
       database: "new-db",
       created_by: users(:acme_admin)
@@ -55,7 +54,7 @@ class PgDsnSecretTest < ActiveSupport::TestCase
     assert_includes dup.errors[:foreign_id], "has already been taken"
   end
 
-  test "database can be shared within a namespace" do
+  test "database can be shared" do
     with_dsn(PgDsnSecret.new(base_attrs(foreign_id: "first-pg", database: "shared-db"))).save!
     dup = with_dsn(PgDsnSecret.new(base_attrs(foreign_id: "second-pg", database: "shared-db")))
     assert dup.valid?
@@ -170,7 +169,6 @@ class PgDsnSecretTest < ActiveSupport::TestCase
   test "to_proxy_dsn resolves console user compatibility labels from columns" do
     user = users(:acme_admin)
     principal = Principal.create!(
-      namespace: "acme",
       kind: "console_user",
       console_user_id: user.id,
       console_user_email: user.email,
@@ -330,7 +328,7 @@ class PgDsnSecretTest < ActiveSupport::TestCase
     ])))
     assert_not secret.valid?
     assert_includes secret.errors[:settings],
-      %([0] unknown principal_field "labels" (one of: id, namespace, foreign_id, name, slack_history_channel_ids))
+      %([0] unknown principal_field "labels" (one of: id, foreign_id, name, slack_history_channel_ids))
   end
 
   test "settings with a valid empty value are accepted and stringified" do
