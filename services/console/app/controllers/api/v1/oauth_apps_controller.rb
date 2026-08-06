@@ -104,7 +104,6 @@ module Api
           provider: app.provider,
           client_id: app.client_id,
           allowed_scopes: app.allowed_scopes,
-          credential_namespace: "default",
           enabled: app.enabled,
           created_at: app.created_at,
           updated_at: app.updated_at

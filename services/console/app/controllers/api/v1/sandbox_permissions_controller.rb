@@ -62,7 +62,6 @@ module Api
       def principal_payload(principal)
         {
           id: principal.oid,
-          namespace: "default",
           foreign_id: principal.foreign_id,
           name: principal.name
         }

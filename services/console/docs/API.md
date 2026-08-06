@@ -45,7 +45,7 @@ A missing or invalid token returns `401`:
 
 ### Namespace Compatibility
 
-Resources are global and `foreign_id` values are globally unique within each resource type. The removed `namespace` and `credential_namespace` request fields are temporarily accepted only when their value is `default`, then ignored. Any other value returns `422`. Responses temporarily include those fields with the virtual value `default`.
+Resources are global and `foreign_id` values are globally unique within each resource type. The removed `namespace` and `credential_namespace` fields are not part of requests or responses.
 
 Canonical foreign-id lookups use `/lookup/:foreign_id`. `/lookup/default/:foreign_id` remains as a temporary compatibility alias. Other formerly namespaced lookup paths return `404`.
 
@@ -242,7 +242,6 @@ Returns `201` with the created resource. Response shape:
 {
   "data": {
     "id": "ssr_...",
-    "namespace": "default",
     "foreign_id": "github-token",
     "name": "GitHub Token",
     "description": "Repo access",
@@ -326,7 +325,6 @@ Returns `201`. Response shape:
 {
   "data": {
     "id": "gas_...",
-    "namespace": "default",
     "foreign_id": "sa-prod",
     "name": "Production Service Account",
     "description": null,
@@ -394,7 +392,6 @@ Returns `201`. Response shape:
 {
   "data": {
     "id": "gid_...",
-    "namespace": "default",
     "foreign_id": "cloud-run-caller",
     "name": "Cloud Run Caller",
     "description": null,
@@ -479,7 +476,6 @@ Returns `201`. Response shape (each credential echoes its source as `{ source_ty
 {
   "data": {
     "id": "aas_...",
-    "namespace": "default",
     "foreign_id": "cloudwatch-reader",
     "name": "CloudWatch Reader",
     "description": null,
@@ -571,7 +567,6 @@ Returns `201`. Response shape (note that `credentials` and `token_endpoint_heade
 {
   "data": {
     "id": "ots_...",
-    "namespace": "default",
     "foreign_id": "slack-app",
     "name": "Slack App OAuth",
     "description": null,
@@ -651,7 +646,6 @@ Returns `201` with the created resource. Response shape:
 {
   "data": {
     "id": "pgs_...",
-    "namespace": "default",
     "foreign_id": "analytics-pg",
     "name": "Analytics DB",
     "description": "Read-only reporting",
@@ -756,7 +750,6 @@ Returns `201`. Response shape (note that `credentials` echoes each source as `{ 
 {
   "data": {
     "id": "hms_...",
-    "namespace": "default",
     "foreign_id": "webhook-hmac",
     "name": "Webhook Signing",
     "description": null,
@@ -871,7 +864,6 @@ Returns `201`. The token blob, the `refresh_token` seed, and the `client_secret`
 {
   "data": {
     "id": "bcr_...",
-    "namespace": "default",
     "foreign_id": "gmail",
     "name": "Gmail",
     "description": null,
@@ -1046,7 +1038,6 @@ Returns `201`. The `client_secret` is never echoed back:
     "provider": "google",
     "client_id": "1234.apps.googleusercontent.com",
     "allowed_scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
-    "credential_namespace": "default",
     "enabled": true,
     "created_at": "2026-06-01T10:00:00Z",
     "updated_at": "2026-06-01T10:00:00Z"
@@ -1204,7 +1195,6 @@ Returns `201`:
 {
   "data": {
     "id": "prn_...",
-    "namespace": "default",
     "foreign_id": "api-service",
     "name": "API Service",
     "labels": { "tier": "backend", "kind": "unknown" },
@@ -1305,7 +1295,6 @@ Returns `201`:
 {
   "data": {
     "id": "role_...",
-    "namespace": "default",
     "foreign_id": "infra",
     "name": "Infra",
     "labels": { "kind": "shared" },
