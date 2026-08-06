@@ -92,8 +92,6 @@ pub struct IronControlSettings {
     pub client: IronControlClient,
     /// Base URL injected into the proxy pod as `IRON_CONTROL_URL`.
     pub control_url: String,
-    /// iron-control namespace, used to resolve principals by `foreign_id`.
-    pub namespace: String,
 }
 
 impl AgentSandboxConfig {

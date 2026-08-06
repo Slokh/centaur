@@ -49,7 +49,6 @@ used by `centaur-perms`:
 ```bash
 export IRON_CONTROL_URL=http://localhost:3000
 export IRON_CONTROL_API_KEY=iak_...
-export IRON_CONTROL_NAMESPACE=default
 ```
 
 Point the CLI at the same tool directories the API uses. Explicit
