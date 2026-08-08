@@ -47,3 +47,22 @@ def test_upload_file_rejects_missing_path(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="does not exist"):
         client.upload_file("companies", "record-id", str(tmp_path / "missing.pdf"))
+
+
+def test_replace_record_values_uses_put() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "PUT"
+        assert request.url.path == "/v2/objects/deals/records/deal-123"
+        assert request.read() == b'{"data":{"values":{"dependencies_4":[]}}}'
+        return httpx.Response(200, json={"data": {"id": {"record_id": "deal-123"}}})
+
+    client = AttioClient(api_key="test-key")
+    client._client = httpx.Client(
+        base_url="https://api.attio.com/v2",
+        headers={"Authorization": "Bearer test-key"},
+        transport=httpx.MockTransport(handler),
+    )
+
+    result = client.replace_record_values("deals", "deal-123", {"dependencies_4": []})
+
+    assert result == {"id": {"record_id": "deal-123"}}

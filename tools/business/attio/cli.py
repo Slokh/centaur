@@ -294,6 +294,20 @@ def update(
 
 
 @app.command()
+def replace(
+    object_slug: str = typer.Argument(..., help="Object slug"),
+    record_id: str = typer.Argument(..., help="Record ID"),
+    values_json: str = typer.Argument(..., help="Values to replace as JSON"),
+):
+    """Replace supplied attribute values, including multi-value relationships."""
+    client = _get_client()
+    values = json.loads(values_json)
+    client.replace_record_values(object_slug, record_id, values)
+
+    console.print(f"[green]✓ Replaced values on {object_slug} record {record_id[:8]}...[/]")
+
+
+@app.command()
 def delete(
     object_slug: str = typer.Argument(..., help="Object slug"),
     record_id: str = typer.Argument(..., help="Record ID"),

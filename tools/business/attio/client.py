@@ -172,6 +172,12 @@ class AttioClient:
         data = self._request("PATCH", f"/objects/{object_slug}/records/{record_id}", json=body)
         return data.get("data", {})
 
+    def replace_record_values(self, object_slug: str, record_id: str, values: dict) -> dict:
+        """Replace the supplied record attribute values instead of appending them."""
+        body = {"data": {"values": values}}
+        data = self._request("PUT", f"/objects/{object_slug}/records/{record_id}", json=body)
+        return data.get("data", {})
+
     def delete_record(self, object_slug: str, record_id: str) -> bool:
         """Delete a record."""
         self._request("DELETE", f"/objects/{object_slug}/records/{record_id}")
