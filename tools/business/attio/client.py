@@ -2,6 +2,8 @@
 
 import mimetypes
 import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 
@@ -44,11 +46,7 @@ class AttioClient:
             if response.status_code != 429 or attempt == self.max_rate_limit_retries:
                 break
             retry_after = response.headers.get("Retry-After", "1")
-            try:
-                delay = min(max(float(retry_after), 0.0), 5.0)
-            except ValueError:
-                delay = 1.0
-            time.sleep(delay)
+            time.sleep(self._retry_delay(retry_after))
         if response.status_code >= 400:
             try:
                 error = response.json()
@@ -57,6 +55,20 @@ class AttioClient:
                 msg = response.text
             raise RuntimeError(f"Attio API error ({response.status_code}): {msg}")
         return response.json()
+
+    def _retry_delay(self, retry_after: str, now: datetime | None = None) -> float:
+        """Parse Retry-After as delta seconds or an HTTP date, bounded to one minute."""
+        try:
+            delay = float(retry_after)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(retry_after)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=UTC)
+                delay = (retry_at - (now or datetime.now(UTC))).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                delay = 1.0
+        return min(max(delay, 0.0), 60.0)
 
     def _clean_params(self, params: dict[str, Any]) -> dict[str, Any]:
         """Remove unset values and encode list query params the way Attio expects."""

@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -151,3 +152,10 @@ def test_rate_limit_response_retries_then_succeeds() -> None:
 
     assert attempts == 2
     sleep.assert_called_once_with(0.0)
+
+
+def test_retry_after_http_date_is_parsed() -> None:
+    client = AttioClient(api_key="test-key")
+    now = datetime(2026, 8, 8, 12, 0, tzinfo=UTC)
+
+    assert client._retry_delay("Sat, 08 Aug 2026 12:00:05 GMT", now=now) == 5.0
