@@ -484,6 +484,13 @@ apiRs:
     timeoutSeconds: 5
   terminationGracePeriodSeconds: 35
   extraEnv: {}
+  # Optional execution-bound gateway to one private application service.
+  applicationGateway:
+    enabled: false
+    url: ""
+    capabilities: ""
+    signingSecretKey: CENTAUR_APPLICATION_SIGNING_SECRET
+    gatewayKeySecretKey: CENTAUR_APPLICATION_GATEWAY_KEY
   resources: {}
 
 # Chat SDK Slackbot v2. Forwards Slack events to the api-rs control plane
@@ -623,6 +630,14 @@ discordbot:
   mentionRoleIds: ""
   # Rename auto-created threads to the triggering message; set false to keep generic names.
   nameThreads: true
+  # New channel mentions use native threads or inline reply chains.
+  conversationMode: thread
+  # Set reactions to suppress public status/reasoning text.
+  progressMode: narration
+  applicationIngestion:
+    enabled: false
+    url: ""
+    tokenSecretKey: DISCORDBOT_APPLICATION_INGESTION_TOKEN
   extraEnv: {}
   resources: {}
 

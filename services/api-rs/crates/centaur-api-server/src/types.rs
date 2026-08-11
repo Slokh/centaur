@@ -1,5 +1,7 @@
 use axum::response::sse::Event;
-use centaur_session_core::{HarnessType, Session, SessionEvent, SessionMessageInput, ThreadKey};
+use centaur_session_core::{
+    ChatDestination, HarnessType, Session, SessionEvent, SessionMessageInput, ThreadKey,
+};
 use centaur_session_runtime::SESSION_OUTPUT_LINE_EVENT;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -10,6 +12,10 @@ pub struct CreateSessionRequest {
     pub harness_type: HarnessType,
     pub persona_id: Option<String>,
     pub metadata: Option<Value>,
+    /// Physical chat delivery target. Omit when it is encoded by the thread
+    /// key; provide it when the logical session key and delivery target differ.
+    #[serde(default)]
+    pub chat_destination: Option<ChatDestination>,
     /// What to do when the session already exists on a different harness.
     /// Omitted or `reject`: fail with 409. `restart`: stop the old sandbox and
     /// restart the thread on the requested harness (the new harness starts
@@ -74,6 +80,8 @@ pub struct DiscordThreadContext {
     pub channel_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reply_to_message_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -111,10 +119,66 @@ pub struct AppendMessagesResponse {
 pub struct ExecuteSessionRequest {
     pub idempotency_key: Option<String>,
     pub metadata: Option<Value>,
+    /// Trusted actor and visibility facts established by chat ingress. Kept
+    /// outside free-form metadata so the API can validate it against the
+    /// session destination before persisting it on the execution.
+    #[serde(default)]
+    pub invocation: Option<InvocationContext>,
     #[serde(default)]
     pub input_lines: Vec<String>,
     pub idle_timeout_ms: Option<u64>,
     pub max_duration_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct InvocationContext {
+    pub version: u8,
+    pub kind: InvocationKind,
+    pub actor: InvocationActor,
+    pub conversation: InvocationConversation,
+    pub source: InvocationSource,
+    pub authority: InvocationAuthority,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum InvocationKind {
+    DiscordMember,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct InvocationActor {
+    pub platform: String,
+    pub user_id: String,
+    pub guild_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct InvocationConversation {
+    pub platform: String,
+    pub channel_id: String,
+    pub thread_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct InvocationSource {
+    pub event_id: String,
+    pub message_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+pub struct InvocationAuthority {
+    pub mutation: MutationAuthority,
+    pub observed_at: String,
+    #[serde(default)]
+    pub visible_channel_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationAuthority {
+    CurrentMemberRequest,
+    None,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

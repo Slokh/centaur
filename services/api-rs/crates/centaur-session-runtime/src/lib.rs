@@ -883,6 +883,21 @@ impl SessionRuntime {
         Ok(self.store.get_session_title(thread_key).await?)
     }
 
+    /// Load the durable session, including its explicit physical chat
+    /// destination when one was recorded at creation.
+    pub async fn session(&self, thread_key: &ThreadKey) -> Result<Session, SessionRuntimeError> {
+        Ok(self.store.get_session(thread_key).await?)
+    }
+
+    /// Returns the queued or running execution for a trusted application
+    /// gateway without exposing the underlying session store.
+    pub async fn active_execution(
+        &self,
+        thread_key: &ThreadKey,
+    ) -> Result<Option<SessionExecution>, SessionRuntimeError> {
+        Ok(self.store.active_execution_for_thread(thread_key).await?)
+    }
+
     /// Returns the harness already persisted for a thread, if the session
     /// exists. API policy uses this to keep rollout assignments sticky across
     /// configuration changes without exposing the session store itself.
@@ -1989,7 +2004,13 @@ impl SessionRuntime {
             };
 
             let trace = SessionTraceContext::new(thread_key, Some(&execution_trace_span));
-            let input_lines = input_lines_with_session_context(thread_key, &trace, &input_lines);
+            let destination = session.resolved_chat_destination();
+            let input_lines = input_lines_with_session_context(
+                thread_key,
+                destination.as_ref(),
+                &trace,
+                &input_lines,
+            );
             if let Err(error) = write_input_lines(
                 &pipe,
                 &input_lines,
@@ -2117,7 +2138,19 @@ impl SessionRuntime {
             .get(&execution.execution_id)
             .cloned();
         let trace = SessionTraceContext::new(thread_key, execution_span.as_ref());
-        let input_lines = input_lines_with_session_context(thread_key, &trace, &input_lines);
+        let destination = match self.store.get_session(thread_key).await {
+            Ok(session) => session.resolved_chat_destination(),
+            Err(error) => {
+                warn!(%thread_key, %error, "session destination lookup failed during steering");
+                thread_key.chat_destination()
+            }
+        };
+        let input_lines = input_lines_with_session_context(
+            thread_key,
+            destination.as_ref(),
+            &trace,
+            &input_lines,
+        );
 
         let pipe = match self
             .wait_for_active_steering_pipe(thread_key, &execution.execution_id)
@@ -2183,8 +2216,14 @@ impl SessionRuntime {
             .get(&execution.execution_id)
             .cloned();
         let trace = SessionTraceContext::new(thread_key, execution_span.as_ref());
+        let destination = self
+            .store
+            .get_session(thread_key)
+            .await?
+            .resolved_chat_destination();
         let input_lines = input_lines_with_session_context(
             thread_key,
+            destination.as_ref(),
             &trace,
             &[interrupt_input_line(thread_key, reason)],
         );
@@ -6180,17 +6219,28 @@ pub fn thread_trace_parent_span_id(thread_key: &ThreadKey) -> String {
 
 fn input_lines_with_session_context(
     thread_key: &ThreadKey,
+    destination: Option<&ChatDestination>,
     trace: &SessionTraceContext,
     input_lines: &[String],
 ) -> Vec<String> {
     input_lines
         .iter()
-        .map(|line| input_line_with_session_context(thread_key, trace, line))
+        .map(|line| input_line_with_destination(thread_key, destination, trace, line))
         .collect()
 }
 
+#[cfg(test)]
 fn input_line_with_session_context(
     thread_key: &ThreadKey,
+    trace: &SessionTraceContext,
+    line: &str,
+) -> String {
+    input_line_with_destination(thread_key, None, trace, line)
+}
+
+fn input_line_with_destination(
+    thread_key: &ThreadKey,
+    destination: Option<&ChatDestination>,
     trace: &SessionTraceContext,
     line: &str,
 ) -> String {
@@ -6208,8 +6258,11 @@ fn input_line_with_session_context(
         map.entry("traceparent")
             .or_insert_with(|| Value::String(traceparent.clone()));
     }
-    prepend_chat_surface_note(map, thread_key);
-    merge_session_context(map, session_context_for_thread(thread_key));
+    let destination = destination
+        .cloned()
+        .or_else(|| thread_key.chat_destination());
+    prepend_chat_surface_note(map, destination.as_ref());
+    merge_session_context(map, session_context_for_destination(destination));
     serde_json::to_string(&value).unwrap_or_else(|_| line.to_owned())
 }
 
@@ -6221,11 +6274,14 @@ fn input_line_with_session_context(
 /// only to `user` turns whose content is an array of message parts and whose
 /// thread key resolves to a known chat destination; every other shape is left
 /// untouched.
-fn prepend_chat_surface_note(map: &mut serde_json::Map<String, Value>, thread_key: &ThreadKey) {
+fn prepend_chat_surface_note(
+    map: &mut serde_json::Map<String, Value>,
+    destination: Option<&ChatDestination>,
+) {
     if map.get("type").and_then(Value::as_str) != Some("user") {
         return;
     }
-    let Some(destination) = thread_key.chat_destination() else {
+    let Some(destination) = destination else {
         return;
     };
     let Some(Value::Array(content)) = map.get_mut("message").and_then(|m| m.get_mut("content"))
@@ -6256,15 +6312,10 @@ fn merge_session_context(
     }
 }
 
-/// Build the structured per-turn session context for a thread, mirroring the
-/// `/api/session` response shape (`{ platform, <slack|discord|linear|github>: { .. } }`).
-///
-/// Resolved from the same [`ChatDestination`] the session-context route uses, so
-/// the structured context the agent sees in its input is consistent with what
-/// tools read back from the API. Returns `None` for non-platform threads (e.g.
-/// `api:` keys), which carry no chat destination and get no `session_context`.
-fn session_context_for_thread(thread_key: &ThreadKey) -> Option<serde_json::Map<String, Value>> {
-    let destination = thread_key.chat_destination()?;
+fn session_context_for_destination(
+    destination: Option<ChatDestination>,
+) -> Option<serde_json::Map<String, Value>> {
+    let destination = destination?;
     let mut context = serde_json::Map::new();
     context.insert(
         "platform".to_owned(),
@@ -6284,12 +6335,19 @@ fn session_context_for_thread(thread_key: &ThreadKey) -> Option<serde_json::Map<
             guild_id,
             channel_id,
             thread_id,
+            reply_to_message_id,
         } => {
             let mut discord = serde_json::Map::new();
             discord.insert("guild_id".to_owned(), Value::String(guild_id));
             discord.insert("channel_id".to_owned(), Value::String(channel_id));
             if let Some(thread_id) = thread_id {
                 discord.insert("thread_id".to_owned(), Value::String(thread_id));
+            }
+            if let Some(reply_to_message_id) = reply_to_message_id {
+                discord.insert(
+                    "reply_to_message_id".to_owned(),
+                    Value::String(reply_to_message_id),
+                );
             }
             ("discord", discord)
         }
@@ -8339,6 +8397,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         Session {
             thread_key,
+            chat_destination: None,
             title: None,
             sandbox_id: Some(sandbox_id.to_owned()),
             sandbox_capabilities: None,

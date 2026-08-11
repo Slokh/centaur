@@ -68,6 +68,19 @@ spec:
               value: {{ .Values.discordbot.userName | quote }}
             - name: DISCORDBOT_GUILD_ALLOWLIST
               value: {{ .Values.discordbot.guildAllowlist | quote }}
+            - name: DISCORDBOT_CONVERSATION_MODE
+              value: {{ .Values.discordbot.conversationMode | quote }}
+            - name: DISCORDBOT_PROGRESS_MODE
+              value: {{ .Values.discordbot.progressMode | quote }}
+{{- if .Values.discordbot.applicationIngestion.enabled }}
+            - name: DISCORDBOT_APPLICATION_INGESTION_URL
+              value: {{ required "discordbot.applicationIngestion.url is required" .Values.discordbot.applicationIngestion.url | quote }}
+            - name: DISCORDBOT_APPLICATION_INGESTION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%s%s" .Values.secretManager.envPrefix .Values.discordbot.applicationIngestion.tokenSecretKey }}
+{{- end }}
 {{- if .Values.discordbot.mentionRoleIds }}
             - name: DISCORD_MENTION_ROLE_IDS
               value: {{ .Values.discordbot.mentionRoleIds | quote }}

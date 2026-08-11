@@ -12,7 +12,7 @@
 // - Reasoning blurbs post as separate `-# ` subtext messages (append-only).
 // - The final answer streams into separate lazily-created message(s), split
 //   across multiple messages at ≤1900 chars.
-// - concurrency: "drop"; no webhook ingress route on the Hono app.
+// - concurrency: bounded queue; no webhook ingress route on the Hono app.
 // - Render-obligation state lives under `discordbot:render:*` keys.
 // - Threads are renamed only when the bot itself created them.
 import {
@@ -60,13 +60,15 @@ beforeAll(async () => {
   codexApi = await startMockCodexApi();
 });
 
-beforeEach(() => {
+beforeEach(async () => {
+  await bot?.chat.shutdown().catch(() => undefined);
   discordApi.reset();
   codexApi.reset();
   bot = createTestBot();
 });
 
 afterAll(async () => {
+  await bot?.chat.shutdown().catch(() => undefined);
   await codexApi?.close();
   await discordApi?.close();
 });
@@ -282,7 +284,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     await dispatchMessage({
       channelId: threadId,
@@ -317,7 +319,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     const secondMentionId = await dispatchMessage({
       channelId: threadId,
@@ -352,7 +354,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     codexApi.emitOutputLine(
       key,
@@ -385,7 +387,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     codexApi.emitOutputLine(
       key,
@@ -429,7 +431,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     codexApi.emitOutputLine(
       key,
@@ -468,7 +470,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     codexApi.emitSessionEvent(key, "session.execution_completed", {
       execution_id: "exe-terminal-result",
@@ -497,7 +499,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     codexApi.emitOutputLine(
       key,
@@ -517,6 +519,18 @@ describe("discordbot", () => {
         type: "item.agentMessage.delta",
         itemId: "answer-1",
         delta: "DUPLICATE_DELIVERY_GUARD_OK",
+      }),
+    );
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          id: "answer-1",
+          type: "agentMessage",
+          text: "DUPLICATE_DELIVERY_GUARD_OK",
+          phase: "final_answer",
+        },
       }),
     );
     codexApi.emitSessionEvent(key, "session.execution_completed", {
@@ -590,7 +604,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     const fenceLines = Array.from(
       { length: 120 },
@@ -1009,7 +1023,7 @@ describe("discordbot", () => {
       thread: { id: threadA, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(threadKey(threadA)));
 
     const mentionB = await dispatchMessage({
       channelId: threadB,
@@ -2279,6 +2293,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
         events,
         id: ++eventId,
         streams,
+        streamThreadKeys,
         threadKey,
       });
     },
@@ -2299,6 +2314,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
         events,
         id: ++eventId,
         streams,
+        streamThreadKeys,
         threadKey,
       });
     },
@@ -2411,7 +2427,10 @@ async function handleMockCodexRequest(
         writeMockSseEvent(res, event);
       }
     }
-    req.once("close", () => {
+    // IncomingMessage "close" means the GET request body is complete and may
+    // fire while its SSE response is still live. Track the response lifecycle
+    // so live emissions cannot silently lose their registered stream.
+    res.once("close", () => {
       input.streams.delete(res);
       input.streamThreadKeys.delete(res);
     });
@@ -2469,6 +2488,7 @@ async function handleMockCodexRequest(
         events: input.events,
         id: input.nextEventId(),
         streams: input.streams,
+        streamThreadKeys: input.streamThreadKeys,
         threadKey,
       });
     }
@@ -2502,6 +2522,7 @@ function emitMockSessionEvent(input: {
   events: MockSessionEvent[];
   id: number;
   streams: Set<ServerResponse>;
+  streamThreadKeys: Map<ServerResponse, string>;
   threadKey: string;
 }): void {
   const event: MockSessionEvent = {
@@ -2512,7 +2533,11 @@ function emitMockSessionEvent(input: {
     threadKey: input.threadKey,
   };
   input.events.push(event);
-  for (const stream of input.streams) writeMockSseEvent(stream, event);
+  for (const stream of input.streams) {
+    if (input.streamThreadKeys.get(stream) === input.threadKey) {
+      writeMockSseEvent(stream, event);
+    }
+  }
 }
 
 function writeMockSseEvent(
