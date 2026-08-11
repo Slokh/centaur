@@ -30,7 +30,8 @@ use base64::{Engine as _, engine::general_purpose};
 use centaur_session_core::{ChatDestination, HarnessType, ThreadKey};
 use centaur_session_runtime::{
     ExecuteSessionInput, HarnessConflictPolicy, PersonaSummary, SandboxRuntime,
-    SessionPrincipalRegistrar, SessionRuntime, thread_trace_id, thread_trace_parent_span_id,
+    SessionPrincipalRegistrar, SessionRuntime, application_gateway_session_key, thread_trace_id,
+    thread_trace_parent_span_id,
 };
 use centaur_session_sqlx::PgSessionStore;
 use centaur_telemetry::{
@@ -48,7 +49,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use subtle::ConstantTimeEq;
-use time::{Duration as TimeDuration, OffsetDateTime};
+use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tower_http::trace::TraceLayer;
 use tracing::Span;
 use uuid::Uuid;
@@ -83,6 +84,7 @@ struct ApplicationGatewayConfig {
     signing_secret: String,
     capabilities: BTreeSet<String>,
     gateway_key: String,
+    authority_max_age: TimeDuration,
 }
 
 #[derive(Clone)]
@@ -99,7 +101,11 @@ impl AppState {
             metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
             codex_nanocodex_rollout_percent: 0,
             application_gateway: application_gateway_config_from_env(),
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("application HTTP client configuration must be valid"),
         }
     }
 
@@ -894,6 +900,7 @@ struct ApplicationInvocationClaims<'a> {
     iat: i64,
     jti: String,
     execution_id: &'a str,
+    thread_key: &'a str,
     capability: &'a str,
     body_sha256: &'a str,
     invocation: &'a InvocationContext,
@@ -908,13 +915,15 @@ async fn invoke_application_capability(
     let config = state.application_gateway.as_ref().ok_or_else(|| {
         ApiError::ServiceUnavailable("application gateway is not configured".to_owned())
     })?;
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let expected_key = application_gateway_session_key(&config.gateway_key, &thread_key);
     let supplied_key = headers
         .get("x-centaur-application-gateway-key")
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     if supplied_key
         .as_bytes()
-        .ct_eq(config.gateway_key.as_bytes())
+        .ct_eq(expected_key.as_bytes())
         .unwrap_u8()
         != 1
     {
@@ -927,7 +936,6 @@ async fn invoke_application_capability(
             "application capability is not allowlisted".to_owned(),
         ));
     }
-    let thread_key = ThreadKey::try_from(raw_thread_key)?;
     let execution = state
         .runtime()?
         .active_execution(&thread_key)
@@ -941,6 +949,7 @@ async fn invoke_application_capability(
             .ok_or_else(|| ApiError::Forbidden("execution has no trusted invocation".to_owned()))?,
     )
     .map_err(|_| ApiError::Internal("stored invocation context is invalid".to_owned()))?;
+    validate_application_authority_freshness(&invocation, config.authority_max_age)?;
     let body_sha256 = hex::encode(Sha256::digest(&body));
     let now = OffsetDateTime::now_utc().unix_timestamp();
     let token_id = hex::encode(Sha256::digest(format!(
@@ -956,6 +965,7 @@ async fn invoke_application_capability(
         iat: now,
         jti: token_id,
         execution_id: &execution.execution_id,
+        thread_key: thread_key.as_str(),
         capability: &capability,
         body_sha256: &body_sha256,
         invocation: &invocation,
@@ -973,6 +983,20 @@ async fn invoke_application_capability(
         config.base_url.trim_end_matches('/'),
         capability
     );
+    let started_at = Instant::now();
+    state
+        .runtime()?
+        .append_application_event(
+            &thread_key,
+            &execution.execution_id,
+            "application.capability.started",
+            json!({
+                "capability": capability,
+                "request_bytes": body.len(),
+                "body_sha256": body_sha256,
+            }),
+        )
+        .await?;
     let upstream = state
         .http
         .post(url)
@@ -980,18 +1004,69 @@ async fn invoke_application_capability(
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(body)
         .send()
-        .await
-        .map_err(|error| {
-            ApiError::ServiceUnavailable(format!("application request failed: {error}"))
-        })?;
+        .await;
+    let upstream = match upstream {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            let _ = state
+                .runtime()?
+                .append_application_event(
+                    &thread_key,
+                    &execution.execution_id,
+                    "application.capability.failed",
+                    json!({
+                        "capability": capability,
+                        "latency_ms": started_at.elapsed().as_millis(),
+                        "error_kind": if error.is_timeout() { "timeout" } else { "transport" },
+                    }),
+                )
+                .await;
+            return Err(ApiError::ServiceUnavailable(format!(
+                "application request failed: {error}"
+            )));
+        }
+    };
     let status = upstream.status();
     let content_type = upstream
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
         .cloned();
-    let bytes = upstream.bytes().await.map_err(|error| {
-        ApiError::Internal(format!("failed to read application response: {error}"))
-    })?;
+    let bytes = match upstream.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = state
+                .runtime()?
+                .append_application_event(
+                    &thread_key,
+                    &execution.execution_id,
+                    "application.capability.failed",
+                    json!({
+                        "capability": capability,
+                        "status": status.as_u16(),
+                        "latency_ms": started_at.elapsed().as_millis(),
+                        "error_kind": "response_body",
+                    }),
+                )
+                .await;
+            return Err(ApiError::Internal(format!(
+                "failed to read application response: {error}"
+            )));
+        }
+    };
+    state
+        .runtime()?
+        .append_application_event(
+            &thread_key,
+            &execution.execution_id,
+            "application.capability.finished",
+            json!({
+                "capability": capability,
+                "status": status.as_u16(),
+                "response_bytes": bytes.len(),
+                "latency_ms": started_at.elapsed().as_millis(),
+            }),
+        )
+        .await?;
     let mut response = Response::builder()
         .status(status)
         .body(Body::from(bytes))
@@ -1021,6 +1096,11 @@ fn application_gateway_config_from_env() -> Option<ApplicationGatewayConfig> {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect();
+    let authority_max_age_seconds = env::var("CENTAUR_APPLICATION_AUTHORITY_MAX_AGE_SECONDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(900);
     if base_url.is_empty()
         || signing_secret.is_empty()
         || gateway_key.is_empty()
@@ -1033,7 +1113,84 @@ fn application_gateway_config_from_env() -> Option<ApplicationGatewayConfig> {
         signing_secret,
         capabilities,
         gateway_key,
+        authority_max_age: TimeDuration::seconds(authority_max_age_seconds),
     })
+}
+
+fn validate_application_authority_freshness(
+    invocation: &InvocationContext,
+    max_age: TimeDuration,
+) -> Result<(), ApiError> {
+    let observed_at = OffsetDateTime::parse(&invocation.authority.observed_at, &Rfc3339)
+        .map_err(|_| ApiError::Forbidden("invocation authority timestamp is invalid".to_owned()))?;
+    let age = OffsetDateTime::now_utc() - observed_at;
+    if age > max_age || age < TimeDuration::seconds(-60) {
+        return Err(ApiError::Forbidden(
+            "invocation authority is stale; a fresh member request is required".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod application_authority_tests {
+    use super::*;
+    use crate::types::{
+        InvocationActor, InvocationAuthority, InvocationConversation, InvocationSource,
+        MutationAuthority,
+    };
+
+    fn invocation(observed_at: OffsetDateTime) -> InvocationContext {
+        InvocationContext {
+            version: 1,
+            kind: InvocationKind::DiscordMember,
+            actor: InvocationActor {
+                platform: "discord".to_owned(),
+                user_id: "user".to_owned(),
+                guild_id: "guild".to_owned(),
+            },
+            conversation: InvocationConversation {
+                platform: "discord".to_owned(),
+                channel_id: "channel".to_owned(),
+                thread_id: None,
+            },
+            source: InvocationSource {
+                event_id: "event".to_owned(),
+                message_id: "message".to_owned(),
+            },
+            authority: InvocationAuthority {
+                mutation: MutationAuthority::CurrentMemberRequest,
+                observed_at: observed_at.format(&Rfc3339).unwrap(),
+                visible_channel_ids: vec!["channel".to_owned()],
+            },
+        }
+    }
+
+    #[test]
+    fn application_authority_accepts_fresh_and_rejects_stale_or_future() {
+        let now = OffsetDateTime::now_utc();
+        assert!(
+            validate_application_authority_freshness(
+                &invocation(now - TimeDuration::seconds(30)),
+                TimeDuration::minutes(15),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_application_authority_freshness(
+                &invocation(now - TimeDuration::minutes(16)),
+                TimeDuration::minutes(15),
+            )
+            .is_err()
+        );
+        assert!(
+            validate_application_authority_freshness(
+                &invocation(now + TimeDuration::minutes(2)),
+                TimeDuration::minutes(15),
+            )
+            .is_err()
+        );
+    }
 }
 
 fn validate_invocation_context(

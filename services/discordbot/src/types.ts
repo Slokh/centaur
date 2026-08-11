@@ -153,6 +153,10 @@ export type DiscordbotOptions = {
   progressMode?: "narration" | "reactions";
   publicKey: string;
   recoverRenderObligationsOnStart?: boolean;
+  /** Initial exponential backoff for render recovery. Default 250ms. */
+  renderRetryInitialDelayMs?: number;
+  /** Maximum render recovery backoff. Default 5s. */
+  renderRetryMaxDelayMs?: number;
   resolveVisibleChannelIds?: (input: {
     currentChannelId: string;
     currentThreadId?: string;

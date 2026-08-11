@@ -1,4 +1,9 @@
 import type { DiscordbotFetch, DiscordbotOptions } from "./types";
+import type { StateAdapter } from "chat";
+
+const INGESTION_INDEX_KEY = "discordbot:application-ingestion:index";
+const INGESTION_EVENT_PREFIX = "discordbot:application-ingestion:event:";
+const INGESTION_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
 
 export type ObservedDiscordMessage = {
   guildId: string;
@@ -6,6 +11,11 @@ export type ObservedDiscordMessage = {
   threadId?: string;
   messageId: string;
   authorId: string;
+  authorName?: string;
+  displayName?: string;
+  authorIsBot?: boolean;
+  replyToMessageId?: string;
+  normalizedPayload?: unknown;
   content: string;
   createdAt: string;
   editedAt?: string;
@@ -26,37 +36,153 @@ export type ObservedDiscordMessage = {
 export async function ingestObservedDiscordMessage(
   options: DiscordbotOptions,
   message: ObservedDiscordMessage,
+  state?: StateAdapter,
 ): Promise<void> {
   if (!options.applicationIngestionUrl || !options.applicationIngestionToken) {
     return;
   }
-  const fetchFn: DiscordbotFetch = options.fetch ?? fetch;
   const updatedAt = message.editedAt ?? message.createdAt;
+  if (message.authorName) {
+    await persistAndPostIngestionEvent(options, state, {
+      guild_id: message.guildId,
+      source_key: `member:${message.authorId}:${message.authorName}:${message.displayName ?? ""}:${message.authorIsBot === true}`,
+      type: "member_upsert",
+      user_id: message.authorId,
+      username: message.authorName,
+      display_name: message.displayName ?? null,
+      is_bot: message.authorIsBot === true,
+    });
+  }
+  await persistAndPostIngestionEvent(options, state, {
+    guild_id: message.guildId,
+    source_key: `message:${message.messageId}:${updatedAt}`,
+    type: "message_upsert",
+    channel_id: message.threadId ?? message.channelId,
+    message_id: message.messageId,
+    thread_id: message.threadId ?? null,
+    reply_to_message_id: message.replyToMessageId ?? null,
+    author_user_id: message.authorId,
+    content: message.content,
+    normalized_payload: message.normalizedPayload ?? {},
+    created_at: message.createdAt,
+    updated_at: updatedAt,
+    attachments: message.attachments.map((attachment) => ({
+      id: attachment.id,
+      filename: attachment.filename,
+      content_type: attachment.contentType ?? null,
+      size_bytes: attachment.size,
+      url: attachment.url,
+      url_expires_at: discordAttachmentExpiry(attachment.url),
+    })),
+  });
+}
+
+/** Discord signed CDN URLs carry an `ex` Unix timestamp encoded as hex. */
+export function discordAttachmentExpiry(url: string): string | null {
+  try {
+    const encoded = new URL(url).searchParams.get("ex");
+    if (!encoded || !/^[0-9a-f]+$/i.test(encoded)) return null;
+    const seconds = Number.parseInt(encoded, 16);
+    if (!Number.isSafeInteger(seconds) || seconds <= 0) return null;
+    return new Date(seconds * 1000).toISOString();
+  } catch {
+    return null;
+  }
+}
+
+export async function ingestDeletedDiscordMessage(
+  options: DiscordbotOptions,
+  message: { guildId: string; channelId: string; messageId: string; deletedAt: string },
+  state?: StateAdapter,
+): Promise<void> {
+  await persistAndPostIngestionEvent(options, state, {
+    guild_id: message.guildId,
+    source_key: `message-delete:${message.messageId}:${message.deletedAt}`,
+    type: "message_delete",
+    channel_id: message.channelId,
+    message_id: message.messageId,
+    deleted_at: message.deletedAt,
+  });
+}
+
+export async function ingestObservedDiscordChannel(
+  options: DiscordbotOptions,
+  channel: { guildId: string; channelId: string; name?: string; kind: string; parentId?: string; deleted: boolean },
+  state?: StateAdapter,
+): Promise<void> {
+  await persistAndPostIngestionEvent(options, state, channel.deleted ? {
+    guild_id: channel.guildId,
+    source_key: `channel-delete:${channel.channelId}`,
+    type: "channel_delete",
+    channel_id: channel.channelId,
+  } : {
+    guild_id: channel.guildId,
+    source_key: `channel:${channel.channelId}:${channel.name ?? ""}:${channel.kind}:${channel.parentId ?? ""}`,
+    type: "channel_upsert",
+    channel_id: channel.channelId,
+    name: channel.name ?? null,
+    kind: channel.kind,
+    parent_id: channel.parentId ?? null,
+  });
+}
+
+async function persistAndPostIngestionEvent(
+  options: DiscordbotOptions,
+  state: StateAdapter | undefined,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  if (!state) return postIngestionEvent(options, payload);
+  const sourceKey = String(payload.source_key ?? "");
+  if (!sourceKey) throw new Error("application ingestion event lacks source_key");
+  const eventKey = `${INGESTION_EVENT_PREFIX}${sourceKey}`;
+  await state.set(eventKey, payload, INGESTION_RETENTION_MS);
+  await state.appendToList(INGESTION_INDEX_KEY, sourceKey, {
+    maxLength: 100_000,
+    ttlMs: INGESTION_RETENTION_MS,
+  });
+  try {
+    await postIngestionEvent(options, payload);
+    await state.delete(eventKey);
+  } catch {
+    // Gateway delivery has no redelivery. Retain the normalized event and let
+    // the recovery loop retry it; Mindcool source keys make duplicates inert.
+  }
+}
+
+export async function recoverApplicationIngestion(
+  options: DiscordbotOptions,
+  state: StateAdapter,
+): Promise<number> {
+  if (!options.applicationIngestionUrl || !options.applicationIngestionToken) return 0;
+  const sourceKeys = Array.from(new Set(await state.getList<string>(INGESTION_INDEX_KEY)));
+  let pending = 0;
+  for (const sourceKey of sourceKeys) {
+    const eventKey = `${INGESTION_EVENT_PREFIX}${sourceKey}`;
+    const payload = await state.get<Record<string, unknown>>(eventKey);
+    if (!payload) continue;
+    try {
+      await postIngestionEvent(options, payload);
+      await state.delete(eventKey);
+    } catch {
+      pending += 1;
+    }
+  }
+  return pending;
+}
+
+async function postIngestionEvent(
+  options: DiscordbotOptions,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  if (!options.applicationIngestionUrl || !options.applicationIngestionToken) return;
+  const fetchFn: DiscordbotFetch = options.fetch ?? fetch;
   const response = await fetchFn(options.applicationIngestionUrl, {
     method: "POST",
     headers: {
       authorization: `Bearer ${options.applicationIngestionToken}`,
       "content-type": "application/json",
     },
-    body: JSON.stringify({
-      guild_id: message.guildId,
-      source_key: `message:${message.messageId}:${updatedAt}`,
-      type: "message_upsert",
-      channel_id: message.threadId ?? message.channelId,
-      message_id: message.messageId,
-      thread_id: message.threadId ?? null,
-      author_user_id: message.authorId,
-      content: message.content,
-      created_at: message.createdAt,
-      updated_at: updatedAt,
-      attachments: message.attachments.map((attachment) => ({
-        id: attachment.id,
-        filename: attachment.filename,
-        content_type: attachment.contentType ?? null,
-        size_bytes: attachment.size,
-        url: attachment.url,
-      })),
-    }),
+    body: JSON.stringify(payload),
   });
   if (!response.ok) {
     throw new Error(`application ingestion returned ${response.status}`);

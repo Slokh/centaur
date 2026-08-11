@@ -19,6 +19,7 @@ ironProxy:
   image:
     repository: centaur-iron-proxy
     tag: latest
+    digest: ""
     pullPolicy: Always
   service:
     proxyPort: 8080
@@ -79,6 +80,7 @@ toolServer:
   runnerImage:
     repository: ""
     tag: ""
+    digest: ""
     pullPolicy: ""
   # GitHub token for direct private-repo clones when repoCache.enabled=false.
   # With the default repo-cache path, configure repoCache.githubToken instead.
@@ -122,6 +124,7 @@ console:
   image:
     repository: centaur-console
     tag: latest
+    digest: ""
     # Default Always: the image is published under the mutable `latest` tag, so
     # IfNotPresent would pin pods to whatever digest a node already cached.
     pullPolicy: Always
@@ -241,6 +244,7 @@ sandbox:
   image:
     repository: centaur-agent
     tag: latest
+    digest: ""
     pullPolicy: Always
   # Node steering for sandbox pods **and** their paired iron-proxy pods. These
   # reach the pod through the control plane, not through this chart's templates:
@@ -363,6 +367,7 @@ apiRs:
   image:
     repository: centaur-api-rs
     tag: latest
+    digest: ""
     pullPolicy: Always
   port: 8080
   # Sticky percentage of session requests for Codex assigned to Nanocodex.
@@ -501,6 +506,7 @@ slackbotv2:
   image:
     repository: centaur-slackbotv2
     tag: latest
+    digest: ""
     pullPolicy: Always
   userName: centaur
   assistantStatus: ""
@@ -565,6 +571,7 @@ linearbot:
   image:
     repository: centaur-linearbot
     tag: latest
+    digest: ""
     pullPolicy: Always
   userName: centaur
   extraEnv: {}
@@ -583,6 +590,7 @@ githubbot:
   image:
     repository: centaur-githubbot
     tag: latest
+    digest: ""
     pullPolicy: Always
   userName: ""
   # v2 PR self-management (only acts on PRs assigned to the bot account).
@@ -622,6 +630,7 @@ discordbot:
   image:
     repository: centaur-discordbot
     tag: latest
+    digest: ""
     pullPolicy: Always
   userName: centaur
   # Comma/space-separated Discord guild IDs. The bot is INERT (ignores all messages) until set.
@@ -650,6 +659,7 @@ teamsbot:
   image:
     repository: centaur-teamsbot
     tag: latest
+    digest: ""
     pullPolicy: Always
   allowedTeamIds: ""
   allowedChannelIds: ""

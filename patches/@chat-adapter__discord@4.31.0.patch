@@ -1,5 +1,5 @@
 diff --git a/dist/index.d.ts b/dist/index.d.ts
-index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..9cc90b71b93cca503cd3fca1359abb6199d857e2 100644
+index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..86a4b55a181b68972618cf0d1fd23bc06d7ff329 100644
 --- a/dist/index.d.ts
 +++ b/dist/index.d.ts
 @@ -20,8 +20,8 @@ import { ButtonStyle, APIEmbed, ChannelType, APIMessage, InteractionType } from
@@ -13,7 +13,7 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..9cc90b71b93cca503cd3fca1359abb61
       */
      private convertMentionsToDiscord;
      /**
-@@ -47,6 +47,20 @@ declare class DiscordFormatConverter extends BaseFormatConverter {
+@@ -47,6 +47,29 @@ declare class DiscordFormatConverter extends BaseFormatConverter {
   * Discord adapter configuration.
   */
  interface DiscordAdapterConfig {
@@ -26,15 +26,24 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..9cc90b71b93cca503cd3fca1359abb61
 +        threadId?: string;
 +        messageId: string;
 +        authorId: string;
++        authorName?: string;
++        displayName?: string;
++        authorIsBot?: boolean;
++        replyToMessageId?: string;
++        normalizedPayload?: unknown;
 +        content: string;
 +        createdAt: string;
 +        editedAt?: string;
 +        attachments: Array<{ id: string; filename: string; contentType?: string; size: number; url: string }>;
 +    }) => void | Promise<void>;
++    /** Observe Gateway message deletions for external archive reconciliation. */
++    onMessageDeleted?: (message: { guildId: string; channelId: string; messageId: string; deletedAt: string }) => void | Promise<void>;
++    /** Observe Gateway channel create/update/delete events. */
++    onChannelObserved?: (channel: { guildId: string; channelId: string; name?: string; kind: string; parentId?: string; deleted: boolean }) => void | Promise<void>;
      /** Override the Discord API base URL. Defaults to DISCORD_API_URL env var or "https://discord.com/api/v10". */
      apiUrl?: string;
      /** Discord application ID. Defaults to DISCORD_APPLICATION_ID env var. */
-@@ -61,6 +75,44 @@ interface DiscordAdapterConfig {
+@@ -61,6 +84,44 @@ interface DiscordAdapterConfig {
      publicKey?: string;
      /** Override bot username (optional) */
      userName?: string;
@@ -79,7 +88,7 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..9cc90b71b93cca503cd3fca1359abb61
  }
  /**
   * Discord thread ID components.
-@@ -73,6 +125,8 @@ interface DiscordThreadId {
+@@ -73,6 +134,8 @@ interface DiscordThreadId {
      guildId: string;
      /** Thread ID (if message is in a thread) */
      threadId?: string;
@@ -88,7 +97,7 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..9cc90b71b93cca503cd3fca1359abb61
  }
  /**
   * Per-request slash command context used while resolving deferred responses.
-@@ -363,6 +417,13 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
+@@ -363,6 +426,13 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
      protected readonly publicKey: string;
      protected readonly applicationId: string;
      protected readonly mentionRoleIds: string[];
@@ -102,7 +111,7 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..9cc90b71b93cca503cd3fca1359abb61
      protected chat: ChatInstance | null;
      protected readonly logger: Logger;
      protected readonly formatConverter: DiscordFormatConverter;
-@@ -563,6 +624,23 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
+@@ -563,6 +633,23 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
       * Handle a message received via the Gateway WebSocket.
       */
      protected handleGatewayMessage(message: Message$1, isMentioned: boolean): Promise<void>;
@@ -127,7 +136,7 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..9cc90b71b93cca503cd3fca1359abb61
       * Handle a reaction received via the Gateway WebSocket.
       */
 diff --git a/dist/index.js b/dist/index.js
-index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1aa30aa1aa 100644
+index e4f6fe07808ab3c9858fda724c36f7aef5084502..1ffabc9a145280ad31a7e9a793514fbb7767f008 100644
 --- a/dist/index.js
 +++ b/dist/index.js
 @@ -272,11 +272,11 @@ import {
@@ -154,12 +163,14 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
      }
      if (isStrongNode(node)) {
        const content = getNodeChildren(node).map((child) => this.nodeToDiscordMarkdown(child)).join("");
-@@ -398,6 +398,13 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -398,6 +398,15 @@ var DiscordAdapter = class _DiscordAdapter {
    publicKey;
    applicationId;
    mentionRoleIds;
 +  conversationMode;
 +  onMessageObserved;
++  onMessageDeleted;
++  onChannelObserved;
 +  shouldHandleMention;
 +  onMessageDropped;
 +  shouldForwardBotMessage;
@@ -168,12 +179,14 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
    chat = null;
    logger;
    formatConverter = new DiscordFormatConverter();
-@@ -431,7 +438,13 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -431,7 +440,15 @@ var DiscordAdapter = class _DiscordAdapter {
      this.publicKey = publicKey.trim().toLowerCase();
      this.applicationId = applicationId;
      this.mentionRoleIds = config.mentionRoleIds ?? (process.env.DISCORD_MENTION_ROLE_IDS ? process.env.DISCORD_MENTION_ROLE_IDS.split(",").map((id) => id.trim()) : []);
 +    this.conversationMode = config.conversationMode ?? "thread";
 +    this.onMessageObserved = config.onMessageObserved;
++    this.onMessageDeleted = config.onMessageDeleted;
++    this.onChannelObserved = config.onChannelObserved;
      this.botUserId = applicationId;
 +    this.shouldHandleMention = config.shouldHandleMention;
 +    this.onMessageDropped = config.onMessageDropped;
@@ -182,7 +195,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
      this.logger = config.logger ?? new ConsoleLogger("info").child("discord");
      this.userName = config.userName ?? "bot";
      if (!HEX_64_PATTERN.test(this.publicKey)) {
-@@ -896,6 +909,7 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -896,6 +913,7 @@ var DiscordAdapter = class _DiscordAdapter {
      const guildId = data.guild_id || "@me";
      const channelId = data.channel_id;
      let discordThreadId;
@@ -190,7 +203,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
      let parentChannelId = channelId;
      if (data.thread) {
        discordThreadId = data.thread.id;
-@@ -927,7 +941,42 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -927,7 +945,47 @@ var DiscordAdapter = class _DiscordAdapter {
        (roleId) => this.mentionRoleIds.includes(roleId)
      );
      const isMentioned = isUserMentioned || isRoleMentioned;
@@ -215,6 +228,11 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
 +        threadId: discordThreadId,
 +        messageId: data.id,
 +        authorId: data.author.id,
++        authorName: data.author.username,
++        displayName: data.member?.nick ?? data.author.global_name ?? void 0,
++        authorIsBot: data.author.bot === true,
++        replyToMessageId: data.message_reference?.message_id,
++        normalizedPayload: { embeds: data.embeds ?? [], poll: data.poll ?? null, stickers: data.sticker_items ?? [], messageType: data.type },
 +        content: data.content,
 +        createdAt: data.timestamp,
 +        editedAt: data.edited_timestamp ?? void 0,
@@ -234,7 +252,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
        try {
          const newThread = await this.createDiscordThread(channelId, data.id);
          discordThreadId = newThread.id;
-@@ -946,7 +995,8 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -946,7 +1004,8 @@ var DiscordAdapter = class _DiscordAdapter {
      const threadId = this.encodeThreadId({
        guildId,
        channelId: parentChannelId,
@@ -244,7 +262,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
      });
      const chatMessage = new Message({
        id: data.id,
-@@ -978,6 +1028,19 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -978,6 +1037,19 @@ var DiscordAdapter = class _DiscordAdapter {
      try {
        await this.chat.handleIncomingMessage(this, threadId, chatMessage);
      } catch (error) {
@@ -264,7 +282,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
        this.logger.error("Error handling forwarded message", {
          error: String(error),
          messageId: data.id
-@@ -1058,12 +1121,20 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1058,12 +1130,20 @@ var DiscordAdapter = class _DiscordAdapter {
     * Post a message to a Discord channel or thread.
     */
    async postMessage(threadId, message) {
@@ -287,7 +305,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
      const embeds = [];
      const components = [];
      const card = extractCard(message);
-@@ -1318,7 +1389,9 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1318,7 +1398,9 @@ var DiscordAdapter = class _DiscordAdapter {
    async editMessage(threadId, messageId, message) {
      const { channelId, threadId: discordThreadId } = this.decodeThreadId(threadId);
      const targetChannelId = discordThreadId || channelId;
@@ -298,7 +316,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
      const embeds = [];
      const components = [];
      const card = extractCard(message);
-@@ -1530,6 +1603,9 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1530,6 +1612,9 @@ var DiscordAdapter = class _DiscordAdapter {
     * Encode platform data into a thread ID string.
     */
    encodeThreadId(platformData) {
@@ -308,7 +326,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
      const threadPart = platformData.threadId ? `:${platformData.threadId}` : "";
      return `discord:${platformData.guildId}:${platformData.channelId}${threadPart}`;
    }
-@@ -1544,10 +1620,12 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1544,10 +1629,12 @@ var DiscordAdapter = class _DiscordAdapter {
          `Invalid Discord thread ID: ${threadId}`
        );
      }
@@ -322,7 +340,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
      };
    }
    /**
-@@ -1634,11 +1712,49 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1634,11 +1721,49 @@ var DiscordAdapter = class _DiscordAdapter {
      if (body) {
        headers["Content-Type"] = "application/json";
      }
@@ -373,7 +391,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
      if (!response.ok) {
        const errorText = await response.text();
        this.logger.error("Discord API error", {
-@@ -1737,6 +1853,27 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1737,6 +1862,27 @@ var DiscordAdapter = class _DiscordAdapter {
          username: client.user?.username,
          id: client.user?.id
        });
@@ -401,7 +419,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
      });
      client.on(Events.Error, (error) => {
        this.logger.error("Discord Gateway error", { error: String(error) });
-@@ -1774,6 +1911,7 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1774,6 +1920,7 @@ var DiscordAdapter = class _DiscordAdapter {
      } finally {
        isShuttingDown = true;
        client.destroy();
@@ -409,7 +427,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
        this.logger.info("Discord Gateway listener stopped");
      }
    }
-@@ -1787,18 +1925,42 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1787,18 +1934,42 @@ var DiscordAdapter = class _DiscordAdapter {
          return;
        }
        if (message.author.bot) {
@@ -458,7 +476,50 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
        this.logger.info("Discord Gateway message received", {
          channelId: message.channelId,
          guildId: message.guildId,
-@@ -1930,12 +2092,44 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1810,6 +1981,42 @@ var DiscordAdapter = class _DiscordAdapter {
+       });
+       await this.handleGatewayMessage(message, isMentioned);
+     });
++    client.on(Events.MessageUpdate, async (_oldMessage, message) => {
++      if (isShuttingDown() || !this.onMessageObserved || message.partial || !message.guildId) return;
++      const isInThread = message.channel.isThread();
++      await this.onMessageObserved({
++        guildId: message.guildId,
++        channelId: isInThread && message.channel.parentId ? message.channel.parentId : message.channelId,
++        threadId: isInThread ? message.channelId : void 0,
++        messageId: message.id,
++        authorId: message.author.id,
++        authorName: message.author.username,
++        displayName: message.member?.displayName,
++        authorIsBot: message.author.bot,
++        replyToMessageId: message.reference?.messageId,
++        normalizedPayload: { embeds: message.embeds.map((embed) => embed.toJSON()), poll: message.poll?.toJSON() ?? null, stickers: message.stickers.map((sticker) => sticker.toJSON()), messageType: message.type },
++        content: message.content,
++        createdAt: message.createdAt.toISOString(),
++        editedAt: message.editedAt?.toISOString(),
++        attachments: message.attachments.map((attachment) => ({
++          id: attachment.id, filename: attachment.name,
++          contentType: attachment.contentType ?? void 0, size: attachment.size, url: attachment.url
++        }))
++      }).catch((error) => this.logger.warn("Message update observation failed", { error: String(error), messageId: message.id }));
++    });
++    client.on(Events.MessageDelete, async (message) => {
++      if (isShuttingDown() || !this.onMessageDeleted || !message.guildId) return;
++      await this.onMessageDeleted({ guildId: message.guildId, channelId: message.channelId, messageId: message.id, deletedAt: (/* @__PURE__ */ new Date()).toISOString() })
++        .catch((error) => this.logger.warn("Message delete observation failed", { error: String(error), messageId: message.id }));
++    });
++    const observeChannel = async (channel, deleted) => {
++      if (isShuttingDown() || !this.onChannelObserved || !channel.guildId) return;
++      await this.onChannelObserved({ guildId: channel.guildId, channelId: channel.id, name: "name" in channel ? channel.name : void 0, kind: String(channel.type), parentId: "parentId" in channel ? channel.parentId ?? void 0 : void 0, deleted })
++        .catch((error) => this.logger.warn("Channel observation failed", { error: String(error), channelId: channel.id }));
++    };
++    client.on(Events.ChannelCreate, (channel) => observeChannel(channel, false));
++    client.on(Events.ChannelUpdate, (_oldChannel, channel) => observeChannel(channel, false));
++    client.on(Events.ChannelDelete, (channel) => observeChannel(channel, true));
+     client.on(Events.InteractionCreate, async (interaction) => {
+       if (isShuttingDown()) {
+         this.logger.debug("Ignoring interaction - Gateway is shutting down");
+@@ -1930,12 +2137,49 @@ var DiscordAdapter = class _DiscordAdapter {
      const channelId = message.channelId;
      const isInThread = message.channel.isThread();
      let discordThreadId;
@@ -476,6 +537,11 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
 +        threadId: discordThreadId,
 +        messageId: message.id,
 +        authorId: message.author.id,
++        authorName: message.author.username,
++        displayName: message.member?.displayName,
++        authorIsBot: message.author.bot,
++        replyToMessageId: message.reference?.messageId,
++        normalizedPayload: { embeds: message.embeds.map((embed) => embed.toJSON()), poll: message.poll?.toJSON() ?? null, stickers: message.stickers.map((sticker) => sticker.toJSON()), messageType: message.type },
 +        content: message.content,
 +        createdAt: message.createdAt.toISOString(),
 +        editedAt: message.editedAt?.toISOString(),
@@ -504,7 +570,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
        try {
          const newThread = await this.createDiscordThread(channelId, message.id);
          discordThreadId = newThread.id;
-@@ -1954,7 +2148,8 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1954,7 +2198,8 @@ var DiscordAdapter = class _DiscordAdapter {
      const threadId = this.encodeThreadId({
        guildId,
        channelId: parentChannelId,
@@ -514,7 +580,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
      });
      const chatMessage = new Message({
        id: message.id,
-@@ -1983,9 +2178,13 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1983,9 +2228,13 @@ var DiscordAdapter = class _DiscordAdapter {
        })),
        raw: {
          id: message.id,
@@ -528,7 +594,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
          author: {
            id: message.author.id,
            username: message.author.username
-@@ -1998,6 +2197,19 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1998,6 +2247,19 @@ var DiscordAdapter = class _DiscordAdapter {
      try {
        await this.chat.handleIncomingMessage(this, threadId, chatMessage);
      } catch (error) {
@@ -548,7 +614,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
        this.logger.error("Error handling Gateway message", {
          error: String(error),
          messageId: message.id
-@@ -2262,7 +2474,9 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2262,7 +2524,9 @@ var DiscordAdapter = class _DiscordAdapter {
          `Invalid Discord channel ID: ${channelId}`
        );
      }
@@ -559,7 +625,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..451d7a7aaf316544a3afa0afe3adfe1a
      const embeds = [];
      const components = [];
      const card = extractCard(message);
-@@ -2313,6 +2527,43 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2313,6 +2577,43 @@ var DiscordAdapter = class _DiscordAdapter {
        raw: result
      };
    }
