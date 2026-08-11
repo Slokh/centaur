@@ -16,6 +16,8 @@
 # This is a plain module (no Rails dependencies) so it can be required from
 # config/boot.rb and used in early-boot ERB such as config/database.yml.
 module ConsoleEnv
+  require "uri"
+
   PREFIX = "CENTAUR_CONSOLE".freeze
   LEGACY_PREFIX = "IRON_CONTROL".freeze
 
@@ -52,5 +54,20 @@ module ConsoleEnv
     else
       raise KeyError, "neither #{key(suffix)} nor #{legacy_key(suffix)} is set"
     end
+  end
+
+  # Rails merges a configured URL over each named production database. Derive
+  # the cache/queue/cable URLs from the primary DSN so those roles cannot
+  # silently collapse onto the primary database during a cold deployment.
+  def database_url(database_suffix = nil)
+    value = self["DATABASE_URL"]
+    return value if value.nil? || database_suffix.nil?
+
+    uri = URI.parse(value)
+    database = uri.path.delete_prefix("/")
+    raise ArgumentError, "#{key("DATABASE_URL")} must name a database" if database.empty?
+
+    uri.path = "/#{database}#{database_suffix}"
+    uri.to_s
   end
 end
