@@ -58,16 +58,50 @@ export type DiscordbotAppendMessagesRequest = {
 };
 
 export type DiscordbotCreateSessionRequest = {
+  chat_destination?: DiscordbotChatDestination;
   harness_type: string;
   metadata: JsonObject;
+};
+
+export type DiscordbotChatDestination = {
+  platform: "discord";
+  guild_id: string;
+  channel_id: string;
+  thread_id: string | null;
+  reply_to_message_id?: string;
 };
 
 export type DiscordbotExecuteSessionRequest = {
   idempotency_key?: string;
   idle_timeout_ms?: number;
   input_lines: string[];
+  invocation: DiscordbotInvocationContext;
   max_duration_ms?: number;
   metadata: JsonObject;
+};
+
+export type DiscordbotInvocationContext = {
+  version: 1;
+  kind: "discord_member";
+  actor: {
+    platform: "discord";
+    user_id: string;
+    guild_id: string;
+  };
+  conversation: {
+    platform: "discord";
+    channel_id: string;
+    thread_id: string | null;
+  };
+  source: {
+    event_id: string;
+    message_id: string;
+  };
+  authority: {
+    mutation: "current_member_request";
+    observed_at: string;
+    visible_channel_ids: string[];
+  };
 };
 
 export type DiscordbotExecuteSessionResponse = {
@@ -93,8 +127,13 @@ export type DiscordbotOptions = {
   answerEditIntervalMs?: number;
   apiKey?: string;
   apiUrl: string;
+  /** Private application Discord ingestion endpoint; requires the token too. */
+  applicationIngestionUrl?: string;
+  applicationIngestionToken?: string;
   applicationId: string;
   botToken: string;
+  /** Layout for new channel mentions. Existing Discord threads remain threads. */
+  conversationMode?: "thread" | "inline_reply";
   discordApiUrl?: string;
   fetch?: DiscordbotFetch;
   guildAllowlist?: readonly string[];
@@ -110,8 +149,17 @@ export type DiscordbotOptions = {
   /** Rename auto-created threads to the message-derived title. Defaults to true. */
   nameThreads?: boolean;
   postgresUrl?: string;
+  /** Public progress surface. `reactions` never posts reasoning or statuses. */
+  progressMode?: "narration" | "reactions";
   publicKey: string;
   recoverRenderObligationsOnStart?: boolean;
+  resolveVisibleChannelIds?: (input: {
+    currentChannelId: string;
+    currentThreadId?: string;
+    guildId: string;
+    rawMessage: unknown;
+    userId: string;
+  }) => Promise<string[]>;
   state?: StateAdapter;
   stateKeyPrefix?: string;
   /**
@@ -163,6 +211,8 @@ export type DiscordbotTrace = {
 };
 
 export type ForwardSessionInput = {
+  /** Acting member for a new execution; omitted for append-only steering. */
+  actorUserId?: string;
   afterEventId: number;
   /**
    * Human-readable channel name carried in the create-session metadata as
@@ -177,6 +227,7 @@ export type ForwardSessionInput = {
   openStream: boolean;
   threadId: string;
   trace?: DiscordbotTrace;
+  visibleChannelIds?: string[];
 };
 
 /** Minimal slice of the Discord adapter the Gateway runner needs. */

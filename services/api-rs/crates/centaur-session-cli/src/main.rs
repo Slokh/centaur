@@ -102,6 +102,7 @@ async fn main() -> Result<()> {
         .create_session(
             &thread_key,
             CreateSessionRequest {
+                chat_destination: None,
                 harness_type: args.harness_type.into(),
                 persona_id: None,
                 metadata: Some(json!({
@@ -243,6 +244,7 @@ pub(crate) async fn execute_input_lines(
                 metadata: Some(json!({
                     "source": "centaur-session-cli",
                 })),
+                invocation: None,
                 input_lines,
                 idle_timeout_ms: Some(idle_timeout_ms),
                 max_duration_ms: Some(max_duration_ms),

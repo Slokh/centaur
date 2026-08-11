@@ -54,6 +54,7 @@ describe("parseDiscordThreadKey", () => {
       guildId: "G1",
       channelId: "C1",
       threadId: "T1",
+      replyToMessageId: undefined,
     });
   });
 
@@ -62,6 +63,16 @@ describe("parseDiscordThreadKey", () => {
       guildId: "G1",
       channelId: "C1",
       threadId: undefined,
+      replyToMessageId: undefined,
+    });
+  });
+
+  it("decodes an inline reply-chain root independently from a Discord thread", () => {
+    expect(parseDiscordThreadKey("discord:G1:C1:reply~M1")).toEqual({
+      guildId: "G1",
+      channelId: "C1",
+      threadId: undefined,
+      replyToMessageId: "M1",
     });
   });
 

@@ -12,6 +12,7 @@ import {
   type Adapter,
   type Logger,
   type Message as ChatMessage,
+  type MessageContext,
   type StateAdapter,
   type Thread,
 } from "chat";
@@ -25,6 +26,7 @@ import {
   resolveTriggerBotAllowlist,
 } from "./discord-allowlist";
 import { DiscordNarrator, reactToDiscordMessage } from "./discord-narrator";
+import { ingestObservedDiscordMessage } from "./discord-ingestion";
 import { fetchThreadStarterMessage } from "./discord-starter";
 import {
   deriveThreadName,
@@ -171,6 +173,36 @@ export async function resolveDiscordConversationName(
   return name;
 }
 
+async function resolveVisibleChannelScope(
+  options: DiscordbotOptions,
+  message: DiscordbotApiMessage,
+  threadKey: string,
+  logger: Logger,
+): Promise<string[]> {
+  const { guildId, channelId, threadId } = parseDiscordThreadKey(threadKey);
+  const fallback = [channelId, threadId].filter(
+    (value): value is string => Boolean(value),
+  );
+  if (!guildId || !channelId || !options.resolveVisibleChannelIds) return fallback;
+  try {
+    return await options.resolveVisibleChannelIds({
+      currentChannelId: channelId,
+      ...(threadId ? { currentThreadId: threadId } : {}),
+      guildId,
+      rawMessage: message.raw,
+      userId: message.author.userId,
+    });
+  } catch (error) {
+    logger.warn("discordbot_visibility_scope_failed", {
+      channel_id: channelId,
+      error: errorMessage(error),
+      guild_id: guildId,
+      user_id: message.author.userId,
+    });
+    return fallback;
+  }
+}
+
 export function createDiscordbot(options: DiscordbotOptions): Discordbot {
   const userName = options.userName ?? "centaur";
   const logger = options.logger ?? noopLogger;
@@ -185,6 +217,11 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     apiUrl: options.discordApiUrl,
     applicationId: options.applicationId,
     botToken: options.botToken,
+    conversationMode: options.conversationMode,
+    onMessageObserved: async (message) => {
+      if (!isAllowedDiscordGuild(message.guildId, options)) return;
+      await ingestObservedDiscordMessage(options, message);
+    },
     publicKey: options.publicKey,
     mentionRoleIds: options.mentionRoleIds,
     userName,
@@ -248,7 +285,16 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     // double-execute. `'drop'` keeps the lock: a second message that lands while a handler holds the
     // thread lock is dropped rather than run in parallel. Same code path as before for the
     // no-contention case, so single-message streaming is unchanged.
-    concurrency: "drop",
+    concurrency: {
+      strategy: "queue",
+      maxQueueSize: 1_000,
+      onQueueFull: "drop-newest",
+      queueEntryTtlMs: 5 * 60 * 1_000,
+    },
+    // Queue entries must never cross logical Discord conversations. The
+    // adapter's channel scope would otherwise drain a message from one thread
+    // through another thread's handler.
+    lockScope: "thread",
     logger,
   });
 
@@ -259,23 +305,25 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
       DEFAULT_MAX_CONCURRENT_EXECUTIONS_PER_GUILD,
   );
 
-  chat.onNewMention(async (thread, message) => {
+  chat.onNewMention(async (thread, message, context) => {
     if (!isAllowedDiscordMessage(message, options, logger)) return;
     await thread.subscribe();
     await syncThreadMessageToSession(thread, message, {
       executionLimiter,
       mode: "execute",
       options,
+      precedingMessages: allowedQueuedMessages(context, options, logger),
       state,
     });
   });
 
-  chat.onSubscribedMessage(async (thread, message) => {
+  chat.onSubscribedMessage(async (thread, message, context) => {
     if (!isAllowedDiscordMessage(message, options, logger)) return;
     await syncThreadMessageToSession(thread, message, {
       executionLimiter,
       mode: message.isMention === true ? "execute" : "append",
       options,
+      precedingMessages: allowedQueuedMessages(context, options, logger),
       state,
     });
   });
@@ -296,6 +344,16 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
   }
 
   return { app, chat, adapter: discord };
+}
+
+function allowedQueuedMessages(
+  context: MessageContext | undefined,
+  options: DiscordbotOptions,
+  logger: Logger,
+): ChatMessage[] {
+  return (context?.skipped ?? []).filter((message) =>
+    isAllowedDiscordMessage(message, options, logger),
+  );
 }
 
 function createDefaultState(
@@ -365,6 +423,7 @@ async function syncThreadMessageToSession(
     executionLimiter: GuildExecutionLimiter;
     mode: DiscordbotMessageMode;
     options: DiscordbotOptions;
+    precedingMessages?: ChatMessage[];
     state: StateAdapter;
   },
 ): Promise<void> {
@@ -409,6 +468,9 @@ async function syncThreadMessageToSession(
     shouldStartExecution && state.historyForwarded !== true;
   const isDuplicateIncrementalMessage =
     messageIds.has(message.id) &&
+    !(input.precedingMessages ?? []).some(
+      (item) => !messageIds.has(item.id),
+    ) &&
     !shouldStartExecution &&
     !shouldIncludeContext;
   const trace: DiscordbotTrace = {
@@ -430,8 +492,17 @@ async function syncThreadMessageToSession(
 
   const serializeStartedAtMs = nowMs();
   const serializedMessage = await serializeMessage(message);
+  const serializedPrecedingMessages = (
+    await Promise.all((input.precedingMessages ?? []).map(serializeMessage))
+  ).filter((item) => !isContentlessApiMessage(item));
   traceLog(input.options, "discordbot_forward_message_serialized", trace, {
-    attachment_count: serializedMessage.attachments.length,
+    attachment_count:
+      serializedMessage.attachments.length +
+      serializedPrecedingMessages.reduce(
+        (count, item) => count + item.attachments.length,
+        0,
+      ),
+    queued_message_count: serializedPrecedingMessages.length,
     phase_ms: elapsedMs(serializeStartedAtMs),
   });
 
@@ -451,7 +522,10 @@ async function syncThreadMessageToSession(
 
   let context: DiscordbotApiMessage[] | undefined;
 
-  if (shouldIncludeContext && !state.historyForwarded) {
+  const isInlineReply = Boolean(
+    parseDiscordThreadKey(thread.id).replyToMessageId,
+  );
+  if (shouldIncludeContext && !state.historyForwarded && !isInlineReply) {
     const contextStartedAtMs = nowMs();
     try {
       context = await collectInitialContext(thread, message);
@@ -497,6 +571,9 @@ async function syncThreadMessageToSession(
       starter_included: starter !== null,
     });
   } else {
+    if (shouldIncludeContext && isInlineReply) {
+      context = [serializedMessage];
+    }
     traceLog(input.options, "discordbot_forward_context_skipped", trace, {
       message_count: 1,
     });
@@ -506,7 +583,10 @@ async function syncThreadMessageToSession(
   const renderLease: { release: (() => Promise<void>) | null } = {
     release: null,
   };
-  const candidateMessages = context ?? [serializedMessage];
+  const candidateMessages = context ?? [
+    ...serializedPrecedingMessages,
+    serializedMessage,
+  ];
   const messagesToAppend = candidateMessages.filter(
     (item) => !messageIds.has(item.id),
   );
@@ -517,8 +597,19 @@ async function syncThreadMessageToSession(
     thread.id,
     logger,
   );
+  const visibleChannelIds = shouldStartExecution
+    ? await resolveVisibleChannelScope(
+        input.options,
+        serializedMessage,
+        thread.id,
+        logger,
+      )
+    : undefined;
 
   const forwardInput: ForwardSessionInput = {
+    actorUserId: shouldStartExecution
+      ? serializedMessage.author.userId
+      : undefined,
     afterEventId: lastEventId,
     conversationName,
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
@@ -529,6 +620,7 @@ async function syncThreadMessageToSession(
     openStream: false,
     threadId: thread.id,
     trace,
+    visibleChannelIds,
   };
 
   const commitMessagesAppended = async (): Promise<void> => {
@@ -703,6 +795,7 @@ function scheduleExecutionRender(
           isInitialExecution,
           trace,
           onExecutionStarted,
+          onSettled,
         );
         if (result === "complete") return;
         // Discord delta (no slackbotv2 analog): cap the retry loop — see
@@ -812,6 +905,7 @@ async function renderExecutionAttempt(
   onExecutionStarted?: (
     execution: DiscordbotExecuteSessionResponse,
   ) => Promise<void>,
+  onExecutionSettled?: () => void,
 ): Promise<"complete" | "retry"> {
   let rendered = false;
   let retry = false;
@@ -850,6 +944,10 @@ async function renderExecutionAttempt(
       lastEventId: Math.max(latest.lastEventId ?? 0, getLastEventId()),
       ...(rendered ? { renderObligation: null } : {}),
     });
+    // The public reaction lifecycle and durable thread state now agree that
+    // this attempt is terminal. Release guild capacity before best-effort
+    // render-lease cleanup, which must not delay the next conversation.
+    if (!retry) onExecutionSettled?.();
     traceLog(options, "discordbot_render_finalized", trace, {
       obligation_cleared: rendered,
       retry_scheduled: retry,

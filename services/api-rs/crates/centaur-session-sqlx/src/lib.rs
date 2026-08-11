@@ -3,9 +3,9 @@
 use std::{collections::BTreeMap, str::FromStr, time::Duration};
 
 use centaur_session_core::{
-    ExecutionStatus, HarnessType, MessageRole, SandboxCapabilities, SandboxRepoCacheAccess,
-    Session, SessionEvent, SessionExecution, SessionMessage, SessionMessageInput, SessionStatus,
-    ThreadKey, empty_object,
+    ChatDestination, ExecutionStatus, HarnessType, MessageRole, SandboxCapabilities,
+    SandboxRepoCacheAccess, Session, SessionEvent, SessionExecution, SessionMessage,
+    SessionMessageInput, SessionStatus, ThreadKey, empty_object,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -175,7 +175,7 @@ impl PgSessionStore {
     pub async fn get_session(&self, thread_key: &ThreadKey) -> Result<Session, SessionStoreError> {
         let row = sqlx::query_as::<_, SessionRow>(
             r#"
-            select thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            select thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, sandbox_api_server_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, metadata, sandbox_last_active_at, created_at, updated_at
             from sessions
             where thread_key = $1
             "#,
@@ -1620,6 +1620,7 @@ struct SessionRow {
     status: String,
     iron_control_principal: Option<String>,
     proxy_labels: Json<BTreeMap<String, String>>,
+    metadata: Value,
     sandbox_last_active_at: Option<OffsetDateTime>,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
@@ -1631,6 +1632,17 @@ impl TryFrom<SessionRow> for Session {
     fn try_from(row: SessionRow) -> Result<Self, Self::Error> {
         Ok(Self {
             thread_key: parse_persisted(row.thread_key)?,
+            chat_destination: row
+                .metadata
+                .get("chat_destination")
+                .cloned()
+                .map(serde_json::from_value::<ChatDestination>)
+                .transpose()
+                .map_err(|error| {
+                    SessionStoreError::InvalidPersistedValue(format!(
+                        "session chat_destination: {error}"
+                    ))
+                })?,
             title: row.title,
             sandbox_id: row.sandbox_id,
             sandbox_capabilities: match (

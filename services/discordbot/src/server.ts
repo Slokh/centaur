@@ -1,5 +1,6 @@
 import { createGatewayController } from "./gateway";
 import { createDiscordbot, type DiscordbotOptions } from "./index";
+import { resolveDiscordVisibleChannelIds } from "./discord-visibility";
 
 const port = numberEnv("PORT", 3001);
 const apiUrl = stringEnv("CENTAUR_API_URL", "http://127.0.0.1:8080");
@@ -35,9 +36,23 @@ const options: DiscordbotOptions = {
   answerEditIntervalMs: optionalNumberEnv("DISCORDBOT_ANSWER_EDIT_INTERVAL_MS"),
   apiUrl,
   apiKey: optionalEnv("DISCORDBOT_API_KEY"),
+  applicationIngestionUrl: optionalEnv("DISCORDBOT_APPLICATION_INGESTION_URL"),
+  applicationIngestionToken: optionalEnv(
+    "DISCORDBOT_APPLICATION_INGESTION_TOKEN",
+  ),
   applicationId,
   botToken,
+  conversationMode:
+    optionalEnv("DISCORDBOT_CONVERSATION_MODE") === "inline_reply"
+      ? "inline_reply"
+      : "thread",
   publicKey,
+  resolveVisibleChannelIds: (input) =>
+    resolveDiscordVisibleChannelIds({
+      ...input,
+      apiUrl: optionalEnv("DISCORD_API_URL"),
+      botToken,
+    }),
   discordApiUrl: optionalEnv("DISCORD_API_URL"),
   guildAllowlist: optionalList("DISCORDBOT_GUILD_ALLOWLIST"),
   idleTimeoutMs: optionalNumberEnv("SESSION_IDLE_TIMEOUT_MS"),
@@ -49,6 +64,10 @@ const options: DiscordbotOptions = {
   mentionRoleIds: optionalList("DISCORD_MENTION_ROLE_IDS"),
   nameThreads: optionalEnv("DISCORDBOT_NAME_THREADS") !== "false",
   postgresUrl,
+  progressMode:
+    optionalEnv("DISCORDBOT_PROGRESS_MODE") === "reactions"
+      ? "reactions"
+      : "narration",
   stateKeyPrefix: optionalEnv("DISCORDBOT_STATE_KEY_PREFIX"),
   triggerBotAllowlist: optionalList("DISCORDBOT_TRIGGER_BOT_ALLOWLIST"),
   userName: stringEnv("DISCORDBOT_USER_NAME", "centaur"),

@@ -111,6 +111,7 @@ export class DiscordNarrator {
    */
   status(text: string): void {
     if (this.finished) return;
+    if (this.botOptions.progressMode === "reactions") return;
     const trimmed = text.trim();
     if (!trimmed || trimmed === this.lastStatus) return;
     this.lastStatus = trimmed;
@@ -123,6 +124,7 @@ export class DiscordNarrator {
     if (this.finished) return;
     if (chunk.type !== "task_update") return;
     if (chunk.status === "error") this.sawError = true;
+    if (this.botOptions.progressMode === "reactions") return;
     if (chunk.title === "Thinking") {
       if (chunk.details) this.pendingParts.set(chunk.id, chunk.details);
       if (
@@ -151,8 +153,10 @@ export class DiscordNarrator {
       clearTimeout(this.timer);
       this.timer = null;
     }
-    this.flushPendingText();
-    this.enqueueBlurbPost();
+    if (this.botOptions.progressMode !== "reactions") {
+      this.flushPendingText();
+      this.enqueueBlurbPost();
+    }
     const failed =
       outcome === "failed" || (outcome === "done" && this.sawError);
     if (outcome !== "retrying") {

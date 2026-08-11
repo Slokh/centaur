@@ -1,5 +1,6 @@
 import type { RustSessionStreamEvent } from "@centaur/harness-events";
 import type { Attachment, Message } from "chat";
+import { parseDiscordThreadKey } from "./discord-allowlist";
 import { withDiscordEmbedText } from "./discord-starter";
 import type {
   DiscordbotApiAttachment,
@@ -188,7 +189,12 @@ export async function forwardToSessionApi(
   callbacks: ForwardSessionApiCallbacks = {},
 ): Promise<AsyncIterable<DiscordbotRendererSource> | null> {
   const createStartedAtMs = nowMs();
-  await createSession(options, input.threadId, input.conversationName);
+  await createSession(
+    options,
+    input.threadId,
+    input.conversationName,
+    input.actorUserId ?? input.executeMessage?.author.userId,
+  );
   traceLog(options, "discordbot_session_create_complete", input.trace, {
     phase_ms: elapsedMs(createStartedAtMs),
   });
@@ -212,6 +218,7 @@ export async function forwardToSessionApi(
     options,
     input.threadId,
     input.executeMessage,
+    input.visibleChannelIds,
   );
   traceLog(options, "discordbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
@@ -240,6 +247,7 @@ export async function executeSessionTurn(
     options,
     input.threadId,
     input.executeMessage,
+    input.visibleChannelIds,
   );
   traceLog(options, "discordbot_session_execute_complete", input.trace, {
     execution_id: execution.execution_id,
@@ -390,15 +398,19 @@ async function createSession(
   options: DiscordbotOptions,
   threadId: string,
   conversationName?: string,
+  actorUserId?: string,
 ): Promise<void> {
   const fetchFn = options.fetch ?? fetch;
   const name = conversationName?.trim();
+  const destination = discordDestination(threadId);
   const body: DiscordbotCreateSessionRequest = {
+    ...(destination ? { chat_destination: destination } : {}),
     harness_type: "codex",
     metadata: {
       source: "discordbot",
       platform: "discord",
       thread_id: threadId,
+      ...(actorUserId ? { user_id: actorUserId } : {}),
       // api-rs reads this as the session principal's display name.
       ...(name ? { discord_conversation_name: name } : {}),
     },
@@ -435,11 +447,13 @@ async function executeSession(
   options: DiscordbotOptions,
   threadId: string,
   message: DiscordbotApiMessage,
+  visibleChannelIds?: string[],
 ): Promise<DiscordbotExecuteSessionResponse> {
   const fetchFn = options.fetch ?? fetch;
   const body: DiscordbotExecuteSessionRequest = {
     idempotency_key: message.id,
     metadata: sessionMetadata(message, { action: "execute" }),
+    invocation: discordInvocationContext(message, threadId, visibleChannelIds),
     input_lines: toCodexInputLines(message, threadId),
     ...(options.idleTimeoutMs === undefined
       ? {}
@@ -458,6 +472,70 @@ async function executeSession(
   );
   await ensureApiOk(response, "execute session", options);
   return (await response.json()) as DiscordbotExecuteSessionResponse;
+}
+
+function discordDestination(threadId: string):
+  | {
+      platform: "discord";
+      guild_id: string;
+      channel_id: string;
+      thread_id: string | null;
+      reply_to_message_id?: string;
+    }
+  | undefined {
+  const parsed = parseDiscordThreadKey(threadId);
+  if (!parsed.guildId || !parsed.channelId) return undefined;
+  return {
+    platform: "discord",
+    guild_id: parsed.guildId,
+    channel_id: parsed.channelId,
+    thread_id: parsed.threadId ?? null,
+    ...(parsed.replyToMessageId
+      ? { reply_to_message_id: parsed.replyToMessageId }
+      : {}),
+  };
+}
+
+function discordInvocationContext(
+  message: DiscordbotApiMessage,
+  threadId: string,
+  visibleChannelIds?: string[],
+) {
+  const parsed = parseDiscordThreadKey(threadId);
+  if (!parsed.guildId || !parsed.channelId) {
+    throw new Error("Discord session key is missing guild or channel identity");
+  }
+  const visible = new Set(
+    visibleChannelIds ??
+      [parsed.channelId, parsed.threadId].filter(
+        (value): value is string => Boolean(value),
+      ),
+  );
+  visible.add(parsed.channelId);
+  if (parsed.threadId) visible.add(parsed.threadId);
+  return {
+    version: 1 as const,
+    kind: "discord_member" as const,
+    actor: {
+      platform: "discord" as const,
+      user_id: message.author.userId,
+      guild_id: parsed.guildId,
+    },
+    conversation: {
+      platform: "discord" as const,
+      channel_id: parsed.channelId,
+      thread_id: parsed.threadId ?? null,
+    },
+    source: {
+      event_id: message.id,
+      message_id: message.id,
+    },
+    authority: {
+      mutation: "current_member_request" as const,
+      observed_at: message.timestamp,
+      visible_channel_ids: [...visible],
+    },
+  };
 }
 
 async function ensureApiOk(

@@ -7,12 +7,13 @@ the Rust `api-rs` control plane is unchanged (`discord:…` thread keys flow thr
 
 ## Behavior
 
-- **`@`-mention in a channel** → the adapter creates a **public thread from that message**, the
-  bot streams the answer inside it, and the thread is renamed to the message text. The session is
-  keyed by the new thread (`discord:{guild}:{channel}:{threadId}`).
+- **`@`-mention in a channel** → the default `thread` mode creates a public thread. The
+  `inline_reply` mode replies in place and keys the logical session by its root message
+  (`discord:{guild}:{channel}:reply~{messageId}`).
 - **`@`-mention inside an existing thread** → the bot answers in that thread.
 - **Follow-ups inside an active thread** append to the same session without a re-mention.
-- **Append-only narration**: a run instantly reacts 👀 on the triggering message, then posts the
+- **Configurable progress**: a run instantly reacts 👀 on the triggering message. `narration` posts
+  concise activity blurbs; `reactions` posts no public status or reasoning. In narration mode the
   agent's reasoning blurbs as their own *italic* messages as each thought completes (commands/tools
   are not rendered — they just end a thought). The **answer** streams into a separate message
   created when the first answer text arrives, so it lands at the bottom of the thread even when
@@ -49,6 +50,9 @@ ingress** — only a `GET /health` endpoint that reflects the Gateway connection
 | `DISCORDBOT_ANSWER_EDIT_INTERVAL_MS` | – | Edit cadence for the streamed answer message (default 1500 ms, clamped to ≥1500 to respect Discord rate limits). |
 | `DISCORD_MENTION_ROLE_IDS` | – | Role mentions that also trigger the bot. |
 | `DISCORDBOT_NAME_THREADS` | – | Set `false` to keep the adapter's generic thread names. |
+| `DISCORDBOT_CONVERSATION_MODE` | – | `thread` (default) or `inline_reply` for channel reply chains. |
+| `DISCORDBOT_PROGRESS_MODE` | – | `narration` (default) or `reactions` to suppress public progress text. |
+| `DISCORDBOT_APPLICATION_INGESTION_URL` / `DISCORDBOT_APPLICATION_INGESTION_TOKEN` | – | Optional private Discord event sink. Both are required to enable ingestion. |
 | `DISCORDBOT_USER_NAME` | – | Bot display name used for mention parsing/thread naming (default `centaur`; the chart sets it from `discordbot.userName`). |
 | `DISCORDBOT_STATE_KEY_PREFIX` | – | Prefix for rows in the Postgres thread-state store (default `centaur-discordbot`). |
 | `DISCORD_API_URL` | – | Override Discord API base. |
@@ -92,9 +96,8 @@ bun run dev           # run the server locally (needs env above)
 - The Gateway listener can't expose the precise close code on a fatal end; an unexpected
   disconnect exits the process so Kubernetes restarts it (CrashLoopBackOff surfaces bad
   token/intents). `/health` liveness is "listener still running", not a deep socket probe.
-- Concurrency is `'drop'`: the per-thread lock serializes handling so two near-simultaneous mentions
-  can't double-execute. The tradeoff is that a follow-up sent *while a stream is still running* is
-  dropped rather than appended mid-stream; send it again once the reply finishes.
+- Concurrency uses a bounded queue per logical conversation. Follow-ups that arrive during a run
+  are appended in order; overflowing or expired queue entries are surfaced to the member.
 - Thread renaming is best-effort, applies on the first execution, and only touches threads the
   bot created from a channel mention (`isThreadCreatedForMessage`); a mention inside a
   user-created thread never renames it (set `DISCORDBOT_NAME_THREADS=false` to disable renaming

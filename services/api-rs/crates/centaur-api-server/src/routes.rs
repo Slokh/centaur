@@ -47,6 +47,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use subtle::ConstantTimeEq;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tower_http::trace::TraceLayer;
 use tracing::Span;
@@ -61,9 +62,9 @@ use crate::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         DiscordThreadContext, EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest,
         ExecuteSessionResponse, GithubThreadContext, HarnessAssignment,
-        InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, LinearThreadContext,
-        ListWorkflowRunsQuery, OnHarnessConflict, SessionContextResponse, SessionSseEvent,
-        SlackThreadContext, stream_error_sse,
+        InterruptSessionExecutionRequest, InterruptSessionExecutionResponse, InvocationContext,
+        InvocationKind, LinearThreadContext, ListWorkflowRunsQuery, OnHarnessConflict,
+        SessionContextResponse, SessionSseEvent, SlackThreadContext, stream_error_sse,
     },
 };
 
@@ -72,6 +73,16 @@ pub struct AppState {
     initialized: Arc<RwLock<Option<AppRuntimeState>>>,
     metrics: PrometheusHandle,
     codex_nanocodex_rollout_percent: u8,
+    application_gateway: Option<ApplicationGatewayConfig>,
+    http: reqwest::Client,
+}
+
+#[derive(Clone)]
+struct ApplicationGatewayConfig {
+    base_url: String,
+    signing_secret: String,
+    capabilities: BTreeSet<String>,
+    gateway_key: String,
 }
 
 #[derive(Clone)]
@@ -87,6 +98,8 @@ impl AppState {
             initialized: Arc::new(RwLock::new(None)),
             metrics: prometheus_handle().expect("failed to initialize Prometheus metrics recorder"),
             codex_nanocodex_rollout_percent: 0,
+            application_gateway: application_gateway_config_from_env(),
+            http: reqwest::Client::new(),
         }
     }
 
@@ -239,6 +252,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             post(interrupt_session_execution),
         )
         .route("/api/session/{thread_key}/events", get(stream_events))
+        .route(
+            "/api/session/{thread_key}/application/{capability}",
+            post(invoke_application_capability).layer(DefaultBodyLimit::max(1024 * 1024)),
+        )
         .route("/api/sandboxes/drain", post(drain_sandboxes))
         .merge(slack_proxy_router())
         .route("/api/workflows/schedules", get(list_workflow_schedules))
@@ -448,6 +465,15 @@ async fn create_or_get_session(
     Json(request): Json<CreateSessionRequest>,
 ) -> Result<Json<CreateSessionResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    if let (Some(encoded), Some(explicit)) = (
+        thread_key.chat_destination(),
+        request.chat_destination.as_ref(),
+    ) && &encoded != explicit
+    {
+        return Err(ApiError::BadRequest(
+            "chat_destination conflicts with the destination encoded by thread_key".to_owned(),
+        ));
+    }
     let requested_harness = request.harness_type;
     let runtime = state.runtime()?;
     let existing_rollout_harness = if requested_harness == HarnessType::Codex {
@@ -491,15 +517,26 @@ async fn create_or_get_session(
         Some(OnHarnessConflict::Restart) => HarnessConflictPolicy::Restart,
         Some(OnHarnessConflict::Reject) | None => HarnessConflictPolicy::Reject,
     };
+    let metadata =
+        session_metadata_with_harness_assignment(request.metadata, harness_assignment.as_ref());
+    let metadata =
+        session_metadata_with_chat_destination(metadata, request.chat_destination.as_ref());
     let outcome = runtime
         .create_or_get_session(
             &thread_key,
             &harness_type,
             request.persona_id.as_deref(),
-            session_metadata_with_harness_assignment(request.metadata, harness_assignment.as_ref()),
+            metadata,
             on_harness_conflict,
         )
         .await?;
+    if let Some(requested) = request.chat_destination.as_ref()
+        && outcome.session.resolved_chat_destination().as_ref() != Some(requested)
+    {
+        return Err(ApiError::BadRequest(
+            "existing session has a different chat_destination".to_owned(),
+        ));
+    }
     Ok(Json(CreateSessionResponse {
         session: outcome.session,
         harness_switched: outcome.harness_switched,
@@ -542,6 +579,20 @@ fn session_metadata_with_harness_assignment(
                 "rollout_percent": assignment.rollout_percent,
             }),
         );
+    }
+    Some(metadata)
+}
+
+fn session_metadata_with_chat_destination(
+    metadata: Option<Value>,
+    destination: Option<&ChatDestination>,
+) -> Option<Value> {
+    let Some(destination) = destination else {
+        return metadata;
+    };
+    let mut metadata = metadata.unwrap_or_else(|| json!({}));
+    if let Value::Object(object) = &mut metadata {
+        object.insert("chat_destination".to_owned(), json!(destination));
     }
     Some(metadata)
 }
@@ -661,7 +712,17 @@ async fn get_session_context(
 ) -> Result<Json<SessionContextResponse>, ApiError> {
     let runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let destination = thread_key.chat_destination();
+    let destination = match runtime.session(&thread_key).await {
+        Ok(session) => session.resolved_chat_destination(),
+        Err(error) => {
+            tracing::debug!(
+                thread_key = %thread_key,
+                %error,
+                "session unavailable while resolving optional chat destination"
+            );
+            thread_key.chat_destination()
+        }
+    };
     let platform = destination
         .as_ref()
         .map(ChatDestination::platform)
@@ -684,12 +745,14 @@ async fn get_session_context(
             guild_id,
             channel_id,
             thread_id,
+            reply_to_message_id,
         }) => (
             None,
             Some(DiscordThreadContext {
                 guild_id,
                 channel_id,
                 thread_id,
+                reply_to_message_id,
             }),
             None,
             None,
@@ -778,13 +841,21 @@ async fn execute_session(
     Json(request): Json<ExecuteSessionRequest>,
 ) -> Result<Json<ExecuteSessionResponse>, ApiError> {
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let execution = state
-        .runtime()?
+    let runtime = state.runtime()?;
+    if let Some(invocation) = request.invocation.as_ref() {
+        let destination = runtime
+            .session(&thread_key)
+            .await?
+            .resolved_chat_destination();
+        validate_invocation_context(invocation, destination.as_ref())?;
+    }
+    let metadata = execution_metadata_with_invocation(request.metadata, request.invocation);
+    let execution = runtime
         .execute_session(
             &thread_key,
             ExecuteSessionInput {
                 idempotency_key: request.idempotency_key,
-                metadata: request.metadata,
+                metadata,
                 input_lines: request.input_lines,
                 idle_timeout_ms: request.idle_timeout_ms,
                 max_duration_ms: request.max_duration_ms,
@@ -797,6 +868,224 @@ async fn execute_session(
         thread_key: execution.thread_key,
         status: execution.status.to_string(),
     }))
+}
+
+fn execution_metadata_with_invocation(
+    metadata: Option<Value>,
+    invocation: Option<InvocationContext>,
+) -> Option<Value> {
+    let Some(invocation) = invocation else {
+        return metadata;
+    };
+    let mut metadata = metadata.unwrap_or_else(|| json!({}));
+    if let Value::Object(object) = &mut metadata {
+        object.insert("invocation".to_owned(), json!(invocation));
+    }
+    Some(metadata)
+}
+
+#[derive(Serialize)]
+struct ApplicationInvocationClaims<'a> {
+    iss: &'static str,
+    sub: &'a str,
+    aud: &'static str,
+    exp: i64,
+    nbf: i64,
+    iat: i64,
+    jti: String,
+    execution_id: &'a str,
+    capability: &'a str,
+    body_sha256: &'a str,
+    invocation: &'a InvocationContext,
+}
+
+async fn invoke_application_capability(
+    State(state): State<AppState>,
+    Path((raw_thread_key, capability)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let config = state.application_gateway.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("application gateway is not configured".to_owned())
+    })?;
+    let supplied_key = headers
+        .get("x-centaur-application-gateway-key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if supplied_key
+        .as_bytes()
+        .ct_eq(config.gateway_key.as_bytes())
+        .unwrap_u8()
+        != 1
+    {
+        return Err(ApiError::Unauthorized(
+            "application gateway credential is invalid".to_owned(),
+        ));
+    }
+    if !config.capabilities.contains(&capability) {
+        return Err(ApiError::Forbidden(
+            "application capability is not allowlisted".to_owned(),
+        ));
+    }
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    let execution = state
+        .runtime()?
+        .active_execution(&thread_key)
+        .await?
+        .ok_or_else(|| ApiError::Forbidden("no active execution for this session".to_owned()))?;
+    let invocation: InvocationContext = serde_json::from_value(
+        execution
+            .metadata
+            .get("invocation")
+            .cloned()
+            .ok_or_else(|| ApiError::Forbidden("execution has no trusted invocation".to_owned()))?,
+    )
+    .map_err(|_| ApiError::Internal("stored invocation context is invalid".to_owned()))?;
+    let body_sha256 = hex::encode(Sha256::digest(&body));
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let token_id = hex::encode(Sha256::digest(format!(
+        "{}\0{}\0{}",
+        execution.execution_id, capability, body_sha256
+    )));
+    let claims = ApplicationInvocationClaims {
+        iss: "centaur",
+        sub: &invocation.actor.user_id,
+        aud: "centaur-application",
+        exp: now + 60,
+        nbf: now - 5,
+        iat: now,
+        jti: token_id,
+        execution_id: &execution.execution_id,
+        capability: &capability,
+        body_sha256: &body_sha256,
+        invocation: &invocation,
+    };
+    let token = jsonwebtoken::encode(
+        &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+        &claims,
+        &jsonwebtoken::EncodingKey::from_secret(config.signing_secret.as_bytes()),
+    )
+    .map_err(|error| {
+        ApiError::Internal(format!("failed to sign application invocation: {error}"))
+    })?;
+    let url = format!(
+        "{}/v1/capabilities/{}",
+        config.base_url.trim_end_matches('/'),
+        capability
+    );
+    let upstream = state
+        .http
+        .post(url)
+        .bearer_auth(token)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| {
+            ApiError::ServiceUnavailable(format!("application request failed: {error}"))
+        })?;
+    let status = upstream.status();
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .cloned();
+    let bytes = upstream.bytes().await.map_err(|error| {
+        ApiError::Internal(format!("failed to read application response: {error}"))
+    })?;
+    let mut response = Response::builder()
+        .status(status)
+        .body(Body::from(bytes))
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+    if let Some(content_type) = content_type {
+        response
+            .headers_mut()
+            .insert(axum::http::header::CONTENT_TYPE, content_type);
+    }
+    Ok(response)
+}
+
+fn application_gateway_config_from_env() -> Option<ApplicationGatewayConfig> {
+    let base_url = env::var("CENTAUR_APPLICATION_URL").ok()?.trim().to_owned();
+    let signing_secret = env::var("CENTAUR_APPLICATION_SIGNING_SECRET")
+        .ok()?
+        .trim()
+        .to_owned();
+    let gateway_key = env::var("CENTAUR_APPLICATION_GATEWAY_KEY")
+        .ok()?
+        .trim()
+        .to_owned();
+    let capabilities: BTreeSet<String> = env::var("CENTAUR_APPLICATION_CAPABILITIES")
+        .ok()?
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if base_url.is_empty()
+        || signing_secret.is_empty()
+        || gateway_key.is_empty()
+        || capabilities.is_empty()
+    {
+        return None;
+    }
+    Some(ApplicationGatewayConfig {
+        base_url,
+        signing_secret,
+        capabilities,
+        gateway_key,
+    })
+}
+
+fn validate_invocation_context(
+    invocation: &InvocationContext,
+    destination: Option<&ChatDestination>,
+) -> Result<(), ApiError> {
+    if invocation.version != 1 || invocation.kind != InvocationKind::DiscordMember {
+        return Err(ApiError::BadRequest(
+            "unsupported invocation context".to_owned(),
+        ));
+    }
+    let Some(ChatDestination::Discord {
+        guild_id,
+        channel_id,
+        thread_id,
+        ..
+    }) = destination
+    else {
+        return Err(ApiError::BadRequest(
+            "Discord invocation requires a Discord session destination".to_owned(),
+        ));
+    };
+    if invocation.actor.platform != "discord"
+        || invocation.conversation.platform != "discord"
+        || invocation.actor.guild_id != *guild_id
+        || invocation.conversation.channel_id != *channel_id
+        || invocation.conversation.thread_id.as_ref() != thread_id.as_ref()
+    {
+        return Err(ApiError::BadRequest(
+            "invocation actor or conversation conflicts with the session destination".to_owned(),
+        ));
+    }
+    if invocation.actor.user_id.trim().is_empty()
+        || invocation.source.event_id.trim().is_empty()
+        || invocation.source.message_id.trim().is_empty()
+        || invocation.authority.observed_at.trim().is_empty()
+    {
+        return Err(ApiError::BadRequest(
+            "invocation identity, source, and observation time are required".to_owned(),
+        ));
+    }
+    let visible = invocation
+        .authority
+        .visible_channel_ids
+        .iter()
+        .collect::<BTreeSet<_>>();
+    if !visible.contains(channel_id) || thread_id.as_ref().is_some_and(|id| !visible.contains(id)) {
+        return Err(ApiError::BadRequest(
+            "invocation visibility does not include the session destination".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 async fn interrupt_session_execution(

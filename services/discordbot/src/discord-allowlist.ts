@@ -9,10 +9,21 @@ export function parseDiscordThreadKey(threadKey: string): {
   guildId?: string;
   channelId?: string;
   threadId?: string;
+  replyToMessageId?: string;
 } {
   const parts = threadKey.split(":");
   if (parts[0] !== "discord") return {};
-  return { guildId: parts[1], channelId: parts[2], threadId: parts[3] };
+  const encodedDestination = parts[3];
+  return {
+    guildId: parts[1],
+    channelId: parts[2],
+    threadId: encodedDestination?.startsWith("reply~")
+      ? undefined
+      : encodedDestination,
+    replyToMessageId: encodedDestination?.startsWith("reply~")
+      ? encodedDestination.slice(6)
+      : undefined,
+  };
 }
 
 /**
