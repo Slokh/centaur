@@ -211,7 +211,7 @@ spec:
       {{- end }}
       containers:
         - name: api-rs
-          image: {{ printf "%s:%s" .Values.apiRs.image.repository .Values.apiRs.image.tag | quote }}
+          image: {{ include "centaur.imageRef" .Values.apiRs.image | quote }}
           imagePullPolicy: {{ .Values.apiRs.image.pullPolicy }}
           env:
             - name: DATABASE_URL
@@ -336,7 +336,7 @@ spec:
             - name: SESSION_SANDBOX_K8S_NAMESPACE
               value: {{ .Release.Namespace | quote }}
             - name: SESSION_SANDBOX_IMAGE
-              value: {{ printf "%s:%s" .Values.sandbox.image.repository .Values.sandbox.image.tag | quote }}
+              value: {{ include "centaur.imageRef" .Values.sandbox.image | quote }}
             - name: SESSION_SANDBOX_IMAGE_PULL_POLICY
               value: {{ .Values.sandbox.image.pullPolicy | quote }}
 {{- if and .Values.sandbox.resources (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_RESOURCES")) }}
@@ -374,7 +374,7 @@ spec:
 {{- end }}
 {{- end }}
             - name: KUBERNETES_IRON_PROXY_IMAGE
-              value: {{ printf "%s:%s" .Values.ironProxy.image.repository .Values.ironProxy.image.tag | quote }}
+              value: {{ include "centaur.imageRef" .Values.ironProxy.image | quote }}
             - name: KUBERNETES_IRON_PROXY_IMAGE_PULL_POLICY
               value: {{ .Values.ironProxy.image.pullPolicy | quote }}
             - name: KUBERNETES_IRON_PROXY_UPSTREAM_DENY_CIDRS
@@ -498,7 +498,11 @@ spec:
 {{- end }}
 {{- end }}
             - name: KUBERNETES_TOOLS_RUNNER_IMAGE
-              value: {{ printf "%s:%s" (default .Values.sandbox.image.repository .Values.toolServer.runnerImage.repository) (default .Values.sandbox.image.tag .Values.toolServer.runnerImage.tag) | quote }}
+              value: {{ include "centaur.imageRef" (dict
+                "repository" (default .Values.sandbox.image.repository .Values.toolServer.runnerImage.repository)
+                "tag" (default .Values.sandbox.image.tag .Values.toolServer.runnerImage.tag)
+                "digest" (ternary .Values.toolServer.runnerImage.digest .Values.sandbox.image.digest (ne .Values.toolServer.runnerImage.repository ""))
+              ) | quote }}
             - name: KUBERNETES_TOOLS_RUNNER_IMAGE_PULL_POLICY
               value: {{ default .Values.sandbox.image.pullPolicy .Values.toolServer.runnerImage.pullPolicy | quote }}
 {{- if and .Values.toolServer.githubToken.existingSecretName (not $toolsUseRepoCache) }}

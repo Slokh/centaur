@@ -63,7 +63,7 @@ beforeAll(async () => {
 beforeEach(async () => {
   await bot?.chat.shutdown().catch(() => undefined);
   discordApi.reset();
-  codexApi.reset();
+  await codexApi.reset();
   bot = createTestBot();
 });
 
@@ -338,7 +338,7 @@ describe("discordbot", () => {
 
     codexApi.emitOutputLines(key, sampleCodexOutputLines("First run done."));
     await waitForSettle(threadId, firstMentionId);
-  });
+  }, 15_000);
 
   // Regression (a) — upstream 4c7ee514.
   it("ignores non-JSON sandbox bootstrap output lines instead of ending the stream", async () => {
@@ -416,7 +416,7 @@ describe("discordbot", () => {
     expect(answerPostsIn(threadId).join("\n")).toContain(
       "Execution failed: Reconnecting... 2/5: unexpected status 502 Bad Gateway",
     );
-  });
+  }, 15_000);
 
   it("renders successful completions with no final answer as visible text", async () => {
     codexApi.autoRespond = false;
@@ -455,7 +455,7 @@ describe("discordbot", () => {
     expect(answerPostsIn(threadId).join("\n")).toContain(
       "Execution completed, but no final text was captured.",
     );
-  });
+  }, 15_000);
 
   it("renders api-rs completion result text when no final answer delta streamed", async () => {
     codexApi.autoRespond = false;
@@ -784,7 +784,7 @@ describe("discordbot", () => {
     expect(answers.join("\n")).toContain("Done with status.");
     expect(answers.join("\n")).not.toContain(firstSummary);
     expect(hasReaction(threadId, mentionId, "PUT", "✅")).toBe(true);
-  });
+  }, 15_000);
 
   // Regression (g) — transient create/append failure is retried in place.
   it("retries a transient createSession failure and succeeds without user-visible error", async () => {
@@ -1253,6 +1253,12 @@ describe("discordbot", () => {
         (request) => request.threadKey === healthyKey,
       ),
     ).toHaveLength(1);
+    await waitFor(async () => {
+      const latest = await sharedState.get<Record<string, unknown>>(
+        `thread-state:${healthyKey}`,
+      );
+      return latest?.activeExecution === false && latest.renderObligation === null;
+    });
     const healthyState = await sharedState.get<Record<string, unknown>>(
       `thread-state:${healthyKey}`,
     );
@@ -1370,6 +1376,8 @@ function createTestBot(overrides: Partial<DiscordbotOptions> = {}): Discordbot {
     guildAllowlist: [GUILD_ID],
     publicKey: PUBLIC_KEY,
     recoverRenderObligationsOnStart: false,
+    renderRetryInitialDelayMs: 5,
+    renderRetryMaxDelayMs: 20,
     state: createMemoryState(),
     ...overrides,
   });
@@ -1503,14 +1511,27 @@ async function waitForSettle(
   emoji: "✅" | "❌" = "✅",
   timeoutMs = 5000,
 ): Promise<void> {
-  await waitFor(
-    () => hasReaction(channelId, messageId, "PUT", emoji),
-    timeoutMs,
-  );
-  await waitFor(
-    () => hasReaction(channelId, messageId, "DELETE", "👀"),
-    timeoutMs,
-  );
+  try {
+    await waitFor(
+      () => hasReaction(channelId, messageId, "PUT", emoji),
+      timeoutMs,
+    );
+    await waitFor(
+      () => hasReaction(channelId, messageId, "DELETE", "👀"),
+      timeoutMs,
+    );
+  } catch (error) {
+    throw new Error(
+      `Timed out waiting for ${emoji} settlement: ${JSON.stringify({
+        answers: answerPostsIn(channelId),
+        eventRequests: codexApi.eventRequests,
+        executes: codexApi.executes.map((request) => request.threadKey),
+        reactions: reactionsOn(channelId, messageId),
+        streamCount: codexApi.streamCount,
+      })}`,
+      { cause: error },
+    );
+  }
 }
 
 function sessionMessageTexts(messages: DiscordbotSessionMessage[]): string[] {
@@ -2118,7 +2139,7 @@ type MockSessionApi = {
   failNextExecuteAfterAccept: boolean;
   hasStream(threadKey: string): boolean;
   holdNextExecute(): () => void;
-  reset(): void;
+  reset(): Promise<void>;
   streamCount: number;
   url: string;
 };
@@ -2207,24 +2228,38 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
     creates,
     eventRequests,
     executes,
-    reset() {
+    async reset() {
+      // A timed-out assertion can leave a detached render attempt holding an
+      // SSE response after Chat SDK shutdown. Make that prior attempt
+      // recoverable before clearing observations for the next test: otherwise
+      // closeStreams() preserves failAllEvents/idempotency from the failed
+      // case, starts the 33-second retry loop, and contaminates later counts.
+      const hadLiveStreams = streams.size > 0;
+      autoRespond = true;
+      failAllEvents = false;
+      failNextCreate = false;
+      failNextEvents = false;
+      failNextExecute = false;
+      failNextExecuteAfterAccept = false;
+      idempotentExecutions.clear();
+      events.length = 0;
+      executeHoldRelease?.();
+      executeHold = null;
+      executeHoldRelease = null;
+      closeStreams();
+      if (hadLiveStreams) {
+        // Production retry starts at 250ms. Give the detached attempt enough
+        // time to reopen against the now-healthy fake API and consume its
+        // auto-generated terminal event before resetting recorded calls.
+        await sleep(350);
+      }
       appends.length = 0;
       creates.length = 0;
       eventRequests.length = 0;
       events.length = 0;
       executes.length = 0;
       idempotentExecutions.clear();
-      executeHoldRelease?.();
-      executeHold = null;
-      executeHoldRelease = null;
-      closeStreams();
-      autoRespond = true;
       eventId = 0;
-      failAllEvents = false;
-      failNextCreate = false;
-      failNextEvents = false;
-      failNextExecute = false;
-      failNextExecuteAfterAccept = false;
     },
     url: `http://127.0.0.1:${port}`,
     closeStreams,
@@ -2414,25 +2449,35 @@ async function handleMockCodexRequest(
       connection: "keep-alive",
       "content-type": "text/event-stream",
     });
-    input.streams.add(res);
-    input.streamThreadKeys.set(res, threadKey);
-    for (const event of input.events) {
-      if (
-        event.threadKey === threadKey &&
-        event.id > afterEventId &&
-        (!executionId ||
-          !event.executionId ||
-          event.executionId === executionId)
-      ) {
-        writeMockSseEvent(res, event);
-      }
-    }
     // IncomingMessage "close" means the GET request body is complete and may
     // fire while its SSE response is still live. Track the response lifecycle
     // so live emissions cannot silently lose their registered stream.
     res.once("close", () => {
       input.streams.delete(res);
       input.streamThreadKeys.delete(res);
+    });
+    // Do not expose the stream to tests until the initial SSE bytes have
+    // flushed. Merely calling writeHead() is not a client-readiness signal in
+    // Bun: a terminal event emitted in that gap can remain unread even though
+    // the fake's server-side stream set already contains the response.
+    res.write(": connected\n\n", () => {
+      if (res.destroyed) return;
+      input.streams.add(res);
+      input.streamThreadKeys.set(res, threadKey);
+      // Events can arrive between request acceptance and this flushed-write
+      // callback. Replay the durable fake ledger after registration so those
+      // events are delivered exactly once to the newly ready response.
+      for (const event of input.events) {
+        if (
+          event.threadKey === threadKey &&
+          event.id > afterEventId &&
+          (!executionId ||
+            !event.executionId ||
+            event.executionId === executionId)
+        ) {
+          writeMockSseEvent(res, event);
+        }
+      }
     });
     return;
   }
@@ -2602,6 +2647,12 @@ async function sendWebResponse(
   response.headers.forEach((value, key) => {
     res.setHeader(key, value);
   });
+  // Keep the node:http fakes deterministic under Bun's fetch pool. Completed
+  // JSON/REST responses do not need connection reuse, and a socket cancelled
+  // by the preceding SSE test can otherwise be selected until Node's 5-second
+  // keep-alive timeout expires. SSE responses bypass this helper and remain
+  // intentionally long-lived.
+  res.setHeader("connection", "close");
   if (response.body === null || response.status === 204) {
     res.end();
     return;
@@ -2629,12 +2680,12 @@ function closeServer(server: HttpServer): Promise<void> {
 }
 
 async function waitFor(
-  predicate: () => boolean,
+  predicate: () => boolean | Promise<boolean>,
   timeoutMs = 5000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("Timed out waiting for condition");

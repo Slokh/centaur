@@ -15,6 +15,7 @@ centaur-session-sqlx.workspace = true
 centaur-telemetry.workspace = true
 dashmap.workspace = true
 futures-util.workspace = true
+hmac.workspace = true
 hex.workspace = true
 reqwest.workspace = true
 serde.workspace = true

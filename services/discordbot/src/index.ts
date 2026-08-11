@@ -26,8 +26,14 @@ import {
   resolveTriggerBotAllowlist,
 } from "./discord-allowlist";
 import { DiscordNarrator, reactToDiscordMessage } from "./discord-narrator";
-import { ingestObservedDiscordMessage } from "./discord-ingestion";
+import {
+  ingestDeletedDiscordMessage,
+  ingestObservedDiscordChannel,
+  ingestObservedDiscordMessage,
+  recoverApplicationIngestion,
+} from "./discord-ingestion";
 import { fetchThreadStarterMessage } from "./discord-starter";
+import { reconcileDiscordArchive } from "./discord-reconciliation";
 import {
   deriveThreadName,
   fetchDiscordChannelName,
@@ -213,6 +219,7 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     });
   }
 
+  const state = options.state ?? createDefaultState(options, logger);
   const discord = createDiscordAdapter({
     apiUrl: options.discordApiUrl,
     applicationId: options.applicationId,
@@ -220,7 +227,15 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     conversationMode: options.conversationMode,
     onMessageObserved: async (message) => {
       if (!isAllowedDiscordGuild(message.guildId, options)) return;
-      await ingestObservedDiscordMessage(options, message);
+      await ingestObservedDiscordMessage(options, message, state);
+    },
+    onMessageDeleted: async (message) => {
+      if (!isAllowedDiscordGuild(message.guildId, options)) return;
+      await ingestDeletedDiscordMessage(options, message, state);
+    },
+    onChannelObserved: async (channel) => {
+      if (!isAllowedDiscordGuild(channel.guildId, options)) return;
+      await ingestObservedDiscordChannel(options, channel, state);
     },
     publicKey: options.publicKey,
     mentionRoleIds: options.mentionRoleIds,
@@ -268,7 +283,6 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     // 503 once the connection has been down for >60s (see gateway.ts).
     onGatewayStatusChange: (connected) => setGatewayConnected(connected),
   });
-  const state = options.state ?? createDefaultState(options, logger);
   const chat = new Chat<{ discord: typeof discord }, DiscordbotThreadState>({
     userName,
     adapters: { discord },
@@ -304,6 +318,10 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     options.maxConcurrentExecutionsPerGuild ??
       DEFAULT_MAX_CONCURRENT_EXECUTIONS_PER_GUILD,
   );
+
+  if (options.applicationIngestionUrl && options.applicationIngestionToken) {
+    scheduleApplicationIngestionRecovery(state, options);
+  }
 
   chat.onNewMention(async (thread, message, context) => {
     if (!isAllowedDiscordMessage(message, options, logger)) return;
@@ -826,7 +844,7 @@ function scheduleExecutionRender(
           ).catch(() => undefined);
           return;
         }
-        const delayMs = renderRetryDelayMs(attempt);
+        const delayMs = renderRetryDelayMs(attempt, options);
         attempt += 1;
         traceLog(options, "discordbot_render_retry_scheduled", trace, {
           retry_delay_ms: delayMs,
@@ -964,6 +982,56 @@ function scheduleRenderObligationRecovery(
   backgroundWaitUntil(recoverRenderObligationsWithRetry(chat, state, options));
 }
 
+function scheduleApplicationIngestionRecovery(
+  state: StateAdapter,
+  options: DiscordbotOptions,
+): void {
+  backgroundWaitUntil(
+    (async () => {
+      await ensureStateConnected(state, options);
+      const recoverOutbox = async () => {
+        try {
+          const pending = await recoverApplicationIngestion(options, state);
+          if (pending > 0) {
+            traceLog(options, "discordbot_application_ingestion_pending", undefined, {
+              pending_count: pending,
+            });
+          }
+        } catch (error) {
+          traceLog(options, "discordbot_application_ingestion_recovery_failed", undefined, {
+            error: errorMessage(error),
+          });
+        }
+      };
+      const reconcileArchive = async () => {
+        try {
+          const observed = await reconcileDiscordArchive(options, state);
+          if (observed > 0) {
+            traceLog(options, "discordbot_application_archive_reconciled", undefined, {
+              observed_count: observed,
+            });
+          }
+        } catch (error) {
+          traceLog(options, "discordbot_application_archive_reconciliation_failed", undefined, {
+            error: errorMessage(error),
+          });
+        }
+      };
+      await Promise.all([recoverOutbox(), reconcileArchive()]);
+      const outboxTimer = setInterval(
+        () => backgroundWaitUntil(recoverOutbox()),
+        5_000,
+      );
+      const archiveTimer = setInterval(
+        () => backgroundWaitUntil(reconcileArchive()),
+        60_000,
+      );
+      outboxTimer.unref();
+      archiveTimer.unref();
+    })(),
+  );
+}
+
 async function recoverRenderObligationsWithRetry(
   chat: Chat<Record<string, Adapter>, DiscordbotThreadState>,
   state: StateAdapter,
@@ -981,7 +1049,7 @@ async function recoverRenderObligationsWithRetry(
         options,
       );
       if (deferredCount === 0) return;
-      const delayMs = renderRetryDelayMs(attempt);
+      const delayMs = renderRetryDelayMs(attempt, options);
       attempt += 1;
       traceLog(
         options,
@@ -1738,10 +1806,20 @@ function rendererOptions(
   };
 }
 
-function renderRetryDelayMs(attempt: number): number {
+function renderRetryDelayMs(
+  attempt: number,
+  options: Pick<
+    DiscordbotOptions,
+    "renderRetryInitialDelayMs" | "renderRetryMaxDelayMs"
+  >,
+): number {
+  const initialDelayMs =
+    options.renderRetryInitialDelayMs ?? RENDER_RETRY_INITIAL_DELAY_MS;
+  const maxDelayMs =
+    options.renderRetryMaxDelayMs ?? RENDER_RETRY_MAX_DELAY_MS;
   return Math.min(
-    RENDER_RETRY_INITIAL_DELAY_MS * 2 ** attempt,
-    RENDER_RETRY_MAX_DELAY_MS,
+    initialDelayMs * 2 ** attempt,
+    maxDelayMs,
   );
 }
 

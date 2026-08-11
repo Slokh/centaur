@@ -252,8 +252,13 @@ mod tests {
 
     use super::*;
 
+    // Replenishment prunes stale rows database-wide, so DB-backed tests must
+    // not race each other's synthetic warm sandboxes.
+    static DATABASE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn replenisher_prunes_missing_ready_rows_before_counting() {
+        let _serial = DATABASE_TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };
@@ -263,6 +268,7 @@ mod tests {
         let stale_sandbox = format!("stale-{suffix}");
         let old_stale_sandbox = format!("old-stale-{suffix}");
         let fresh_sandbox = format!("fresh-{suffix}");
+        let thread_key = format!("test:thread:{suffix}");
 
         store
             .insert_ready_warm_sandbox(&stale_sandbox, &workload_key)
@@ -313,7 +319,23 @@ mod tests {
         );
         assert_eq!(
             store
-                .claim_ready_warm_sandbox(&workload_key, "test-thread")
+                .create_or_get_session(
+                    &centaur_session_core::ThreadKey::parse(&thread_key)
+                        .expect("valid test thread key"),
+                    &centaur_session_core::HarnessType::Codex,
+                    None,
+                    serde_json::json!({}),
+                    BTreeMap::new(),
+                )
+                .await
+                .expect("create claiming session")
+                .thread_key
+                .as_str(),
+            thread_key
+        );
+        assert_eq!(
+            store
+                .claim_ready_warm_sandbox(&workload_key, &thread_key)
                 .await
                 .expect("claim ready warm sandbox"),
             Some(fresh_sandbox)
@@ -329,6 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn replenisher_prunes_stale_evicting_rows() {
+        let _serial = DATABASE_TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
             return;
         };

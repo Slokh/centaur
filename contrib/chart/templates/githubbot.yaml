@@ -56,7 +56,7 @@ spec:
       {{- end }}
       containers:
         - name: githubbot
-          image: {{ printf "%s:%s" .Values.githubbot.image.repository .Values.githubbot.image.tag | quote }}
+          image: {{ include "centaur.imageRef" .Values.githubbot.image | quote }}
           imagePullPolicy: {{ .Values.githubbot.image.pullPolicy }}
           env:
             - name: PORT

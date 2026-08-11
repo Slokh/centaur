@@ -38,6 +38,7 @@ use centaur_telemetry::{
 };
 use dashmap::{DashMap, DashSet};
 use futures_util::{FutureExt, SinkExt, Stream, StreamExt, future::BoxFuture, stream};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -81,6 +82,7 @@ const CENTAUR_PUBLIC_SKILL_DIRS_ENV: &str = "CENTAUR_PUBLIC_SKILL_DIRS";
 const SANDBOX_REPO_CACHE_LABEL: &str = "centaur.sandbox_repo_cache";
 const OBSERVABILITY_TOOL_BLOCKLIST: &str =
     "vlogs,vmetrics,grafana,centaur_investigator,centaur-investigator";
+const APPLICATION_GATEWAY_KEY_ENV: &str = "CENTAUR_APPLICATION_GATEWAY_KEY";
 
 type SandboxSpecFactory = Arc<
     dyn Fn(&ThreadKey, &str, &HarnessType, Option<&PersonaContext>) -> SandboxSpec + Send + Sync,
@@ -896,6 +898,21 @@ impl SessionRuntime {
         thread_key: &ThreadKey,
     ) -> Result<Option<SessionExecution>, SessionRuntimeError> {
         Ok(self.store.active_execution_for_thread(thread_key).await?)
+    }
+
+    /// Append a typed event owned by a trusted application gateway to the
+    /// canonical session ledger.
+    pub async fn append_application_event(
+        &self,
+        thread_key: &ThreadKey,
+        execution_id: &str,
+        event_type: &str,
+        payload: Value,
+    ) -> Result<SessionEvent, SessionRuntimeError> {
+        Ok(self
+            .store
+            .append_event(thread_key, Some(execution_id), event_type, payload)
+            .await?)
     }
 
     /// Returns the harness already persisted for a thread, if the session
@@ -3771,12 +3788,37 @@ impl SandboxWorkloadMode {
                     spec = spec.mount(mount.clone());
                 }
                 for (name, value) in env {
-                    spec = spec.env(name.clone(), value.clone());
+                    if name == APPLICATION_GATEWAY_KEY_ENV {
+                        // The operator config carries one root credential so api-rs can
+                        // construct sandbox specs. Never expose that credential to an
+                        // agent: each claimed sandbox receives a key bound to its exact
+                        // session, while an unclaimed warm sandbox receives no key.
+                        if let Some(thread_key) = thread_key {
+                            spec = spec.env(
+                                name.clone(),
+                                application_gateway_session_key(value, thread_key),
+                            );
+                        }
+                    } else {
+                        spec = spec.env(name.clone(), value.clone());
+                    }
                 }
                 apply_persona_spec_env(spec, persona)
             }
         }
     }
+}
+
+/// Derive the sandbox credential for one session from the operator-held root.
+///
+/// This is public so the API gateway and sandbox-spec builder use exactly the
+/// same derivation. The root key itself is never returned to a sandbox.
+pub fn application_gateway_session_key(root_key: &str, thread_key: &ThreadKey) -> String {
+    let mut mac = Hmac::<Sha256>::new_from_slice(root_key.as_bytes())
+        .expect("HMAC accepts application gateway keys of any length");
+    mac.update(b"centaur:application-gateway:session:v1\0");
+    mac.update(thread_key.as_str().as_bytes());
+    hex::encode(mac.finalize().into_bytes())
 }
 
 /// The harness-server CLI subcommand for a harness type
@@ -8015,6 +8057,31 @@ mod tests {
     }
 
     #[test]
+    fn application_gateway_key_is_session_bound_and_absent_from_warm_sandbox() {
+        let root_key = "operator-root-secret";
+        let workload = SandboxWorkloadMode::codex_app_server(
+            "centaur-agent:latest",
+            [(APPLICATION_GATEWAY_KEY_ENV.to_owned(), root_key.to_owned())],
+            HarnessType::Codex,
+        );
+        let first = ThreadKey::parse("discord:G1:C1:M1").unwrap();
+        let second = ThreadKey::parse("discord:G1:C2:M2").unwrap();
+
+        let first_spec = workload.spec(&first, &HarnessType::Codex, None);
+        let second_spec = workload.spec(&second, &HarnessType::Codex, None);
+        let first_key = env_value(&first_spec, APPLICATION_GATEWAY_KEY_ENV).unwrap();
+        let second_key = env_value(&second_spec, APPLICATION_GATEWAY_KEY_ENV).unwrap();
+
+        assert_eq!(first_key, application_gateway_session_key(root_key, &first));
+        assert_ne!(first_key, root_key);
+        assert_ne!(first_key, second_key);
+        assert_eq!(
+            env_value(&workload.warm_spec(), APPLICATION_GATEWAY_KEY_ENV),
+            None
+        );
+    }
+
+    #[test]
     fn warm_workload_key_ignores_claimed_thread_key() {
         let workload = SandboxWorkloadMode::codex_app_server(
             "centaur-agent:latest",
@@ -9732,13 +9799,24 @@ mod adoption_tests {
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:eof-recorded-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-recorded"), true).await;
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-recorded"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (io, stdout, _stdin) = mock_io();
         backend.push_io(io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        assert!(
+            store
+                .claim_stdout_owner(
+                    &execution_id,
+                    &runtime.stdout_owner_id,
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim stdout owner")
+        );
         runtime
             .ensure_session_pipe(&thread_key, "sbx-recorded")
             .await
@@ -9782,7 +9860,8 @@ mod adoption_tests {
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:eof-reattach-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-reattach"), true).await;
+        let execution_id =
+            orphaned_execution(&store, &thread_key, Some("sbx-reattach"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (first_io, mut first_stdout, _first_stdin) = mock_io();
@@ -9791,6 +9870,16 @@ mod adoption_tests {
         backend.push_io(second_io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        assert!(
+            store
+                .claim_stdout_owner(
+                    &execution_id,
+                    &runtime.stdout_owner_id,
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim stdout owner")
+        );
         runtime
             .ensure_session_pipe(&thread_key, "sbx-reattach")
             .await
@@ -9903,13 +9992,23 @@ mod adoption_tests {
         let _serial = TEST_LOCK.lock().await;
         let thread_key =
             ThreadKey::parse(format!("test:eof-gone-{}", uuid::Uuid::new_v4())).unwrap();
-        orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
+        let execution_id = orphaned_execution(&store, &thread_key, Some("sbx-gone"), true).await;
 
         let backend = Arc::new(MockBackend::new(SandboxStatus::Running, Vec::new()));
         let (io, stdout, _stdin) = mock_io();
         backend.push_io(io).await;
 
         let runtime = runtime_with(&store, backend.clone());
+        assert!(
+            store
+                .claim_stdout_owner(
+                    &execution_id,
+                    &runtime.stdout_owner_id,
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("claim stdout owner")
+        );
         runtime
             .ensure_session_pipe(&thread_key, "sbx-gone")
             .await

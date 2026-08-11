@@ -35,7 +35,7 @@ spec:
       {{- end }}
       containers:
         - name: slackbotv2
-          image: {{ printf "%s:%s" .Values.slackbotv2.image.repository .Values.slackbotv2.image.tag | quote }}
+          image: {{ include "centaur.imageRef" .Values.slackbotv2.image | quote }}
           imagePullPolicy: {{ .Values.slackbotv2.image.pullPolicy }}
           env:
             - name: PORT

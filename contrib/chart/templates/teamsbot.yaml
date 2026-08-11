@@ -25,7 +25,7 @@ spec:
       {{- end }}
       containers:
         - name: teamsbot
-          image: {{ printf "%s:%s" .Values.teamsbot.image.repository .Values.teamsbot.image.tag | quote }}
+          image: {{ include "centaur.imageRef" .Values.teamsbot.image | quote }}
           imagePullPolicy: {{ .Values.teamsbot.image.pullPolicy }}
           env:
             - name: NODE_ENV

@@ -17,10 +17,9 @@ const LONG_RUNNING_MS = 2_147_483_647;
 
 // Discord delta (no slackbotv2 analog): discord.js can sit in a RESUME loop
 // for a long time without the listener promise settling, so `/health` also
-// needs to reflect transient connection state. The adapter does not expose a
-// status callback yet (see the TODO(wire) note at the adapter construction
-// site); once wired, `setGatewayConnected` flips this timestamp and
-// `isActive()` goes false after the gateway has been down for >60s.
+// needs to reflect transient connection state. The patched adapter's status
+// callback drives this timestamp, and `isActive()` goes false after the
+// gateway has been down for >60s.
 const GATEWAY_DISCONNECT_STALE_MS = 60_000;
 
 let gatewayDisconnectedAtMs: number | null = null;
