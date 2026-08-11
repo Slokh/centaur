@@ -1,7 +1,7 @@
 require "test_helper"
 
 class ConsoleEnvTest < ActiveSupport::TestCase
-  KEYS = %w[CENTAUR_CONSOLE_WIDGET IRON_CONTROL_WIDGET].freeze
+  KEYS = %w[CENTAUR_CONSOLE_WIDGET IRON_CONTROL_WIDGET CENTAUR_CONSOLE_DATABASE_URL].freeze
 
   setup do
     @prev_env = ENV.to_hash.slice(*KEYS)
@@ -55,5 +55,21 @@ class ConsoleEnvTest < ActiveSupport::TestCase
   test "key and legacy_key build the prefixed names" do
     assert_equal "CENTAUR_CONSOLE_WIDGET", ConsoleEnv.key("WIDGET")
     assert_equal "IRON_CONTROL_WIDGET", ConsoleEnv.legacy_key("WIDGET")
+  end
+
+  test "database_url derives each production database from the primary DSN" do
+    ENV["CENTAUR_CONSOLE_DATABASE_URL"] = "postgres://user:pass@db.internal:5432/console?sslmode=require"
+
+    assert_equal "postgres://user:pass@db.internal:5432/console?sslmode=require", ConsoleEnv.database_url
+    assert_equal "postgres://user:pass@db.internal:5432/console_cache?sslmode=require", ConsoleEnv.database_url("_cache")
+    assert_equal "postgres://user:pass@db.internal:5432/console_queue?sslmode=require", ConsoleEnv.database_url("_queue")
+    assert_equal "postgres://user:pass@db.internal:5432/console_cable?sslmode=require", ConsoleEnv.database_url("_cable")
+  end
+
+  test "database_url rejects a DSN without a database name when deriving a role" do
+    ENV["CENTAUR_CONSOLE_DATABASE_URL"] = "postgres://user:pass@db.internal:5432"
+
+    error = assert_raises(ArgumentError) { ConsoleEnv.database_url("_queue") }
+    assert_match "CENTAUR_CONSOLE_DATABASE_URL must name a database", error.message
   end
 end
