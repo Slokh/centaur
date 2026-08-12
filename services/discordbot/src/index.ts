@@ -73,6 +73,7 @@ import {
   GuildExecutionLimiter,
   noopLogger,
   nowMs,
+  singleFlight,
   sliceSurrogateSafe,
   takeDiscordMessageChunk,
   traceLog,
@@ -1003,7 +1004,7 @@ function scheduleApplicationIngestionRecovery(
           });
         }
       };
-      const reconcileArchive = async () => {
+      const reconcileArchive = singleFlight(async () => {
         try {
           const observed = await reconcileDiscordArchive(options, state);
           if (observed > 0) {
@@ -1016,18 +1017,28 @@ function scheduleApplicationIngestionRecovery(
             error: errorMessage(error),
           });
         }
-      };
-      await Promise.all([recoverOutbox(), reconcileArchive()]);
+      });
+      const archiveReconciliationEnabled =
+        options.applicationArchiveReconciliationEnabled !== false;
+      await Promise.all([
+        recoverOutbox(),
+        ...(archiveReconciliationEnabled ? [reconcileArchive()] : []),
+      ]);
       const outboxTimer = setInterval(
         () => backgroundWaitUntil(recoverOutbox()),
         5_000,
       );
-      const archiveTimer = setInterval(
-        () => backgroundWaitUntil(reconcileArchive()),
-        60_000,
-      );
       outboxTimer.unref();
-      archiveTimer.unref();
+      if (archiveReconciliationEnabled) {
+        const archiveTimer = setInterval(
+          () => backgroundWaitUntil(reconcileArchive()),
+          Math.max(
+            1_000,
+            options.applicationArchiveReconciliationIntervalMs ?? 60_000,
+          ),
+        );
+        archiveTimer.unref();
+      }
     })(),
   );
 }
