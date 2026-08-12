@@ -485,7 +485,11 @@ impl SandboxBackend for AgentSandboxBackend {
 
     async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
         self.patch_sandbox_merge(id, sandbox_pause_patch(jiff::Timestamp::now()))
-            .await
+            .await?;
+        // A paused agent consumes no compute, so its one-to-one managed proxy
+        // must not keep consuming a pod slot. `resume` recreates and re-adopts
+        // all proxy resources before scaling the agent back up.
+        self.delete_iron_proxy_resources(id).await
     }
 
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
