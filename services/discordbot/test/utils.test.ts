@@ -4,6 +4,7 @@ import {
   singleFlight,
   sliceSurrogateSafe,
   splitDiscordMessageChunks,
+  suppressDiscordLinkEmbeds,
   takeDiscordMessageChunk,
 } from "../src/utils";
 
@@ -61,6 +62,40 @@ describe("sliceSurrogateSafe", () => {
 
   it("returns empty for a non-positive limit", () => {
     expect(sliceSurrogateSafe("hello", 0)).toBe("");
+  });
+});
+
+describe("suppressDiscordLinkEmbeds", () => {
+  it("wraps bare and Markdown HTTP links while preserving punctuation", () => {
+    expect(
+      suppressDiscordLinkEmbeds(
+        "See https://example.com/a. Then [docs](https://docs.example.com/x).",
+      ),
+    ).toBe(
+      "See <https://example.com/a>. Then [docs](<https://docs.example.com/x>).",
+    );
+  });
+
+  it("is idempotent and leaves code links unchanged", () => {
+    const content = [
+      "<https://example.com>",
+      "`https://inline.example.com`",
+      "```txt",
+      "https://code.example.com",
+      "```",
+    ].join("\n");
+    expect(suppressDiscordLinkEmbeds(content)).toBe(content);
+    expect(suppressDiscordLinkEmbeds(suppressDiscordLinkEmbeds(content))).toBe(
+      content,
+    );
+  });
+
+  it("keeps balanced URL parentheses inside the destination", () => {
+    expect(
+      suppressDiscordLinkEmbeds(
+        "Read https://example.com/wiki/Thing_(topic) when ready.",
+      ),
+    ).toBe("Read <https://example.com/wiki/Thing_(topic)> when ready.");
   });
 });
 

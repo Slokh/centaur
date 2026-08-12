@@ -84,6 +84,75 @@ export function sliceSurrogateSafe(value: string, maxUnits: number): string {
   return value.slice(0, end);
 }
 
+/**
+ * Wrap HTTP(S) destinations in Discord's angle-bracket autolink syntax so the
+ * client does not expand them into rich embeds. Existing autolinks and URLs in
+ * inline/fenced code are preserved. The transform is idempotent and also works
+ * for Markdown destinations (`[label](https://example.com)` becomes
+ * `[label](<https://example.com>)`).
+ */
+export function suppressDiscordLinkEmbeds(content: string): string {
+  let output = "";
+  let cursor = 0;
+  let codeDelimiterLength = 0;
+
+  while (cursor < content.length) {
+    if (content[cursor] === "`") {
+      let runEnd = cursor + 1;
+      while (content[runEnd] === "`") runEnd += 1;
+      const runLength = runEnd - cursor;
+      if (codeDelimiterLength === 0) codeDelimiterLength = runLength;
+      else if (runLength === codeDelimiterLength) codeDelimiterLength = 0;
+      output += content.slice(cursor, runEnd);
+      cursor = runEnd;
+      continue;
+    }
+
+    if (
+      codeDelimiterLength === 0 &&
+      (content.startsWith("http://", cursor) ||
+        content.startsWith("https://", cursor)) &&
+      content[cursor - 1] !== "<"
+    ) {
+      let urlEnd = cursor;
+      while (
+        urlEnd < content.length &&
+        !/[\s<`]/.test(content[urlEnd] ?? "")
+      ) {
+        urlEnd += 1;
+      }
+      const { suffix, url } = trimUrlPunctuation(
+        content.slice(cursor, urlEnd),
+      );
+      output += `<${url}>${suffix}`;
+      cursor = urlEnd;
+      continue;
+    }
+
+    output += content[cursor];
+    cursor += 1;
+  }
+
+  return output;
+}
+
+function trimUrlPunctuation(candidate: string): { url: string; suffix: string } {
+  let url = candidate;
+  let suffix = "";
+  while (url.length) {
+    const last = url.at(-1) ?? "";
+    const counterpart =
+      last === ")" ? "(" : last === "]" ? "[" : last === "}" ? "{" : "";
+    const isUnmatchedCloser = Boolean(
+      counterpart && url.split(last).length > url.split(counterpart).length,
+    );
+    if (!/[.,;:!?]/.test(last) && !isUnmatchedCloser) break;
+    suffix = `${last}${suffix}`;
+    url = url.slice(0, -1);
+  }
+  return { url, suffix };
+}
+
 // Discord delta (no slackbotv2 analog): Slack accepts ~40k-char messages, but
 // Discord caps content at 2000 chars and the chat adapter silently truncates
 // with "...". The answer streamer splits long answers across multiple

@@ -3,7 +3,12 @@ import type { Logger, Thread } from "chat";
 import { parseDiscordThreadKey } from "./discord-allowlist";
 import { DEFAULT_DISCORD_API_URL } from "./discord-threading";
 import type { DiscordbotApiMessage, DiscordbotOptions } from "./types";
-import { errorMessage, nowMs, sliceSurrogateSafe } from "./utils";
+import {
+  errorMessage,
+  nowMs,
+  sliceSurrogateSafe,
+  suppressDiscordLinkEmbeds,
+} from "./utils";
 
 export type DiscordNarratorChunk = Exclude<
   ChatSDKStreamChunk,
@@ -18,8 +23,9 @@ const REACTION_WORKING = "👀";
 const REACTION_DONE = "✅";
 const REACTION_FAILED = "❌";
 
-// Discord caps message content at 2000 chars; headroom keeps every post safe.
-const NARRATOR_MESSAGE_MAX_CHARS = 1_900;
+// URL suppression adds two characters per destination. Keep enough raw-text
+// headroom that even URL-dense narration remains under Discord's 2000-char cap.
+const NARRATOR_MESSAGE_MAX_CHARS = 1_500;
 // A single blurb is truncated to this, and a thought still pending at this size
 // is flushed early so long reasoning doesn't sit invisible for the whole run.
 const NARRATOR_BLURB_MAX_CHARS = 600;
@@ -212,8 +218,8 @@ export class DiscordNarrator {
     this.queuedBlurbs = [];
     this.postedCount += 1;
     this.lastPostAtMs = nowMs();
-    const content = clipMessage(
-      blurbs.map((blurb) => subtext(blurb)).join("\n\n"),
+    const content = suppressDiscordLinkEmbeds(
+      clipMessage(blurbs.map((blurb) => subtext(blurb)).join("\n\n")),
     );
     this.chain = this.chain.then(async () => {
       try {

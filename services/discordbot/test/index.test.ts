@@ -134,6 +134,18 @@ describe("streamAnswerToThread", () => {
     expect(messages[0]?.content).toBe("Hello world");
   });
 
+  it("suppresses embeds for links even when a URL spans stream pieces", async () => {
+    const { thread, messages } = fakeThread();
+    await runStreamer(thread, [
+      "Explorer: https://explore.",
+      "tempo.xyz/tx/0x123. [Docs](https://docs.tempo.xyz)",
+    ]);
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.content).toBe(
+      "Explorer: <https://explore.tempo.xyz/tx/0x123>. [Docs](<https://docs.tempo.xyz>)",
+    );
+  });
+
   it("splits a long answer across multiple messages, each within the cap", async () => {
     const paragraphs = Array.from(
       { length: 12 },

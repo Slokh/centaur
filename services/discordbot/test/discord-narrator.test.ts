@@ -294,6 +294,17 @@ describe("DiscordNarrator blurbs", () => {
     ]);
   });
 
+  it("suppresses embeds for links in progress narration", async () => {
+    const h = harness();
+    const narrator = startNarrator(h);
+    narrator.status("Reviewing https://example.com/deploy before continuing");
+    await narrator.finish("done");
+
+    expect(h.posts).toEqual([
+      "-# Reviewing <https://example.com/deploy> before continuing",
+    ]);
+  });
+
   it("skips fragments too short to be worth a message", async () => {
     const h = harness();
     const narrator = startNarrator(h);

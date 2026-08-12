@@ -75,6 +75,7 @@ import {
   nowMs,
   singleFlight,
   sliceSurrogateSafe,
+  suppressDiscordLinkEmbeds,
   takeDiscordMessageChunk,
   traceLog,
 } from "./utils";
@@ -104,7 +105,10 @@ const RENDER_RETRY_INITIAL_DELAY_MS = 250;
 const RENDER_RETRY_MAX_DELAY_MS = 5_000;
 // Discord caps message content at 2000 chars; leave headroom so the honest
 // "[truncated ...]" suffix lands instead of the adapter's silent "..." cut.
-const DISCORD_FALLBACK_TEXT_MAX_CHARS = 1_900;
+// Link suppression adds two characters per URL. Keeping the raw chunk at 1500
+// guarantees even URL-dense output remains below Discord's hard 2000-char cap
+// after every destination is wrapped in `<...>`.
+const DISCORD_FALLBACK_TEXT_MAX_CHARS = 1_500;
 const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250;
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000;
 // Discord delta (no slackbotv2 analog): `activeExecution` persisted before the
@@ -1493,19 +1497,23 @@ export async function streamAnswerToThread(
     // `raw` skips the SDK's markdown round-trip: re-stringifying could change
     // the text length past Discord's 2000-char cap (re-triggering the
     // adapter's silent truncation) and Discord renders markdown natively.
-    const raw = await thread.adapter.postMessage(thread.id, { raw: content });
+    const visibleContent = suppressDiscordLinkEmbeds(content);
+    const raw = await thread.adapter.postMessage(thread.id, {
+      raw: visibleContent,
+    });
     current = { id: raw.id, threadId: raw.threadId || thread.id };
-    lastEditedContent = content;
+    lastEditedContent = visibleContent;
     lastEditAtMs = nowMs();
     postedCount += 1;
   };
 
   const editCurrent = async (content: string): Promise<void> => {
-    if (!current || content === lastEditedContent) return;
+    const visibleContent = suppressDiscordLinkEmbeds(content);
+    if (!current || visibleContent === lastEditedContent) return;
     await thread.adapter.editMessage(current.threadId, current.id, {
-      raw: content,
+      raw: visibleContent,
     });
-    lastEditedContent = content;
+    lastEditedContent = visibleContent;
   };
 
   /** Freeze the in-progress message at `content` (or post it whole). */
@@ -1618,15 +1626,18 @@ async function renderPlainTextExecutionStream(
         sawError = true;
       }
     }
-    const text = truncateDiscordText(
-      fallback.text() || "Execution completed, but no final text was captured.",
-      DISCORD_FALLBACK_TEXT_MAX_CHARS,
-      "Discord final answer",
+    const text = suppressDiscordLinkEmbeds(
+      truncateDiscordText(
+        fallback.text() ||
+          "Execution completed, but no final text was captured.",
+        DISCORD_FALLBACK_TEXT_MAX_CHARS,
+        "Discord final answer",
+      ),
     );
     traceLog(options, "discordbot_render_plain_text_final", trace, {
       chars: text.length,
     });
-    await thread.post(text);
+    await thread.adapter.postMessage(thread.id, { raw: text });
   } finally {
     stopTyping();
   }
