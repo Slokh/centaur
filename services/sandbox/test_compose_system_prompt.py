@@ -108,6 +108,32 @@ class ComposeSystemPromptTest(unittest.TestCase):
                 "base\n\n\n---\n\noverlay\n",
             )
 
+    def test_appends_inline_overlay_before_repo_overlays(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            (home / "AGENTS.md").write_text("base\n")
+
+            prompt = home / "github" / "acme" / "overlay" / "services" / "sandbox" / "SYSTEM_PROMPT.md"
+            prompt.parent.mkdir(parents=True)
+            prompt.write_text("repo overlay\n")
+
+            target = workspace / "AGENTS.md"
+            compose_system_prompt.compose_system_prompt(
+                home_dir=home,
+                target_prompt=target,
+                repo_mount=home / "github",
+                inline_overlay="inline overlay\n",
+            )
+
+            self.assertEqual(
+                target.read_text(),
+                "base\n\n\n---\n\ninline overlay\n\n\n---\n\nrepo overlay\n",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

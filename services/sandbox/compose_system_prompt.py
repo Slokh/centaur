@@ -35,6 +35,7 @@ def compose_system_prompt(
     home_dir: Path,
     target_prompt: Path,
     repo_mount: Path,
+    inline_overlay: str | None = None,
 ) -> None:
     base_prompt = home_dir / "AGENTS_BASE.md"
     baked_prompt = home_dir / "AGENTS.md"
@@ -50,6 +51,12 @@ def compose_system_prompt(
     home_overlay = home_dir / "AGENTS_OVERLAY.md"
     if _append_prompt(target_prompt, home_overlay):
         appended.add(home_overlay.resolve())
+
+    if inline_overlay and inline_overlay.strip():
+        with target_prompt.open("a") as target_file:
+            target_file.write(SEPARATOR)
+            target_file.write(inline_overlay.strip())
+            target_file.write("\n")
 
     for prompt_path in _mounted_overlay_prompts(repo_mount, baked_prompt):
         if not prompt_path.is_file():
@@ -73,6 +80,7 @@ def main() -> int:
         home_dir=home_dir,
         target_prompt=Path(args.target_prompt),
         repo_mount=Path(args.repo_mount) if args.repo_mount else home_dir / "github",
+        inline_overlay=os.environ.get("CENTAUR_SYSTEM_PROMPT"),
     )
     return 0
 

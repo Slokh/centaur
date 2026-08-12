@@ -429,6 +429,9 @@ spec:
 {{- if and .Values.repoCache.enabled (gt (len $publicSkillDirs) 0) }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_PUBLIC_SKILL_DIRS" "value" (join ":" $publicSkillDirs)) }}
 {{- end }}
+{{- if .Values.overlay.systemPrompt }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_SYSTEM_PROMPT" "value" .Values.overlay.systemPrompt) }}
+{{- end }}
 {{- if not (hasKey .Values.sandbox.extraEnv "COMPANY_CONTEXT_EMBEDDINGS_ENABLED") }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_ENABLED" "value" ($companyContextEmbeddingsEnabled | toString)) }}
 {{- end }}
