@@ -186,6 +186,23 @@ describe("DiscordNarrator reactions", () => {
     const narrator = startNarrator(h);
     await expect(narrator.finish("done")).resolves.toBeUndefined();
   });
+
+  it("honors Discord's retry window after a reaction 429", async () => {
+    const h = harness();
+    let attempts = 0;
+    h.botOptions.fetch = async () => {
+      attempts += 1;
+      return attempts === 1
+        ? new Response(JSON.stringify({ retry_after: 0 }), {
+            status: 429,
+            headers: { "content-type": "application/json" },
+          })
+        : new Response(null, { status: 204 });
+    };
+    const narrator = startNarrator(h);
+    await narrator.finish("retrying");
+    expect(attempts).toBe(2);
+  });
 });
 
 describe("DiscordNarrator blurbs", () => {

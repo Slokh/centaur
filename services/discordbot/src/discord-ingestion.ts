@@ -140,13 +140,15 @@ async function persistAndPostIngestionEvent(
     maxLength: 100_000,
     ttlMs: INGESTION_RETENTION_MS,
   });
-  try {
-    await postIngestionEvent(options, payload);
-    await state.delete(eventKey);
-  } catch {
-    // Gateway delivery has no redelivery. Retain the normalized event and let
-    // the recovery loop retry it; Mindcool source keys make duplicates inert.
-  }
+  // The durable outbox write above is the ingress contract. Application
+  // delivery must not sit on the mention/typing critical path: Discord's
+  // Gateway has already delivered the message and the application endpoint
+  // can be arbitrarily slow. Deliver in the background and retain the outbox
+  // entry on failure for the recovery loop. Source keys keep a recovery race
+  // or process restart idempotent at the application boundary.
+  void postIngestionEvent(options, payload)
+    .then(() => state.delete(eventKey))
+    .catch(() => undefined);
 }
 
 export async function recoverApplicationIngestion(

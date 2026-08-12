@@ -289,13 +289,28 @@ async function discordReactionRequest(
     const apiBase = (
       botOptions.discordApiUrl ?? DEFAULT_DISCORD_API_URL
     ).replace(/\/$/, "");
-    const response = await fetchFn(
-      `${apiBase}/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`,
-      {
+    const url = `${apiBase}/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`;
+    let response = await fetchFn(url, {
+      method,
+      headers: { authorization: `Bot ${botOptions.botToken}` },
+    });
+    // Reactions share Discord's REST buckets with other bot activity. Honor
+    // Discord's retry window instead of dropping the status transition on the
+    // first 429. Keep the retry bounded because reactions are cosmetic.
+    for (let attempt = 1; response.status === 429 && attempt < 4; attempt += 1) {
+      const retryAfterMs = await discordRetryAfterMs(response);
+      logger.debug("discordbot_narrator_reaction_rate_limited", {
+        attempt,
+        emoji,
+        method,
+        retry_after_ms: retryAfterMs,
+      });
+      await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
+      response = await fetchFn(url, {
         method,
         headers: { authorization: `Bot ${botOptions.botToken}` },
-      },
-    );
+      });
+    }
     if (!response.ok) {
       logger.warn("discordbot_narrator_reaction_failed", {
         emoji,
@@ -310,6 +325,25 @@ async function discordReactionRequest(
       error: errorMessage(error),
     });
   }
+}
+
+async function discordRetryAfterMs(response: Response): Promise<number> {
+  try {
+    const payload = (await response.clone().json()) as { retry_after?: unknown };
+    if (
+      typeof payload.retry_after === "number" &&
+      Number.isFinite(payload.retry_after) &&
+      payload.retry_after >= 0
+    ) {
+      return Math.max(25, Math.ceil(payload.retry_after * 1_000));
+    }
+  } catch {
+    // Fall through to the standard header/default delay.
+  }
+  const headerSeconds = Number(response.headers.get("retry-after"));
+  return Number.isFinite(headerSeconds) && headerSeconds >= 0
+    ? Math.max(25, Math.ceil(headerSeconds * 1_000))
+    : 1_000;
 }
 
 /** Discord subtext is a per-line prefix, so every non-empty line needs it. */

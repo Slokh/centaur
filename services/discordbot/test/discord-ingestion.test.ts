@@ -63,22 +63,74 @@ describe("Discord application ingestion", () => {
       },
     } satisfies DiscordbotOptions;
 
-    await ingestObservedDiscordMessage(options, {
-      guildId: "G1",
-      channelId: "C1",
-      messageId: "M2",
-      authorId: "U1",
-      content: "persist me",
-      createdAt: "2026-08-10T10:00:00.000Z",
-      attachments: [],
-    }, state);
+    await ingestObservedDiscordMessage(
+      options,
+      {
+        guildId: "G1",
+        channelId: "C1",
+        messageId: "M2",
+        authorId: "U1",
+        content: "persist me",
+        createdAt: "2026-08-10T10:00:00.000Z",
+        attachments: [],
+      },
+      state,
+    );
     expect(delivered).toBe(1);
+
+    // Application delivery is deliberately detached from the Gateway path;
+    // let the failed background attempt leave its durable outbox entry.
+    await Bun.sleep(0);
 
     available = true;
     expect(await recoverApplicationIngestion(options, state)).toBe(0);
     expect(delivered).toBe(2);
     expect(await recoverApplicationIngestion(options, state)).toBe(0);
     expect(delivered).toBe(2);
+  });
+
+  it("does not wait for slow application delivery after writing the outbox", async () => {
+    const state = createMemoryState();
+    await state.connect();
+    let releaseDelivery: (() => void) | undefined;
+    const deliveryBlocked = new Promise<void>((resolve) => {
+      releaseDelivery = resolve;
+    });
+    const options = {
+      apiUrl: "http://centaur",
+      applicationId: "app",
+      botToken: "bot",
+      publicKey: "key",
+      applicationIngestionUrl: "http://application.local/v1/discord/events",
+      applicationIngestionToken: "ingest-secret",
+      fetch: async () => {
+        await deliveryBlocked;
+        return new Response("{}", { status: 200 });
+      },
+    } satisfies DiscordbotOptions;
+
+    const ingestion = ingestObservedDiscordMessage(
+      options,
+      {
+        guildId: "G1",
+        channelId: "C1",
+        messageId: "M3",
+        authorId: "U1",
+        content: "ack me first",
+        createdAt: "2026-08-10T10:00:00.000Z",
+        attachments: [],
+      },
+      state,
+    );
+
+    await expect(
+      Promise.race([
+        ingestion.then(() => "returned"),
+        Bun.sleep(100).then(() => "blocked"),
+      ]),
+    ).resolves.toBe("returned");
+    releaseDelivery?.();
+    await Bun.sleep(0);
   });
 
   it("decodes Discord signed attachment expiry", () => {
