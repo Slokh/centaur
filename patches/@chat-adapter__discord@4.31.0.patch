@@ -203,7 +203,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..1ffabc9a145280ad31a7e9a793514fbb
      let parentChannelId = channelId;
      if (data.thread) {
        discordThreadId = data.thread.id;
-@@ -927,7 +945,47 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -927,7 +945,48 @@ var DiscordAdapter = class _DiscordAdapter {
        (roleId) => this.mentionRoleIds.includes(roleId)
      );
      const isMentioned = isUserMentioned || isRoleMentioned;
@@ -246,7 +246,8 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..1ffabc9a145280ad31a7e9a793514fbb
 +      }).catch((error) => this.logger.warn("Message observation failed", { error: String(error), messageId: data.id }));
 +    }
 +    if (!discordThreadId && this.conversationMode === "inline_reply") {
-+      replyToMessageId = isMentioned ? data.id : data.referenced_message?.message_reference?.message_id ?? data.message_reference?.message_id;
++      const referencedRootMessageId = data.referenced_message?.message_reference?.message_id ?? data.message_reference?.message_id;
++      replyToMessageId = referencedRootMessageId ?? (isMentioned ? data.id : void 0);
 +    }
 +    if (!discordThreadId && isMentioned && this.conversationMode === "thread") {
        try {
@@ -555,15 +556,15 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..1ffabc9a145280ad31a7e9a793514fbb
 +      }).catch((error) => this.logger.warn("Message observation failed", { error: String(error), messageId: message.id }));
 +    }
 +    if (!discordThreadId && this.conversationMode === "inline_reply") {
-+      if (isMentioned) {
-+        replyToMessageId = message.id;
-+      } else if (message.reference?.messageId) {
++      if (message.reference?.messageId) {
 +        replyToMessageId = message.reference.messageId;
 +        try {
 +          const referenced = await message.fetchReference();
 +          replyToMessageId = referenced.reference?.messageId ?? replyToMessageId;
 +        } catch {
 +        }
++      } else if (isMentioned) {
++        replyToMessageId = message.id;
 +      }
 +    }
 +    if (!discordThreadId && isMentioned && this.conversationMode === "thread") {

@@ -74,6 +74,69 @@ afterAll(async () => {
 });
 
 describe("discordbot", () => {
+  it("keeps implicit reply pings in one inline-reply session", async () => {
+    bot = createTestBot({ conversationMode: "inline_reply" });
+
+    const rootId = await dispatchMessage({
+      channelId: CHANNEL_ID,
+      content: `<@${APP_ID}> what day is it`,
+      mention: true,
+    });
+    await waitForSettle(CHANNEL_ID, rootId);
+
+    const firstAnswer = discordApi
+      .messagesIn(CHANNEL_ID)
+      .find(
+        (message) =>
+          message.author.bot === true &&
+          message.message_reference?.message_id === rootId,
+      );
+    expect(firstAnswer).toBeDefined();
+
+    const followUpId = await dispatchMessage({
+      channelId: CHANNEL_ID,
+      content: "in Japan",
+      // Discord includes the replied-to bot in mentions even when the user did
+      // not explicitly type @bot. The reply reference must win over that
+      // implicit mention when selecting the conversation root.
+      mention: true,
+      replyToMessageId: firstAnswer!.id,
+    });
+    await waitForSettle(CHANNEL_ID, followUpId);
+
+    const secondAnswer = [...discordApi.messagesIn(CHANNEL_ID)]
+      .reverse()
+      .find(
+        (message) =>
+          message.author.bot === true &&
+          message.message_reference?.message_id === rootId,
+      );
+    expect(secondAnswer).toBeDefined();
+
+    const secondFollowUpId = await dispatchMessage({
+      channelId: CHANNEL_ID,
+      content: "and tomorrow?",
+      mention: true,
+      replyToMessageId: secondAnswer!.id,
+    });
+    await waitForSettle(CHANNEL_ID, secondFollowUpId);
+
+    const rootKey = `discord:${GUILD_ID}:${CHANNEL_ID}:reply~${rootId}`;
+    expect(codexApi.creates.map((create) => create.threadKey)).toEqual([
+      rootKey,
+      rootKey,
+      rootKey,
+    ]);
+    expect(codexApi.appends).toHaveLength(3);
+    expect(codexApi.executes).toHaveLength(3);
+    expect(sessionMessageTexts(codexApi.appends[1]!.body.messages)).toEqual([
+      "in Japan",
+    ]);
+    expect(sessionMessageTexts(codexApi.appends[2]!.body.messages)).toEqual([
+      "and tomorrow?",
+    ]);
+  });
+
   it("does not wait for application outbox writes before handling a mention", async () => {
     const state = createMemoryState();
     await state.connect();
@@ -1442,6 +1505,7 @@ async function dispatchMessage(input: {
   content: string;
   guildId?: string;
   mention?: boolean;
+  replyToMessageId?: string;
   thread?: { id: string; parentId: string };
 }): Promise<string> {
   const raw = discordApi.seedRawMessage(input.channelId, {
@@ -1453,6 +1517,7 @@ async function dispatchMessage(input: {
       username: "tester",
     },
     content: input.content,
+    replyToMessageId: input.replyToMessageId,
   });
   const data: Record<string, unknown> = {
     ...raw,
@@ -1777,6 +1842,8 @@ type RawDiscordMessage = {
   content: string;
   edited_timestamp: null;
   id: string;
+  message_reference?: { message_id: string };
+  referenced_message?: RawDiscordMessage;
   timestamp: string;
   type: number;
 };
@@ -1809,6 +1876,7 @@ type FakeDiscordApi = {
       attachments?: Record<string, unknown>[];
       author: RawDiscordAuthor;
       content: string;
+      replyToMessageId?: string;
     },
   ): RawDiscordMessage;
   seedThreadChannel(threadId: string, parentId: string): void;
@@ -1844,6 +1912,11 @@ async function startFakeDiscordApi(): Promise<FakeDiscordApi> {
     channelId,
     input,
   ) => {
+    const referencedMessage = input.replyToMessageId
+      ? channelMessages(channelId).find(
+          (message) => message.id === input.replyToMessageId,
+        )
+      : undefined;
     const message: RawDiscordMessage = {
       attachments: input.attachments ?? [],
       author: input.author,
@@ -1851,6 +1924,14 @@ async function startFakeDiscordApi(): Promise<FakeDiscordApi> {
       content: input.content,
       edited_timestamp: null,
       id: nextId(),
+      ...(input.replyToMessageId
+        ? {
+            message_reference: { message_id: input.replyToMessageId },
+            ...(referencedMessage
+              ? { referenced_message: referencedMessage }
+              : {}),
+          }
+        : {}),
       timestamp: new Date().toISOString(),
       type: 0,
     };
@@ -2067,6 +2148,14 @@ async function handleFakeDiscordRequest(
       content: String(body?.content ?? ""),
       edited_timestamp: null,
       id: input.nextId(),
+      ...(isRecord(body?.message_reference) &&
+      typeof body.message_reference.message_id === "string"
+        ? {
+            message_reference: {
+              message_id: body.message_reference.message_id,
+            },
+          }
+        : {}),
       timestamp: new Date().toISOString(),
       type: 0,
     };
