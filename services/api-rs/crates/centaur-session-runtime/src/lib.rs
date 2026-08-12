@@ -87,6 +87,7 @@ const APPLICATION_GATEWAY_KEY_ENV: &str = "CENTAUR_APPLICATION_GATEWAY_KEY";
 type SandboxSpecFactory = Arc<
     dyn Fn(&ThreadKey, &str, &HarnessType, Option<&PersonaContext>) -> SandboxSpec + Send + Sync,
 >;
+type SessionEnvFactory = Arc<dyn Fn(&ThreadKey) -> BTreeMap<String, String> + Send + Sync>;
 type SessionInputSink = FramedWrite<SandboxWrite, LinesCodec>;
 type ExecutionSpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
 type SessionPipeMap = Arc<DashMap<String, SessionPipe>>;
@@ -306,6 +307,10 @@ pub struct SandboxRuntime {
     /// The harness warm sandboxes boot with. A warm claim is only valid for a
     /// session on the same harness; other sessions get a cold sandbox.
     warm_harness: Option<HarnessType>,
+    /// Per-session values delivered over the private harness protocol. Warm
+    /// sandbox pod environments are immutable after claim, so execution-bound
+    /// values cannot live only in the Kubernetes pod spec.
+    session_env_factory: SessionEnvFactory,
 }
 
 #[derive(Clone, Debug)]
@@ -2022,10 +2027,12 @@ impl SessionRuntime {
 
             let trace = SessionTraceContext::new(thread_key, Some(&execution_trace_span));
             let destination = session.resolved_chat_destination();
+            let session_env = self.sandbox_runtime.session_env(thread_key);
             let input_lines = input_lines_with_session_context(
                 thread_key,
                 destination.as_ref(),
                 &trace,
+                &session_env,
                 &input_lines,
             );
             if let Err(error) = write_input_lines(
@@ -2166,6 +2173,7 @@ impl SessionRuntime {
             thread_key,
             destination.as_ref(),
             &trace,
+            &self.sandbox_runtime.session_env(thread_key),
             &input_lines,
         );
 
@@ -2242,6 +2250,7 @@ impl SessionRuntime {
             thread_key,
             destination.as_ref(),
             &trace,
+            &self.sandbox_runtime.session_env(thread_key),
             &[interrupt_input_line(thread_key, reason)],
         );
 
@@ -3639,6 +3648,7 @@ impl SandboxRuntime {
     ) -> Self {
         let warm_harness = workload.default_harness();
         let warm_workload = workload.clone();
+        let session_env_workload = workload.clone();
         let mut runtime = Self::backend_with_warm_spec_factory(
             backend,
             move |thread_key, _execution_id, harness, persona| {
@@ -3647,6 +3657,8 @@ impl SandboxRuntime {
             move || warm_workload.warm_spec(),
         );
         runtime.warm_harness = warm_harness;
+        runtime.session_env_factory =
+            Arc::new(move |thread_key| session_env_workload.session_env(thread_key));
         runtime
     }
 
@@ -3663,6 +3675,7 @@ impl SandboxRuntime {
             warm_spec_factory: None,
             workload_key: None,
             warm_harness: None,
+            session_env_factory: Arc::new(|_| BTreeMap::new()),
         }
     }
 
@@ -3686,7 +3699,12 @@ impl SandboxRuntime {
             warm_spec_factory: Some(warm_spec_factory),
             workload_key: Some(workload_key),
             warm_harness: None,
+            session_env_factory: Arc::new(|_| BTreeMap::new()),
         }
+    }
+
+    fn session_env(&self, thread_key: &ThreadKey) -> BTreeMap<String, String> {
+        (self.session_env_factory)(thread_key)
     }
 }
 
@@ -3732,6 +3750,27 @@ impl SandboxWorkloadMode {
             Self::MockAppServer { .. } => None,
             Self::CodexAppServer { harness, .. } => Some(harness.clone()),
         }
+    }
+
+    fn session_env(&self, thread_key: &ThreadKey) -> BTreeMap<String, String> {
+        let mut session_env = BTreeMap::new();
+        let Self::CodexAppServer { env, .. } = self else {
+            return session_env;
+        };
+        session_env.insert(
+            "CENTAUR_THREAD_KEY".to_owned(),
+            thread_key.as_str().to_owned(),
+        );
+        if let Some((_, root_key)) = env
+            .iter()
+            .find(|(name, _)| name == APPLICATION_GATEWAY_KEY_ENV)
+        {
+            session_env.insert(
+                APPLICATION_GATEWAY_KEY_ENV.to_owned(),
+                application_gateway_session_key(root_key, thread_key),
+            );
+        }
+        session_env
     }
 
     fn spec(
@@ -6264,11 +6303,12 @@ fn input_lines_with_session_context(
     thread_key: &ThreadKey,
     destination: Option<&ChatDestination>,
     trace: &SessionTraceContext,
+    session_env: &BTreeMap<String, String>,
     input_lines: &[String],
 ) -> Vec<String> {
     input_lines
         .iter()
-        .map(|line| input_line_with_destination(thread_key, destination, trace, line))
+        .map(|line| input_line_with_destination(thread_key, destination, trace, session_env, line))
         .collect()
 }
 
@@ -6278,13 +6318,14 @@ fn input_line_with_session_context(
     trace: &SessionTraceContext,
     line: &str,
 ) -> String {
-    input_line_with_destination(thread_key, None, trace, line)
+    input_line_with_destination(thread_key, None, trace, &BTreeMap::new(), line)
 }
 
 fn input_line_with_destination(
     thread_key: &ThreadKey,
     destination: Option<&ChatDestination>,
     trace: &SessionTraceContext,
+    session_env: &BTreeMap<String, String>,
     line: &str,
 ) -> String {
     let Ok(mut value) = serde_json::from_str::<Value>(line) else {
@@ -6300,6 +6341,15 @@ fn input_line_with_destination(
     if let Some(traceparent) = &trace.traceparent {
         map.entry("traceparent")
             .or_insert_with(|| Value::String(traceparent.clone()));
+    }
+    // This field is control-plane-owned. Never preserve a caller-supplied
+    // value from an input line, even when this runtime has no private context.
+    map.remove("session_env");
+    if !session_env.is_empty() {
+        map.insert(
+            "session_env".to_owned(),
+            serde_json::to_value(session_env).unwrap_or(Value::Null),
+        );
     }
     let destination = destination
         .cloned()
@@ -8079,6 +8129,19 @@ mod tests {
             env_value(&workload.warm_spec(), APPLICATION_GATEWAY_KEY_ENV),
             None
         );
+        let first_session_env = workload.session_env(&first);
+        assert_eq!(
+            first_session_env
+                .get("CENTAUR_THREAD_KEY")
+                .map(String::as_str),
+            Some(first.as_str())
+        );
+        assert_eq!(
+            first_session_env
+                .get(APPLICATION_GATEWAY_KEY_ENV)
+                .map(String::as_str),
+            Some(first_key)
+        );
     }
 
     #[test]
@@ -8180,6 +8243,58 @@ mod tests {
         // Without an OpenTelemetry layer there is no traceparent to forward.
         assert!(value.get("traceparent").is_none());
         assert!(value.get("session_context").is_none());
+    }
+
+    #[test]
+    fn input_line_with_destination_adds_private_session_env() {
+        let thread_key = ThreadKey::parse("discord:111:222:333").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+        let session_env = BTreeMap::from([
+            (
+                "CENTAUR_THREAD_KEY".to_owned(),
+                thread_key.as_str().to_owned(),
+            ),
+            (
+                APPLICATION_GATEWAY_KEY_ENV.to_owned(),
+                "session-bound-key".to_owned(),
+            ),
+        ]);
+
+        let line = input_line_with_destination(
+            &thread_key,
+            None,
+            &trace,
+            &session_env,
+            r#"{"type":"user","message":{"content":[]}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        assert_eq!(
+            value["session_env"]["CENTAUR_THREAD_KEY"],
+            thread_key.as_str()
+        );
+        assert_eq!(
+            value["session_env"][APPLICATION_GATEWAY_KEY_ENV],
+            "session-bound-key"
+        );
+        assert!(value["message"].get("session_env").is_none());
+    }
+
+    #[test]
+    fn input_line_removes_caller_supplied_session_env() {
+        let thread_key = ThreadKey::parse("web:thread").unwrap();
+        let trace = SessionTraceContext::new(&thread_key, None);
+
+        let line = input_line_with_destination(
+            &thread_key,
+            None,
+            &trace,
+            &BTreeMap::new(),
+            r#"{"type":"user","session_env":{"CENTAUR_APPLICATION_GATEWAY_KEY":"attacker"}}"#,
+        );
+        let value: Value = serde_json::from_str(&line).unwrap();
+
+        assert!(value.get("session_env").is_none());
     }
 
     #[test]

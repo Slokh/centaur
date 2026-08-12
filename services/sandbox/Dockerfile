@@ -311,6 +311,11 @@ RUN --mount=type=cache,target=/home/agent/.cargo/registry,uid=1001,gid=1001,shar
     CARGO_TARGET_DIR=/home/agent/.cache/harness-server-target \
     cargo +stable install --locked --path /opt/centaur/harness-server-src --root /home/agent/.local
 
+# The private application gateway is on the latency-critical chat path. Prime
+# uv's immutable environment in the image so the first wallet or wager call in
+# a freshly claimed sandbox does not spend several seconds building it.
+RUN uvx --from /opt/centaur/tools/productivity/application application --help >/dev/null
+
 # No RUN instructions after these — all repo-local content at the very end.
 COPY --link --chown=1001:1001 .agents/skills/ /home/agent/.agents/skills/
 COPY --link --chown=1001:1001 harness/ /home/agent/harness/
