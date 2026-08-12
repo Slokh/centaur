@@ -53,6 +53,8 @@ ingress** — only a `GET /health` endpoint that reflects the Gateway connection
 | `DISCORDBOT_CONVERSATION_MODE` | – | `thread` (default) or `inline_reply` for channel reply chains. |
 | `DISCORDBOT_PROGRESS_MODE` | – | `narration` (default) or `reactions` to suppress public progress text. |
 | `DISCORDBOT_APPLICATION_INGESTION_URL` / `DISCORDBOT_APPLICATION_INGESTION_TOKEN` | – | Optional private Discord event sink. Both are required to enable ingestion. |
+| `DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_ENABLED` | – | Set `false` to keep live application ingestion without Discord REST history reconciliation (default `true`). |
+| `DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_INTERVAL_SECONDS` | – | Archive reconciliation interval in seconds (default `60`). Overlapping passes are coalesced. |
 | `DISCORDBOT_USER_NAME` | – | Bot display name used for mention parsing/thread naming (default `centaur`; the chart sets it from `discordbot.userName`). |
 | `DISCORDBOT_STATE_KEY_PREFIX` | – | Prefix for rows in the Postgres thread-state store (default `centaur-discordbot`). |
 | `DISCORD_API_URL` | – | Override Discord API base. |

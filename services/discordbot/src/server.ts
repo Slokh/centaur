@@ -40,6 +40,13 @@ const options: DiscordbotOptions = {
   applicationIngestionToken: optionalEnv(
     "DISCORDBOT_APPLICATION_INGESTION_TOKEN",
   ),
+  applicationArchiveReconciliationEnabled:
+    optionalEnv("DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_ENABLED") !==
+    "false",
+  applicationArchiveReconciliationIntervalMs:
+    optionalSecondsEnv(
+      "DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_INTERVAL_SECONDS",
+    ),
   applicationId,
   botToken,
   conversationMode:
@@ -133,6 +140,11 @@ function optionalNumberEnv(name: string): number | undefined {
     throw new Error(`${name} must be a positive integer`);
   }
   return parsed;
+}
+
+function optionalSecondsEnv(name: string): number | undefined {
+  const seconds = optionalNumberEnv(name);
+  return seconds === undefined ? undefined : seconds * 1_000;
 }
 
 function log(level: string, message: string, data?: unknown): void {

@@ -80,6 +80,10 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%s%s" .Values.secretManager.envPrefix .Values.discordbot.applicationIngestion.tokenSecretKey }}
+            - name: DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_ENABLED
+              value: {{ .Values.discordbot.applicationIngestion.archiveReconciliation.enabled | quote }}
+            - name: DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_INTERVAL_SECONDS
+              value: {{ .Values.discordbot.applicationIngestion.archiveReconciliation.intervalSeconds | quote }}
 {{- end }}
 {{- if .Values.discordbot.mentionRoleIds }}
             - name: DISCORD_MENTION_ROLE_IDS

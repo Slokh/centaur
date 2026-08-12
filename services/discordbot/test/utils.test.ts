@@ -1,10 +1,36 @@
 import { describe, expect, it } from "bun:test";
 import {
   GuildExecutionLimiter,
+  singleFlight,
   sliceSurrogateSafe,
   splitDiscordMessageChunks,
   takeDiscordMessageChunk,
 } from "../src/utils";
+
+describe("singleFlight", () => {
+  it("coalesces overlapping calls and permits a later run", async () => {
+    let resolve!: () => void;
+    let calls = 0;
+    const operation = singleFlight(() => {
+      calls += 1;
+      return new Promise<void>((done) => {
+        resolve = done;
+      });
+    });
+
+    const first = operation();
+    const overlapping = operation();
+    expect(overlapping).toBe(first);
+    expect(calls).toBe(1);
+    resolve();
+    await first;
+
+    const later = operation();
+    expect(calls).toBe(2);
+    resolve();
+    await later;
+  });
+});
 
 describe("sliceSurrogateSafe", () => {
   it("returns the value unchanged when it fits", () => {

@@ -647,6 +647,9 @@ discordbot:
     enabled: false
     url: ""
     tokenSecretKey: DISCORDBOT_APPLICATION_INGESTION_TOKEN
+    archiveReconciliation:
+      enabled: true
+      intervalSeconds: 60
   extraEnv: {}
   resources: {}
 

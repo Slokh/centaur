@@ -130,6 +130,9 @@ export type DiscordbotOptions = {
   /** Private application Discord ingestion endpoint; requires the token too. */
   applicationIngestionUrl?: string;
   applicationIngestionToken?: string;
+  /** Periodically reconcile Discord REST history into application ingestion. */
+  applicationArchiveReconciliationEnabled?: boolean;
+  applicationArchiveReconciliationIntervalMs?: number;
   applicationId: string;
   botToken: string;
   /** Layout for new channel mentions. Existing Discord threads remain threads. */

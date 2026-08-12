@@ -17,6 +17,18 @@ export function elapsedMs(startedAtMs: number): number {
   return Math.max(0, Math.round(nowMs() - startedAtMs));
 }
 
+/** Coalesces overlapping calls onto one in-flight operation. */
+export function singleFlight<T>(operation: () => Promise<T>): () => Promise<T> {
+  let active: Promise<T> | undefined;
+  return () => {
+    if (active) return active;
+    active = operation().finally(() => {
+      active = undefined;
+    });
+    return active;
+  };
+}
+
 export function traceLog(
   options: DiscordbotOptions,
   event: string,
