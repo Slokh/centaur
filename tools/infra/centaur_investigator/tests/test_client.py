@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
@@ -11,10 +14,45 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 import client as centaur_client
 from client import (
     CentaurInvestigatorClient,
+    _connection_role,
     _database_url_with_name,
     _postgres_database_name,
+    _record_to_dict,
+    _safe_discord_log_entry,
+    parse_discord_reference,
     parse_slack_reference,
 )
+
+
+class _AsyncpgLikeRecord:
+    """Mimic asyncpg.Record, whose iterator yields values rather than keys."""
+
+    def __init__(self, values: dict[str, object]) -> None:
+        self._values = values
+
+    def __iter__(self):
+        return iter(self._values.values())
+
+    def items(self):
+        return self._values.items()
+
+
+def test_record_to_dict_uses_mapping_items_for_asyncpg_records() -> None:
+    row = _AsyncpgLikeRecord({"current_user": "tempo", "execution_id": "exe_1"})
+
+    assert _record_to_dict(row) == {
+        "current_user": "tempo",
+        "execution_id": "exe_1",
+    }
+
+
+def test_connection_role_falls_back_to_current_user_when_role_is_none() -> None:
+    assert (
+        _connection_role(
+            {"row": {"session_user": "tempo", "current_user": "tempo", "active_role": "none"}}
+        )
+        == "tempo"
+    )
 
 
 def test_database_url_with_name_appends_database_to_base_dsn() -> None:
@@ -228,6 +266,49 @@ def test_parse_slack_thread_key_with_team() -> None:
     ]
 
 
+def test_parse_discord_permalink_returns_snowflake_time_and_candidates() -> None:
+    result = parse_discord_reference(
+        "debug https://discord.com/channels/87003047531651072/"
+        "1407795944711524462/1537142385174384830"
+    )
+
+    assert result["status"] == "ok"
+    assert result["source"] == "discord"
+    assert result["guild_id"] == "87003047531651072"
+    assert result["channel_id"] == "1407795944711524462"
+    assert result["message_id"] == "1537142385174384830"
+    assert result["message_datetime"] == "2026-08-12T16:55:03.350000+00:00"
+    assert result["thread_key_candidates"] == [
+        "discord:87003047531651072:1407795944711524462:reply~1537142385174384830",
+        "discord:87003047531651072:1407795944711524462",
+    ]
+
+
+def test_safe_discord_log_entry_redacts_content_errors_args_and_tokens() -> None:
+    result = _safe_discord_log_entry(
+        {
+            "_time": "2026-08-12T16:55:00Z",
+            "event": "tool_call_completed",
+            "tool_name": "application",
+            "duration_ms": 1200,
+            "success": "false",
+            "content": "private message",
+            "text": "private message",
+            "error": "secret failure details",
+            "tool_args": ["wallet.transfer", {"amount": "100"}],
+            "DISCORD_BOT_TOKEN": "never-return-this",
+        }
+    )
+
+    assert result == {
+        "_time": "2026-08-12T16:55:00Z",
+        "event": "tool_call_completed",
+        "tool_name": "application",
+        "duration_ms": 1200,
+        "success": "false",
+    }
+
+
 def test_investigation_queries_readonly_tables_without_message_context(monkeypatch) -> None:
     fake = _FakeConnection()
 
@@ -320,3 +401,297 @@ def test_observability_never_requests_raw_log_context(monkeypatch) -> None:
     assert "thread_trace" not in str(result["observability"])
     assert "execution_logs" not in str(result["observability"])
     assert "raw_payload" not in str(result)
+
+
+class _DiscordFakeConnection(_FakeConnection):
+    async def fetch(self, query: str, *args):
+        self.fetch_calls.append((query, args))
+        thread_key = "discord:87003047531651072:1407795944711524462:reply~1537142298947756043"
+        if "SELECT DISTINCT thread_key" in query and "FROM session_messages" in query:
+            return [{"thread_key": thread_key}]
+        if "FROM sessions" in query and "BETWEEN" not in query:
+            return [
+                {
+                    "thread_key": thread_key,
+                    "sandbox_id": "asbx_warm",
+                    "harness_type": "codex",
+                    "harness_thread_id": "harness_1",
+                    "persona_id": None,
+                    "status": "idle",
+                    "source": "discordbot",
+                    "platform": "discord",
+                    "external_thread_id": "1537142298947756043",
+                    "created_at": dt.datetime(2026, 8, 12, 16, 54, 42, 998000, tzinfo=dt.UTC),
+                    "updated_at": dt.datetime(2026, 8, 12, 16, 55, 4, tzinfo=dt.UTC),
+                }
+            ]
+        if "FROM sessions" in query and "BETWEEN" in query:
+            return []
+        if "FROM session_executions" in query:
+            return [
+                {
+                    "execution_id": "exe_1",
+                    "thread_key": thread_key,
+                    "status": "completed",
+                    "model": "gpt-test",
+                    "created_at": dt.datetime(2026, 8, 12, 16, 54, 43, 85000, tzinfo=dt.UTC),
+                    "started_at": dt.datetime(2026, 8, 12, 16, 54, 43, 85000, tzinfo=dt.UTC),
+                    "completed_at": dt.datetime(2026, 8, 12, 16, 55, 3, 62000, tzinfo=dt.UTC),
+                    "duration_seconds": 19.977,
+                }
+            ]
+        if "FROM session_messages" in query:
+            return [
+                {
+                    "message_id": "msg_1",
+                    "thread_key": thread_key,
+                    "role": "user",
+                    "part_count": 1,
+                    "part_types": ["text"],
+                    "source": "discordbot",
+                    "platform": "discord",
+                    "user_id": "87002447687467008",
+                    "user_name": "slokh",
+                    "created_at": dt.datetime(2026, 8, 12, 16, 54, 43, 61000, tzinfo=dt.UTC),
+                }
+            ]
+        if "FROM session_events" in query:
+            return [
+                {
+                    "event_id": 1,
+                    "thread_key": thread_key,
+                    "execution_id": "exe_1",
+                    "event_type": "session.warm_sandbox_claimed",
+                    "status": None,
+                    "has_error": False,
+                    "created_at": dt.datetime(2026, 8, 12, 16, 54, 43, 576000, tzinfo=dt.UTC),
+                }
+            ]
+        if "FROM thread_traces" in query:
+            return []
+        if any(
+            table in query
+            for table in (
+                "FROM agent_runtime_assignments",
+                "FROM agent_execution_requests",
+                "FROM sandbox_sessions",
+            )
+        ):
+            return []
+        raise AssertionError(f"unexpected query: {query}")
+
+
+def _discord_http_client() -> httpx.Client:
+    source_message = {
+        "id": "1537142298947756043",
+        "channel_id": "1407795944711524462",
+        "guild_id": "87003047531651072",
+        "content": "<@1520495166668931242> balances",
+        "timestamp": "2026-08-12T16:54:42.942000+00:00",
+        "edited_timestamp": None,
+        "author": {
+            "id": "87002447687467008",
+            "username": "slokh",
+            "global_name": "kartik",
+        },
+        "attachments": [],
+        "embeds": [],
+        "reactions": [{"emoji": {"name": "✅"}, "count": 1}],
+    }
+    target_message = {
+        "id": "1537142385174384830",
+        "channel_id": "1407795944711524462",
+        "guild_id": "87003047531651072",
+        "content": (
+            "I can't retrieve your live balance because this session is missing its "
+            "thread context (`CENTAUR_THREAD_KEY`)."
+        ),
+        "timestamp": "2026-08-12T16:55:03.350000+00:00",
+        "edited_timestamp": "2026-08-12T16:55:04.073000+00:00",
+        "author": {"id": "1520495166668931242", "username": "ai", "bot": True},
+        "message_reference": {"message_id": source_message["id"]},
+        "referenced_message": source_message,
+        "attachments": [],
+        "embeds": [],
+        "reactions": [],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == "Bot test-token"
+        if request.url.path.endswith("/messages/1537142385174384830"):
+            return httpx.Response(200, json=target_message)
+        if request.url.path.endswith("/channels/1407795944711524462"):
+            return httpx.Response(
+                200,
+                json={"id": "1407795944711524462", "name": "debug", "type": 0},
+            )
+        return httpx.Response(404, json={"code": 10008, "message": "Unknown Message"})
+
+    return httpx.Client(
+        base_url=centaur_client.DISCORD_API_URL, transport=httpx.MockTransport(handler)
+    )
+
+
+def test_discord_investigation_resolves_bot_reply_and_correlates_execution(monkeypatch) -> None:
+    fake = _DiscordFakeConnection()
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
+    http_client = _discord_http_client()
+    try:
+        result = CentaurInvestigatorClient(
+            "postgresql://example",
+            discord_token="test-token",
+            discord_http_client=http_client,
+        ).investigate_discord_message(
+            "https://discord.com/channels/87003047531651072/"
+            "1407795944711524462/1537142385174384830",
+            include_observability=False,
+        )
+    finally:
+        http_client.close()
+
+    assert result["status"] == "ok"
+    assert result["parsed"]["source_message_id"] == "1537142298947756043"
+    assert result["parsed"]["thread_key"].endswith("reply~1537142298947756043")
+    assert result["discord"]["message"]["author"]["bot"] is True
+    assert result["discord"]["source_message"]["content"].endswith("balances")
+    assert result["analysis"]["diagnosis"] == "missing_thread_context"
+    assert result["analysis"]["warm_pool_hit"] is True
+    assert result["analysis"]["response_latency_ms"] == 20408
+    assert any(row["stage"] == "discord.response_message_created" for row in result["timeline"])
+    assert fake.closed is True
+
+    serialized = json.dumps(result, default=str)
+    assert "test-token" not in serialized
+    assert "avatar" not in serialized
+    assert "attachment_url" not in serialized
+
+
+def test_discord_investigation_can_omit_message_content(monkeypatch) -> None:
+    fake = _DiscordFakeConnection()
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
+    http_client = _discord_http_client()
+    try:
+        result = CentaurInvestigatorClient(
+            "postgresql://example",
+            discord_token="test-token",
+            discord_http_client=http_client,
+        ).investigate_discord_message(
+            "https://discord.com/channels/87003047531651072/"
+            "1407795944711524462/1537142385174384830",
+            include_observability=False,
+            include_content=False,
+        )
+    finally:
+        http_client.close()
+
+    assert "content" not in result["discord"]["message"]
+    assert "content" not in result["discord"]["source_message"]
+
+
+def test_discord_observability_timeline_is_strictly_redacted(monkeypatch) -> None:
+    fake = _DiscordFakeConnection()
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    class FakeVlogs:
+        def hits(self, *args, **kwargs):
+            return {"hits": []}
+
+        def field_values(self, *args, **kwargs):
+            return []
+
+        def tool_usage_by_thread(self, *args, **kwargs):
+            return []
+
+        def query(self, *args, **kwargs):
+            return [
+                {
+                    "_time": "2026-08-12T16:54:56.754Z",
+                    "service": "sandbox",
+                    "event": "tool_call_completed",
+                    "tool_name": "application",
+                    "success": "false",
+                    "duration_ms": 1359,
+                    "tool_args": ["wallet.transfer", {"amount": "100"}],
+                    "content": "private Discord content",
+                    "error": "credential-shaped error",
+                    "authorization": "Bot secret",
+                }
+            ]
+
+    def fake_load_module(module_name: str, path: Path):
+        if "vlogs" in str(path):
+            return SimpleNamespace(VictoriaLogsClient=FakeVlogs)
+        return None
+
+    monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
+    monkeypatch.setattr(centaur_client, "_safe_load_module", fake_load_module)
+    http_client = _discord_http_client()
+    try:
+        result = CentaurInvestigatorClient(
+            "postgresql://example",
+            discord_token="test-token",
+            discord_http_client=http_client,
+        ).investigate_discord_message(
+            "https://discord.com/channels/87003047531651072/"
+            "1407795944711524462/1537142385174384830",
+            include_observability=True,
+        )
+    finally:
+        http_client.close()
+
+    safe_timeline = result["observability"]["vlogs"]["discord_timeline"]
+    assert safe_timeline == [
+        {
+            "_time": "2026-08-12T16:54:56.754Z",
+            "service": "sandbox",
+            "event": "tool_call_completed",
+            "tool_name": "application",
+            "success": "false",
+            "duration_ms": 1359,
+        }
+    ]
+    serialized = json.dumps(result, default=str)
+    assert "wallet.transfer" not in serialized
+    assert "private Discord content" not in serialized.replace(
+        result["discord"]["message"]["content"], ""
+    )
+    assert "credential-shaped error" not in serialized
+    assert "Bot secret" not in serialized
+
+
+def test_discord_api_errors_do_not_echo_response_body_or_token() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={"code": 50001, "message": "sensitive upstream detail test-token"},
+        )
+
+    http_client = httpx.Client(
+        base_url=centaur_client.DISCORD_API_URL,
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        result = CentaurInvestigatorClient(
+            "postgresql://example",
+            discord_token="test-token",
+            discord_http_client=http_client,
+        ).investigate_discord_message(
+            "https://discord.com/channels/87003047531651072/"
+            "1407795944711524462/1537142385174384830",
+            include_observability=False,
+        )
+    finally:
+        http_client.close()
+
+    assert result == {"status": "error", "error": "Discord API request failed (403, code 50001)"}
+    assert "test-token" not in str(result)
