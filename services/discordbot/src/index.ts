@@ -228,15 +228,18 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     conversationMode: options.conversationMode,
     onMessageObserved: async (message) => {
       if (!isAllowedDiscordGuild(message.guildId, options)) return;
-      await ingestObservedDiscordMessage(options, message, state);
+      // Observation is a durable background concern, not part of Discord's
+      // acknowledgement path. Even the outbox's state writes may involve a
+      // remote database and must not delay mention routing, typing, or 👀.
+      backgroundWaitUntil(ingestObservedDiscordMessage(options, message, state));
     },
     onMessageDeleted: async (message) => {
       if (!isAllowedDiscordGuild(message.guildId, options)) return;
-      await ingestDeletedDiscordMessage(options, message, state);
+      backgroundWaitUntil(ingestDeletedDiscordMessage(options, message, state));
     },
     onChannelObserved: async (channel) => {
       if (!isAllowedDiscordGuild(channel.guildId, options)) return;
-      await ingestObservedDiscordChannel(options, channel, state);
+      backgroundWaitUntil(ingestObservedDiscordChannel(options, channel, state));
     },
     publicKey: options.publicKey,
     mentionRoleIds: options.mentionRoleIds,
