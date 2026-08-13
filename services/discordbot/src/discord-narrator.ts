@@ -1,6 +1,9 @@
 import type { ChatSDKStreamChunk } from "@centaur/rendering";
 import type { Logger, Thread } from "chat";
-import { parseDiscordThreadKey } from "./discord-allowlist";
+import {
+  discordTurnDeliveryKey,
+  parseDiscordThreadKey,
+} from "./discord-allowlist";
 import { DEFAULT_DISCORD_API_URL } from "./discord-threading";
 import type { DiscordbotApiMessage, DiscordbotOptions } from "./types";
 import {
@@ -64,6 +67,7 @@ export class DiscordNarrator {
   private readonly maxPosts: number;
   private readonly reactionChannelId: string | undefined;
   private readonly reactionMessageId: string;
+  private readonly deliveryThreadId: string;
   // Current thought, keyed by chunk id: reasoning deltas have unique ids and
   // concatenate; a commentary item re-uses its id and replaces its body.
   private pendingParts = new Map<string, string>();
@@ -94,6 +98,7 @@ export class DiscordNarrator {
     this.reactionChannelId =
       message.id === threadId ? channelId : (threadId ?? channelId);
     this.reactionMessageId = message.id;
+    this.deliveryThreadId = discordTurnDeliveryKey(thread.id, message.id);
   }
 
   /** Adds the 👀 working reaction (best-effort) and returns the narrator. */
@@ -225,7 +230,7 @@ export class DiscordNarrator {
       try {
         // `raw` skips the SDK's markdown round-trip, which would escape the
         // leading -# and break Discord's subtext rendering.
-        await this.thread.adapter.postMessage(this.thread.id, {
+        await this.thread.adapter.postMessage(this.deliveryThreadId, {
           raw: content,
         });
       } catch (error) {

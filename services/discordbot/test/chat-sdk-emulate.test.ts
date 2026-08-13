@@ -109,9 +109,18 @@ describe("discordbot", () => {
       .find(
         (message) =>
           message.author.bot === true &&
-          message.message_reference?.message_id === rootId,
-      );
+          message.message_reference?.message_id === followUpId,
+    );
     expect(secondAnswer).toBeDefined();
+
+    // Simulate a Gateway restart losing the adapter's fast reply-root cache.
+    // The bounded Discord reference walk must still recover the original
+    // logical root while the next answer targets the immediate user message.
+    (
+      bot.adapter as unknown as {
+        inlineReplyRootCache: Map<string, string>;
+      }
+    ).inlineReplyRootCache.clear();
 
     const secondFollowUpId = await dispatchMessage({
       channelId: CHANNEL_ID,
@@ -120,6 +129,15 @@ describe("discordbot", () => {
       replyToMessageId: secondAnswer!.id,
     });
     await waitForSettle(CHANNEL_ID, secondFollowUpId);
+
+    const thirdAnswer = [...discordApi.messagesIn(CHANNEL_ID)]
+      .reverse()
+      .find(
+        (message) =>
+          message.author.bot === true &&
+          message.message_reference?.message_id === secondFollowUpId,
+      );
+    expect(thirdAnswer).toBeDefined();
 
     const rootKey = `discord:${GUILD_ID}:${CHANNEL_ID}:reply~${rootId}`;
     expect(codexApi.creates.map((create) => create.threadKey)).toEqual([

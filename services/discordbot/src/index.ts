@@ -19,6 +19,7 @@ import {
 import { Hono } from "hono";
 import pg from "pg";
 import {
+  discordTurnDeliveryKey,
   isAllowedDiscordGuild,
   isAllowedDiscordMessage,
   isGuildAllowlistEmpty,
@@ -565,8 +566,11 @@ async function syncThreadMessageToSession(
         { error: errorMessage(error) },
       );
       await thread
-        .post(
-          "I can't read this channel's history — I'm missing permissions (Read Message History).",
+        .adapter.postMessage(
+          discordTurnDeliveryKey(thread.id, message.id),
+          {
+            raw: "I can't read this channel's history — I'm missing permissions (Read Message History).",
+          },
         )
         .catch(() => undefined);
       await reactToDiscordMessage(
@@ -1375,6 +1379,7 @@ async function renderExecutionStream(
         thread,
         stream,
         options,
+        discordTurnDeliveryKey(thread.id, message.id),
         trace,
       );
       await narrator.finish(sawError ? "failed" : "done");
@@ -1396,7 +1401,13 @@ async function renderExecutionStream(
   const narrator = DiscordNarrator.start(thread, message, options, { logger });
   const stopTyping = startTypingKeepalive(thread, logger);
   try {
-    await renderSplitExecutionStreams(thread, stream, options, narrator);
+    await renderSplitExecutionStreams(
+      thread,
+      stream,
+      options,
+      narrator,
+      discordTurnDeliveryKey(thread.id, message.id),
+    );
     await narrator.finish("done");
   } catch (error) {
     await narrator.finish(
@@ -1420,6 +1431,7 @@ async function renderSplitExecutionStreams(
   stream: AsyncIterable<DiscordbotRendererSource>,
   options: DiscordbotOptions,
   narrator: DiscordNarrator,
+  deliveryThreadId: string,
 ): Promise<void> {
   let answerText = "";
   for await (const chunk of harnessToChatSdkStream(
@@ -1432,7 +1444,7 @@ async function renderSplitExecutionStreams(
     }
     narrator.update(chunk);
   }
-  await postBufferedAnswerToThread(thread, answerText);
+  await postBufferedAnswerToThread(thread, answerText, deliveryThreadId);
 }
 
 /**
@@ -1449,6 +1461,7 @@ async function renderSplitExecutionStreams(
 export async function postBufferedAnswerToThread(
   thread: Thread,
   answer: string,
+  deliveryThreadId = thread.id,
 ): Promise<void> {
   let pending = answer;
   let postedCount = 0;
@@ -1458,7 +1471,7 @@ export async function postBufferedAnswerToThread(
     // the text length past Discord's 2000-char cap (re-triggering the
     // adapter's silent truncation) and Discord renders markdown natively.
     const visibleContent = suppressDiscordLinkEmbeds(content);
-    await thread.adapter.postMessage(thread.id, {
+    await thread.adapter.postMessage(deliveryThreadId, {
       raw: visibleContent,
     });
     postedCount += 1;
@@ -1500,6 +1513,7 @@ async function renderPlainTextExecutionStream(
   thread: Thread,
   stream: AsyncIterable<DiscordbotRendererSource>,
   options: DiscordbotOptions,
+  deliveryThreadId: string,
   trace?: DiscordbotTrace,
 ): Promise<boolean> {
   const logger = options.logger ?? noopLogger;
@@ -1531,7 +1545,7 @@ async function renderPlainTextExecutionStream(
     traceLog(options, "discordbot_render_plain_text_final", trace, {
       chars: text.length,
     });
-    await thread.adapter.postMessage(thread.id, { raw: text });
+    await thread.adapter.postMessage(deliveryThreadId, { raw: text });
   } finally {
     stopTyping();
   }

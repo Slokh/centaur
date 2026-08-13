@@ -27,6 +27,22 @@ export function parseDiscordThreadKey(threadKey: string): {
 }
 
 /**
+ * Keep an inline reply chain's logical root while directing one outbound
+ * message at the user message that triggered the current turn. The patched
+ * Discord adapter understands the private `~to~` suffix; this key is for
+ * delivery only and must never be used as session or state identity.
+ */
+export function discordTurnDeliveryKey(
+  threadKey: string,
+  triggerMessageId: string,
+): string {
+  const { guildId, channelId, replyToMessageId } =
+    parseDiscordThreadKey(threadKey);
+  if (!guildId || !channelId || !replyToMessageId) return threadKey;
+  return `discord:${guildId}:${channelId}:reply~${replyToMessageId}~to~${triggerMessageId}`;
+}
+
+/**
  * Authorization gate for inbound Discord messages.
  *
  * Unlike the Slack allowlist (which is fail-open), this is intentionally **fail-closed**:
