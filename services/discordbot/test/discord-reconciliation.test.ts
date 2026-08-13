@@ -340,6 +340,77 @@ describe("Discord archive reconciliation", () => {
       data: { channel_id: "10", status: 403 },
     }));
   });
+
+  it("skips inaccessible archived-thread endpoints and continues with later parents", async () => {
+    const state = createMemoryState();
+    await state.connect();
+    const delivered: Record<string, unknown>[] = [];
+    const warnings: Array<{ message: string; data?: unknown }> = [];
+    const logger = {
+      debug: () => undefined,
+      info: () => undefined,
+      warn: (message: string, data?: unknown) => {
+        warnings.push({ message, data });
+      },
+      error: () => undefined,
+      child: () => logger,
+    };
+    const options = {
+      apiUrl: "http://centaur",
+      applicationId: "app",
+      botToken: "bot",
+      publicKey: "key",
+      discordApiUrl: "http://discord",
+      guildAllowlist: ["1"],
+      applicationIngestionUrl: "http://application.local/v1/discord/events",
+      applicationIngestionToken: "secret",
+      logger,
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        if (request.url.startsWith("http://application.local")) {
+          recordDelivery(delivered, await request.json());
+          return new Response("{}", { status: 200 });
+        }
+        if (request.url.endsWith("/guilds/1/channels")) {
+          return Response.json([
+            { id: "10", type: 0, name: "private" },
+            { id: "11", type: 0, name: "general" },
+          ]);
+        }
+        if (request.url.endsWith("/guilds/1/threads/active")) {
+          return Response.json({ threads: [] });
+        }
+        if (request.url.includes("/channels/10/threads/archived/public")) {
+          return new Response("missing access", { status: 403 });
+        }
+        if (request.url.includes("/channels/11/threads/archived/public")) {
+          return Response.json({
+            threads: [{
+              id: "50",
+              type: 11,
+              name: "old topic",
+              parent_id: "11",
+              thread_metadata: { archive_timestamp: "2026-08-01T00:00:00.000Z" },
+            }],
+            has_more: false,
+          });
+        }
+        if (request.url.includes("/channels/50/messages") && !request.url.includes("after=")) {
+          return Response.json([{ ...message("60"), channel_id: "50" }]);
+        }
+        return Response.json([]);
+      },
+    } satisfies DiscordbotOptions;
+
+    expect(await reconcileDiscordArchive(options, state)).toBe(1);
+    expect(delivered).toContainEqual(
+      expect.objectContaining({ type: "message_upsert", message_id: "60" }),
+    );
+    expect(warnings).toContainEqual(expect.objectContaining({
+      message: "discordbot_archive_channel_skipped",
+      data: { channel_id: "10", status: 403 },
+    }));
+  });
 });
 
 function message(id: string) {
