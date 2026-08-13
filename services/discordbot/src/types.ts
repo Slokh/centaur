@@ -162,7 +162,6 @@ export type DiscordbotOptions = {
     currentChannelId: string;
     currentThreadId?: string;
     guildId: string;
-    rawMessage: unknown;
     userId: string;
   }) => Promise<string[]>;
   state?: StateAdapter;

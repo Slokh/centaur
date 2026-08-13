@@ -7,6 +7,9 @@ describe("Discord visibility authority", () => {
   it("applies everyone, aggregate role, then member overwrites", async () => {
     const fetch = async (input: RequestInfo | URL) => {
       const url = String(input);
+      if (url.endsWith("/members/U1")) {
+        return Response.json({ roles: ["R1"] });
+      }
       if (url.endsWith("/roles")) {
         return Response.json([
           { id: "G1", permissions: VIEW_CHANNEL },
@@ -38,7 +41,6 @@ describe("Discord visibility authority", () => {
       currentChannelId: "current",
       currentThreadId: "thread",
       guildId: "G1",
-      rawMessage: { member: { roles: ["R1"] } },
       userId: "U1",
       fetch: fetch as typeof globalThis.fetch,
     });
@@ -46,15 +48,37 @@ describe("Discord visibility authority", () => {
     expect(visible).toEqual(["current", "member-restored", "open", "thread"]);
   });
 
-  it("fails closed when member roles are absent", async () => {
+  it("fails closed when the member lookup is invalid", async () => {
+    const fetch = async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/members/U1")) return Response.json({});
+      return Response.json([]);
+    };
     await expect(
       resolveDiscordVisibleChannelIds({
         botToken: "token",
         currentChannelId: "current",
         guildId: "G1",
-        rawMessage: {},
         userId: "U1",
+        fetch: fetch as typeof globalThis.fetch,
       }),
-    ).rejects.toThrow("missing member roles");
+    ).rejects.toThrow("invalid payloads");
+  });
+
+  it("fails closed when Discord rejects the member lookup", async () => {
+    const fetch = async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.endsWith("/members/U1")) return new Response(null, { status: 403 });
+      return Response.json([]);
+    };
+    await expect(
+      resolveDiscordVisibleChannelIds({
+        botToken: "token",
+        currentChannelId: "current",
+        guildId: "G1",
+        userId: "U1",
+        fetch: fetch as typeof globalThis.fetch,
+      }),
+    ).rejects.toThrow("member=403");
   });
 });
