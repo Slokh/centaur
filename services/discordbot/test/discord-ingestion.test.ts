@@ -3,6 +3,7 @@ import { createMemoryState } from "@chat-adapter/state-memory";
 import {
   discordAttachmentExpiry,
   ingestObservedDiscordMessage,
+  ingestObservedDiscordMessages,
   recoverApplicationIngestion,
 } from "../src/discord-ingestion";
 import type { DiscordbotOptions } from "../src/types";
@@ -137,5 +138,38 @@ describe("Discord application ingestion", () => {
     expect(discordAttachmentExpiry("https://cdn.discordapp.com/a?ex=65c00000"))
       .toBe(new Date(Number.parseInt("65c00000", 16) * 1000).toISOString());
     expect(discordAttachmentExpiry("not a url")).toBeNull();
+  });
+
+  it("sends one archive batch and deduplicates repeated member events", async () => {
+    let payload: { events?: Record<string, unknown>[] } | undefined;
+    const options = {
+      apiUrl: "http://centaur",
+      applicationId: "app",
+      botToken: "bot",
+      publicKey: "key",
+      applicationIngestionUrl: "http://application.local/v1/discord/events",
+      applicationIngestionToken: "ingest-secret",
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        payload = await new Request(input, init).json();
+        return new Response("{}", { status: 200 });
+      },
+    } satisfies DiscordbotOptions;
+
+    await ingestObservedDiscordMessages(options, ["M1", "M2"].map((messageId) => ({
+      guildId: "G1",
+      channelId: "C1",
+      messageId,
+      authorId: "U1",
+      authorName: "member",
+      content: messageId,
+      createdAt: "2026-08-10T10:00:00.000Z",
+      attachments: [],
+    })));
+
+    expect(payload?.events).toHaveLength(3);
+    expect(payload?.events?.filter((event) => event.type === "member_upsert"))
+      .toHaveLength(1);
+    expect(payload?.events?.filter((event) => event.type === "message_upsert"))
+      .toHaveLength(2);
   });
 });

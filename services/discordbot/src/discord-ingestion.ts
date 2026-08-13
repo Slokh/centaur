@@ -41,39 +41,29 @@ export async function ingestObservedDiscordMessage(
   if (!options.applicationIngestionUrl || !options.applicationIngestionToken) {
     return;
   }
-  const updatedAt = message.editedAt ?? message.createdAt;
-  if (message.authorName) {
-    await persistAndPostIngestionEvent(options, state, {
-      guild_id: message.guildId,
-      source_key: `member:${message.authorId}:${message.authorName}:${message.displayName ?? ""}:${message.authorIsBot === true}`,
-      type: "member_upsert",
-      user_id: message.authorId,
-      username: message.authorName,
-      display_name: message.displayName ?? null,
-      is_bot: message.authorIsBot === true,
-    });
+  for (const event of messageIngestionEvents(message)) {
+    await persistAndPostIngestionEvent(options, state, event);
   }
-  await persistAndPostIngestionEvent(options, state, {
-    guild_id: message.guildId,
-    source_key: `message:${message.messageId}:${updatedAt}`,
-    type: "message_upsert",
-    channel_id: message.threadId ?? message.channelId,
-    message_id: message.messageId,
-    thread_id: message.threadId ?? null,
-    reply_to_message_id: message.replyToMessageId ?? null,
-    author_user_id: message.authorId,
-    content: message.content,
-    normalized_payload: message.normalizedPayload ?? {},
-    created_at: message.createdAt,
-    updated_at: updatedAt,
-    attachments: message.attachments.map((attachment) => ({
-      id: attachment.id,
-      filename: attachment.filename,
-      content_type: attachment.contentType ?? null,
-      size_bytes: attachment.size,
-      url: attachment.url,
-      url_expires_at: discordAttachmentExpiry(attachment.url),
-    })),
+}
+
+/**
+ * Forward one Discord REST page as a single durable application-ingestion
+ * batch. Gateway events intentionally keep using the single-event path above;
+ * batching is for archive reconciliation, where Discord already supplies a
+ * natural page boundary and checkpoints make replay idempotent.
+ */
+export async function ingestObservedDiscordMessages(
+  options: DiscordbotOptions,
+  messages: readonly ObservedDiscordMessage[],
+  state?: StateAdapter,
+): Promise<void> {
+  if (messages.length === 0) return;
+  const events = deduplicateEvents(messages.flatMap(messageIngestionEvents));
+  const first = messages[0]!;
+  const last = messages.at(-1)!;
+  await persistAndPostIngestionBatch(options, state, {
+    source_key: `batch:${first.guildId}:${first.channelId}:${first.messageId}:${last.messageId}`,
+    events,
   });
 }
 
@@ -149,6 +139,74 @@ async function persistAndPostIngestionEvent(
   void postIngestionEvent(options, payload)
     .then(() => state.delete(eventKey))
     .catch(() => undefined);
+}
+
+async function persistAndPostIngestionBatch(
+  options: DiscordbotOptions,
+  state: StateAdapter | undefined,
+  payload: Record<string, unknown>,
+): Promise<void> {
+  if (!state) return postIngestionEvent(options, payload);
+  const sourceKey = String(payload.source_key ?? "");
+  if (!sourceKey) throw new Error("application ingestion batch lacks source_key");
+  const eventKey = `${INGESTION_EVENT_PREFIX}${sourceKey}`;
+  await state.set(eventKey, payload, INGESTION_RETENTION_MS);
+  await state.appendToList(INGESTION_INDEX_KEY, sourceKey, {
+    maxLength: 100_000,
+    ttlMs: INGESTION_RETENTION_MS,
+  });
+  // Archive workers are already off the Gateway path. Await delivery here so
+  // channel concurrency also bounds load on the private application. A failed
+  // request remains in the durable outbox and prevents checkpoint advancement.
+  await postIngestionEvent(options, payload);
+  await state.delete(eventKey);
+}
+
+function messageIngestionEvents(
+  message: ObservedDiscordMessage,
+): Array<Record<string, unknown>> {
+  const updatedAt = message.editedAt ?? message.createdAt;
+  const events: Array<Record<string, unknown>> = [];
+  if (message.authorName) {
+    events.push({
+      guild_id: message.guildId,
+      source_key: `member:${message.authorId}:${message.authorName}:${message.displayName ?? ""}:${message.authorIsBot === true}`,
+      type: "member_upsert",
+      user_id: message.authorId,
+      username: message.authorName,
+      display_name: message.displayName ?? null,
+      is_bot: message.authorIsBot === true,
+    });
+  }
+  events.push({
+    guild_id: message.guildId,
+    source_key: `message:${message.messageId}:${updatedAt}`,
+    type: "message_upsert",
+    channel_id: message.threadId ?? message.channelId,
+    message_id: message.messageId,
+    thread_id: message.threadId ?? null,
+    reply_to_message_id: message.replyToMessageId ?? null,
+    author_user_id: message.authorId,
+    content: message.content,
+    normalized_payload: message.normalizedPayload ?? {},
+    created_at: message.createdAt,
+    updated_at: updatedAt,
+    attachments: message.attachments.map((attachment) => ({
+      id: attachment.id,
+      filename: attachment.filename,
+      content_type: attachment.contentType ?? null,
+      size_bytes: attachment.size,
+      url: attachment.url,
+      url_expires_at: discordAttachmentExpiry(attachment.url),
+    })),
+  });
+  return events;
+}
+
+function deduplicateEvents(
+  events: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  return [...new Map(events.map((event) => [String(event.source_key), event])).values()];
 }
 
 export async function recoverApplicationIngestion(
