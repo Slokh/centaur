@@ -115,36 +115,66 @@ async function reconcileArchivedPublicThreads(
 ): Promise<number> {
   let observed = 0;
   for (const parent of guildChannels.filter((channel) => THREAD_PARENT_CHANNEL_TYPES.has(channel.type))) {
-    const cursorKey = `${ARCHIVED_THREAD_CURSOR_PREFIX}${guildId}:${parent.id}`;
-    let cursor = await state.get<string>(cursorKey);
-    const latest = await getArchivedPublicThreads(options, parent.id);
+    try {
+      observed += await reconcileArchivedPublicThreadsForParent(
+        options,
+        state,
+        guildId,
+        parent,
+      );
+    } catch (error) {
+      if (
+        error instanceof DiscordReconciliationError &&
+        (error.status === 403 || error.status === 404)
+      ) {
+        options.logger?.warn("discordbot_archive_channel_skipped", {
+          channel_id: parent.id,
+          status: error.status,
+        });
+        continue;
+      }
+      throw error;
+    }
+  }
+  return observed;
+}
+
+async function reconcileArchivedPublicThreadsForParent(
+  options: DiscordbotOptions,
+  state: StateAdapter,
+  guildId: string,
+  parent: DiscordChannel,
+): Promise<number> {
+  let observed = 0;
+  const cursorKey = `${ARCHIVED_THREAD_CURSOR_PREFIX}${guildId}:${parent.id}`;
+  let cursor = await state.get<string>(cursorKey);
+  const latest = await getArchivedPublicThreads(options, parent.id);
+  observed += await reconcileUnseenArchivedThreads(
+    options,
+    state,
+    guildId,
+    latest.threads,
+  );
+  if (!cursor) {
+    cursor = latest.has_more ? archiveTimestamp(latest.threads.at(-1)) : BACKFILL_COMPLETE;
+    // Advance only after every thread on the page has been durably queued and
+    // reconciled. A crash before this write safely replays the whole page.
+    await state.set(cursorKey, cursor);
+  }
+  for (
+    let page = 0;
+    cursor !== BACKFILL_COMPLETE && page < PAGE_LIMIT;
+    page += 1
+  ) {
+    const result = await getArchivedPublicThreads(options, parent.id, cursor);
     observed += await reconcileUnseenArchivedThreads(
       options,
       state,
       guildId,
-      latest.threads,
+      result.threads,
     );
-    if (!cursor) {
-      cursor = latest.has_more ? archiveTimestamp(latest.threads.at(-1)) : BACKFILL_COMPLETE;
-      // Advance only after every thread on the page has been durably queued and
-      // reconciled. A crash before this write safely replays the whole page.
-      await state.set(cursorKey, cursor);
-    }
-    for (
-      let page = 0;
-      cursor !== BACKFILL_COMPLETE && page < PAGE_LIMIT;
-      page += 1
-    ) {
-      const result = await getArchivedPublicThreads(options, parent.id, cursor);
-      observed += await reconcileUnseenArchivedThreads(
-        options,
-        state,
-        guildId,
-        result.threads,
-      );
-      cursor = result.has_more ? archiveTimestamp(result.threads.at(-1)) : BACKFILL_COMPLETE;
-      await state.set(cursorKey, cursor);
-    }
+    cursor = result.has_more ? archiveTimestamp(result.threads.at(-1)) : BACKFILL_COMPLETE;
+    await state.set(cursorKey, cursor);
   }
   return observed;
 }
