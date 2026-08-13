@@ -1554,6 +1554,64 @@ class CentaurInvestigatorClient:
             )
             if matched_keys:
                 parsed["thread_key"] = matched_keys[0]
+
+            # Inline-reply answers deliberately reference the chain root in
+            # Discord, not the user message that triggered each follow-up
+            # execution. Correlate the target response to the latest execution
+            # that began before it, then select the latest user message that
+            # preceded that execution. This keeps response latency and source
+            # content tied to the actual turn without changing the root-based
+            # Centaur thread key.
+            target_time = _parse_datetime(target.get("timestamp"))
+            if matched_keys and target_time is not None and target is not source:
+                trigger = await self._safe_fetchrow(
+                    conn,
+                    "discord_trigger_message",
+                    """
+                    WITH target_execution AS (
+                        SELECT thread_key, created_at
+                        FROM session_executions
+                        WHERE thread_key = ANY($1::text[])
+                          AND created_at <= $2::timestamptz
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                    )
+                    SELECT
+                        message.metadata ->> 'message_id' AS platform_message_id,
+                        message.metadata ->> 'timestamp' AS message_timestamp
+                    FROM session_messages AS message
+                    JOIN target_execution AS execution
+                      ON execution.thread_key = message.thread_key
+                    WHERE message.role = 'user'
+                      AND message.created_at <= execution.created_at
+                      AND message.metadata ->> 'platform' = 'discord'
+                      AND message.metadata ->> 'message_id' IS NOT NULL
+                    ORDER BY message.created_at DESC
+                    LIMIT 1
+                    """,
+                    matched_keys,
+                    target_time,
+                )
+                trigger_row = trigger.get("row") or {}
+                trigger_message_id = str(trigger_row.get("platform_message_id") or "")
+                if trigger_message_id and trigger_message_id != source_message_id:
+                    try:
+                        correlated_source = self._discord_get(
+                            f"/channels/{channel_id}/messages/{trigger_message_id}"
+                        )
+                    except Exception:
+                        correlated_source = None
+                    if correlated_source:
+                        parsed["reply_root_message_id"] = source_message_id
+                        source = correlated_source
+                        source_message_id = trigger_message_id
+                        parsed["source_message_id"] = source_message_id
+                        parsed["event_datetime"] = (
+                            source.get("timestamp")
+                            or trigger_row.get("message_timestamp")
+                            or parsed.get("event_datetime")
+                        )
+                        message_ids = _dedupe(message_ids + [source_message_id])
             result = await self._collect_state(conn, parsed=parsed, limit=limit)
         finally:
             await conn.close()

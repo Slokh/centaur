@@ -481,7 +481,9 @@ class _DiscordFakeConnection(_FakeConnection):
         raise AssertionError(f"unexpected query: {query}")
 
 
-def _discord_http_client() -> httpx.Client:
+def _discord_http_client(
+    trigger_message: dict[str, object] | None = None,
+) -> httpx.Client:
     source_message = {
         "id": "1537142298947756043",
         "channel_id": "1407795944711524462",
@@ -520,6 +522,10 @@ def _discord_http_client() -> httpx.Client:
         assert request.headers["Authorization"] == "Bot test-token"
         if request.url.path.endswith("/messages/1537142385174384830"):
             return httpx.Response(200, json=target_message)
+        if trigger_message and request.url.path.endswith(
+            f"/messages/{trigger_message['id']}"
+        ):
+            return httpx.Response(200, json=trigger_message)
         if request.url.path.endswith("/channels/1407795944711524462"):
             return httpx.Response(
                 200,
@@ -568,6 +574,62 @@ def test_discord_investigation_resolves_bot_reply_and_correlates_execution(monke
     assert "test-token" not in serialized
     assert "avatar" not in serialized
     assert "attachment_url" not in serialized
+
+
+def test_discord_investigation_attributes_inline_reply_to_followup_turn(monkeypatch) -> None:
+    followup_id = "1537142360000000000"
+    followup = {
+        "id": followup_id,
+        "channel_id": "1407795944711524462",
+        "guild_id": "87003047531651072",
+        "content": "in japan",
+        "timestamp": "2026-08-12T16:54:58.000000+00:00",
+        "edited_timestamp": None,
+        "author": {
+            "id": "87002447687467008",
+            "username": "slokh",
+            "global_name": "kartik",
+        },
+        "attachments": [],
+        "embeds": [],
+        "reactions": [],
+    }
+
+    class ReplyChainConnection(_DiscordFakeConnection):
+        async def fetchrow(self, query: str, *args):
+            if "WITH target_execution AS" in query:
+                return {
+                    "platform_message_id": followup_id,
+                    "message_timestamp": followup["timestamp"],
+                }
+            return await super().fetchrow(query, *args)
+
+    fake = ReplyChainConnection()
+
+    async def fake_connect(*args, **kwargs):
+        return fake
+
+    monkeypatch.setattr(centaur_client.asyncpg, "connect", fake_connect)
+    http_client = _discord_http_client(followup)
+    try:
+        result = CentaurInvestigatorClient(
+            "postgresql://example",
+            discord_token="test-token",
+            discord_http_client=http_client,
+        ).investigate_discord_message(
+            "https://discord.com/channels/87003047531651072/"
+            "1407795944711524462/1537142385174384830",
+            include_observability=False,
+        )
+    finally:
+        http_client.close()
+
+    assert result["status"] == "ok"
+    assert result["parsed"]["source_message_id"] == followup_id
+    assert result["parsed"]["reply_root_message_id"] == "1537142298947756043"
+    assert result["parsed"]["thread_key"].endswith("reply~1537142298947756043")
+    assert result["discord"]["source_message"]["content"] == "in japan"
+    assert result["analysis"]["response_latency_ms"] == 5350
 
 
 def test_discord_investigation_can_omit_message_content(monkeypatch) -> None:
