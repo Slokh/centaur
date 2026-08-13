@@ -354,6 +354,7 @@ repoCache:
   image:
     repository: ""
     tag: ""
+    digest: ""
     pullPolicy: ""
   githubToken:
     # Optional for public repos; required for private repos.

@@ -158,7 +158,6 @@ jobs:
           else
             services="$(jq -c --argjson all "$all" '[.[] as $item | $all[] | select(. == $item)] | unique' <<<"${CHANGED_SERVICES:-[]}")"
           fi
-          test "$(jq 'length' <<<"$services")" -gt 0
           if [ "$GITHUB_EVENT_NAME" = push ] && [ "$PUBLISH_ARM64" != false ]; then
             platforms='["linux/amd64","linux/arm64"]'
           else
