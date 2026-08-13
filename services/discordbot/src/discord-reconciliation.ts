@@ -78,7 +78,23 @@ export async function reconcileDiscordArchive(
             DEFAULT_CHANNEL_CONCURRENCY,
         ),
       ),
-      (channel) => reconcileChannel(options, state, guildId, channel),
+      async (channel) => {
+        try {
+          return await reconcileChannel(options, state, guildId, channel);
+        } catch (error) {
+          if (
+            error instanceof DiscordReconciliationError &&
+            (error.status === 403 || error.status === 404)
+          ) {
+            options.logger?.warn("discordbot_archive_channel_skipped", {
+              channel_id: channel.id,
+              status: error.status,
+            });
+            return 0;
+          }
+          throw error;
+        }
+      },
     );
     observed += counts.reduce((total, count) => total + count, 0);
     observed += await reconcileArchivedPublicThreads(
@@ -308,7 +324,7 @@ async function discordGet<T>(options: DiscordbotOptions, path: string): Promise<
     });
     if (response.ok) return response.json() as Promise<T>;
     if (response.status !== 429 || attempt === 4) {
-      throw new Error(`Discord reconciliation returned ${response.status} for ${path}`);
+      throw new DiscordReconciliationError(response.status, path);
     }
     const payload = await response.clone().json().catch(() => ({})) as {
       retry_after?: unknown;
@@ -319,6 +335,16 @@ async function discordGet<T>(options: DiscordbotOptions, path: string): Promise<
     await Bun.sleep(Math.max(25, Math.ceil(retrySeconds * 1_000)));
   }
   throw new Error(`Discord reconciliation exhausted retries for ${path}`);
+}
+
+class DiscordReconciliationError extends Error {
+  constructor(
+    readonly status: number,
+    readonly path: string,
+  ) {
+    super(`Discord reconciliation returned ${status} for ${path}`);
+    this.name = "DiscordReconciliationError";
+  }
 }
 
 async function mapConcurrent<T, R>(
