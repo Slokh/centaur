@@ -33,7 +33,6 @@ if (!postgresUrl) {
 
 const options: DiscordbotOptions = {
   activeExecutionTtlMs: optionalNumberEnv("DISCORDBOT_ACTIVE_EXECUTION_TTL_MS"),
-  answerEditIntervalMs: optionalNumberEnv("DISCORDBOT_ANSWER_EDIT_INTERVAL_MS"),
   apiUrl,
   apiKey: optionalEnv("DISCORDBOT_API_KEY"),
   applicationIngestionUrl: optionalEnv("DISCORDBOT_APPLICATION_INGESTION_URL"),

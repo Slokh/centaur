@@ -10,8 +10,8 @@
 // - No assistant status/title: a 👀 reaction on the triggering message via raw
 //   REST (PUT .../reactions/...) settles to ✅ / ❌ instead.
 // - Reasoning blurbs post as separate `-# ` subtext messages (append-only).
-// - The final answer streams into separate lazily-created message(s), split
-//   across multiple messages at ≤1900 chars.
+// - The final answer is buffered, then posted in separate message(s), split
+//   across multiple messages at ≤1500 chars.
 // - concurrency: bounded queue; no webhook ingress route on the Hono app.
 // - Render-obligation state lives under `discordbot:render:*` keys.
 // - Threads are renamed only when the bot itself created them.
@@ -736,9 +736,11 @@ describe("discordbot", () => {
     expect(combined).not.toContain("[truncated");
   });
 
-  // Regression (f) — a failing final edit must not fail the run.
-  it("keeps a successful run ✅ when the final answer edit fails", async () => {
+  // Regression (f) — answer deltas stay private until completion and Discord
+  // never receives an answer-message edit.
+  it("buffers answer deltas and posts the completed answer without edits", async () => {
     codexApi.autoRespond = false;
+    // Keep the fake edit endpoint hostile so any regression is unmistakable.
     discordApi.setFailMessageEdits(true);
 
     const threadId = discordApi.nextId();
@@ -773,12 +775,10 @@ describe("discordbot", () => {
         delta: "partial answer ",
       }),
     );
-    // Wait for the first message post so the tail must land as an edit —
-    // emitting both deltas back to back can coalesce into the initial post,
-    // which would never exercise the failing-edit path under test.
-    await waitFor(() =>
+    await sleep(50);
+    expect(
       botPostsIn(threadId).some((content) => content.includes("partial answer")),
-    );
+    ).toBe(false);
     codexApi.emitOutputLine(
       key,
       JSON.stringify({
@@ -797,14 +797,14 @@ describe("discordbot", () => {
 
     await waitForSettle(threadId, mentionId);
     const posts = botPostsIn(threadId);
-    expect(posts.some((content) => content.includes("partial answer"))).toBe(
-      true,
-    );
+    expect(posts.filter((content) => content.includes("partial answer"))).toEqual([
+      "partial answer with a tail",
+    ]);
     expect(
-      posts.some((content) =>
-        content.includes("The end of this answer failed to post"),
+      discordApi.calls.some(
+        (call) => call.method === "PATCH" && call.path.includes("/messages/"),
       ),
-    ).toBe(true);
+    ).toBe(false);
     expect(hasReaction(threadId, mentionId, "PUT", "❌")).toBe(false);
   });
 

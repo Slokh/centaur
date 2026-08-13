@@ -67,7 +67,6 @@ import type {
   TypingCapableAdapter,
 } from "./types";
 import {
-  AsyncTextQueue,
   elapsedMs,
   errorMessage,
   GuildExecutionLimiter,
@@ -131,11 +130,9 @@ const RENDER_RETRY_MAX_ATTEMPTS = 10;
 const FORWARD_RETRY_DELAYS_MS = [1_000, 3_000];
 // Discord delta (no slackbotv2 analog): per-guild in-flight execution cap.
 const DEFAULT_MAX_CONCURRENT_EXECUTIONS_PER_GUILD = 3;
-// Discord delta: answer streaming across multiple messages (see
-// streamAnswerToThread). Edits to the in-progress message are throttled to
-// this cadence; everything past the full-message cap lands in one final
-// honestly-truncated message.
-const ANSWER_EDIT_INTERVAL_MS = 1_500;
+// Discord delta: final answers are buffered until the renderer completes,
+// then posted without edits. Everything past the full-message cap lands in
+// one final honestly-truncated message.
 const ANSWER_MESSAGE_MAX_CHARS = DISCORD_FALLBACK_TEXT_MAX_CHARS;
 const ANSWER_MAX_FULL_MESSAGES = 10;
 
@@ -1392,10 +1389,10 @@ async function renderExecutionStream(
 
   // Append-only narration: an instant 👀 reaction on the triggering message,
   // then the agent's reasoning blurbs posted as their own subtext (-#)
-  // messages as each thought completes, then the answer streamed into a separate message
-  // created on first answer text. On settle the 👀 flips to ✅/❌. No bot
-  // message is ever edited or deleted, so messages keep their place in the
-  // timeline even when users chime in mid-run.
+  // messages as each thought completes, then the completed answer posted as
+  // a separate message. On settle the 👀 flips to ✅/❌. No bot message is
+  // ever edited or deleted, so messages keep their place in the timeline even
+  // when users chime in mid-run.
   const narrator = DiscordNarrator.start(thread, message, options, { logger });
   const stopTyping = startTypingKeepalive(thread, logger);
   try {
@@ -1413,10 +1410,10 @@ async function renderExecutionStream(
 
 /**
  * Consumes the renderer's chunk stream, routing task updates to the narrator
- * (reasoning blurbs) and answer text to separately streamed messages. The
- * answer post is created lazily on the first visible answer chunk (which is
- * also what keeps the startingStreamNotification priming working: the
- * synthetic item only unblocks deltas, it never creates an empty message).
+ * (reasoning blurbs) while buffering answer deltas. The completed answer is
+ * posted only after the source stream settles successfully; the synthetic
+ * startingStreamNotification item only unblocks deltas and never creates an
+ * empty message.
  */
 async function renderSplitExecutionStreams(
   thread: Thread,
@@ -1424,73 +1421,36 @@ async function renderSplitExecutionStreams(
   options: DiscordbotOptions,
   narrator: DiscordNarrator,
 ): Promise<void> {
-  const answerText = new AsyncTextQueue();
-  let answerPost: Promise<unknown> | null = null;
-  let sourceFailed = false;
-  try {
-    for await (const chunk of harnessToChatSdkStream(
-      stream,
-      rendererOptions(options, narrator),
-    )) {
-      if (chunk.type === "markdown_text") {
-        if (!answerPost) {
-          // Discord delta: stream the answer ourselves across multiple
-          // ≤1900-char messages instead of the chat SDK's single-message
-          // post+edit fallback, which silently truncates at Discord's
-          // 2000-char cap with "...".
-          answerPost = streamAnswerToThread(thread, answerText, options);
-          // Swallow rejections until the finally below awaits the original
-          // promise; otherwise an early failure (deleted thread/403) becomes
-          // an unhandled rejection while this loop keeps consuming.
-          answerPost.catch(() => undefined);
-        }
-        answerText.push(chunk.text);
-        continue;
-      }
-      narrator.update(chunk);
+  let answerText = "";
+  for await (const chunk of harnessToChatSdkStream(
+    stream,
+    rendererOptions(options, narrator),
+  )) {
+    if (chunk.type === "markdown_text") {
+      answerText += chunk.text;
+      continue;
     }
-  } catch (error) {
-    sourceFailed = true;
-    throw error;
-  } finally {
-    answerText.end();
-    if (answerPost) {
-      // Settle the answer post either way, but when the source stream failed
-      // that error is the one worth propagating.
-      if (sourceFailed) await answerPost.catch(() => undefined);
-      else await answerPost;
-    }
+    narrator.update(chunk);
   }
+  await postBufferedAnswerToThread(thread, answerText);
 }
 
 /**
- * Discord delta (replaces the chat SDK's post+edit fallbackStream for the
- * answer): streams answer text into Discord across MULTIPLE messages, each
- * ≤ ANSWER_MESSAGE_MAX_CHARS, splitting at newline/whitespace boundaries
+ * Discord delta (replaces the chat SDK's post+edit fallbackStream): posts a
+ * completed answer across multiple messages when necessary, each no longer
+ * than ANSWER_MESSAGE_MAX_CHARS, splitting at newline/whitespace boundaries
  * (never through a surrogate pair; code fences are closed and re-opened when
- * a split inside one is unavoidable). The in-progress message is created on
- * the first visible text and edited at most once per ANSWER_EDIT_INTERVAL_MS.
- * Past ANSWER_MAX_FULL_MESSAGES the remainder collapses into one final
- * honestly-truncated message ("[truncated N chars ...]", never a silent
- * "..."). A failure of the final edit/post does not fail the run: it is
- * logged, the already-posted content stands, and a short note is appended
- * best-effort. Mid-stream post failures still propagate (the thread is gone).
+ * a split inside one is unavoidable). Past ANSWER_MAX_FULL_MESSAGES the
+ * remainder collapses into one final honestly-truncated message
+ * ("[truncated N chars ...]", never a silent "..."). Posting failures
+ * propagate so the run is not falsely marked successful.
  * Exported for tests only.
  */
-export async function streamAnswerToThread(
+export async function postBufferedAnswerToThread(
   thread: Thread,
-  source: AsyncIterable<string>,
-  options: DiscordbotOptions,
+  answer: string,
 ): Promise<void> {
-  const logger = options.logger ?? noopLogger;
-  const editIntervalMs = Math.max(
-    options.answerEditIntervalMs ?? ANSWER_EDIT_INTERVAL_MS,
-    ANSWER_EDIT_INTERVAL_MS,
-  );
-  let pending = "";
-  let current: { id: string; threadId: string } | null = null;
-  let lastEditedContent = "";
-  let lastEditAtMs = 0;
+  let pending = answer;
   let postedCount = 0;
 
   const postNew = async (content: string): Promise<void> => {
@@ -1498,95 +1458,29 @@ export async function streamAnswerToThread(
     // the text length past Discord's 2000-char cap (re-triggering the
     // adapter's silent truncation) and Discord renders markdown natively.
     const visibleContent = suppressDiscordLinkEmbeds(content);
-    const raw = await thread.adapter.postMessage(thread.id, {
+    await thread.adapter.postMessage(thread.id, {
       raw: visibleContent,
     });
-    current = { id: raw.id, threadId: raw.threadId || thread.id };
-    lastEditedContent = visibleContent;
-    lastEditAtMs = nowMs();
     postedCount += 1;
   };
 
-  const editCurrent = async (content: string): Promise<void> => {
-    const visibleContent = suppressDiscordLinkEmbeds(content);
-    if (!current || visibleContent === lastEditedContent) return;
-    await thread.adapter.editMessage(current.threadId, current.id, {
-      raw: visibleContent,
-    });
-    lastEditedContent = visibleContent;
-  };
-
-  /** Freeze the in-progress message at `content` (or post it whole). */
-  const finalizeMessage = async (content: string): Promise<void> => {
-    if (current) {
-      await editCurrent(content);
-      current = null;
-      lastEditedContent = "";
-    } else if (content.trim()) {
-      await postNew(content);
-      current = null;
-      lastEditedContent = "";
-    }
-  };
-
   const overflowed = (): boolean => postedCount >= ANSWER_MAX_FULL_MESSAGES;
-  const pendingView = (): string =>
+  while (!overflowed()) {
+    const split = takeDiscordMessageChunk(pending, ANSWER_MESSAGE_MAX_CHARS);
+    if (!split) break;
+    await postNew(split.chunk);
+    pending = split.rest;
+  }
+  if (!pending.trim()) return;
+  await postNew(
     overflowed()
       ? truncateDiscordText(
           pending,
           ANSWER_MESSAGE_MAX_CHARS,
           "Discord final answer",
         )
-      : pending;
-
-  for await (const piece of source) {
-    pending += piece;
-    while (!overflowed()) {
-      const split = takeDiscordMessageChunk(pending, ANSWER_MESSAGE_MAX_CHARS);
-      if (!split) break;
-      await finalizeMessage(split.chunk);
-      pending = split.rest;
-    }
-    const view = pendingView();
-    if (!view.trim()) continue;
-    if (!current) {
-      await postNew(view);
-    } else if (nowMs() - lastEditAtMs >= editIntervalMs) {
-      lastEditAtMs = nowMs();
-      try {
-        await editCurrent(view);
-      } catch (error) {
-        // In-progress edits are cosmetic; the final flush retries the content.
-        logger.warn("discordbot_answer_edit_failed", {
-          error: errorMessage(error),
-        });
-      }
-    }
-  }
-
-  // Final flush. A failure here must not fail an otherwise-successful run.
-  try {
-    while (!overflowed()) {
-      const split = takeDiscordMessageChunk(pending, ANSWER_MESSAGE_MAX_CHARS);
-      if (!split) break;
-      await finalizeMessage(split.chunk);
-      pending = split.rest;
-    }
-    const view = pendingView();
-    if (view.trim()) await finalizeMessage(view);
-  } catch (error) {
-    logger.warn("discordbot_answer_finalize_failed", {
-      error: errorMessage(error),
-      pending_chars: pending.length,
-    });
-    try {
-      await thread.adapter.postMessage(thread.id, {
-        raw: "-# ⚠️ The end of this answer failed to post; the output above may be incomplete.",
-      });
-    } catch {
-      // Best-effort only — the run itself succeeded.
-    }
-  }
+      : pending,
+  );
 }
 
 async function renderRecoveredExecutionStream(

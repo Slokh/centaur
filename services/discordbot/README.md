@@ -15,10 +15,9 @@ the Rust `api-rs` control plane is unchanged (`discord:…` thread keys flow thr
 - **Configurable progress**: a run instantly reacts 👀 on the triggering message. `narration` posts
   concise activity blurbs; `reactions` posts no public status or reasoning. In narration mode the
   agent's reasoning blurbs as their own *italic* messages as each thought completes (commands/tools
-  are not rendered — they just end a thought). The **answer** streams into a separate message
-  created when the first answer text arrives, so it lands at the bottom of the thread even when
-  users chime in mid-run. On settle the 👀 flips to ✅ (or ❌); no bot message is ever edited or
-  deleted.
+  are not rendered — they just end a thought). The **answer** is buffered and posted as a separate
+  message only when complete, so Discord never shows a partially edited response. On settle the 👀
+  flips to ✅ (or ❌); no bot message is ever edited or deleted.
 
 ## Ingress model
 
@@ -47,7 +46,6 @@ ingress** — only a `GET /health` endpoint that reflects the Gateway connection
 | `DISCORDBOT_TRIGGER_BOT_ALLOWLIST` | – | Comma/space-separated bot/webhook author IDs whose messages may enter sessions (e.g. a Sentry webhook). Empty (default) ⇒ all bot messages are ignored. Use the ID the message is authored as: the bot's user id, or the webhook id for webhook integrations. |
 | `DISCORDBOT_MAX_CONCURRENT_EXECUTIONS_PER_GUILD` | – | In-flight execution cap per guild (default 3). Over the cap, the triggering message gets a 🚦 reaction and is kept as context only. |
 | `DISCORDBOT_ACTIVE_EXECUTION_TTL_MS` | – | Staleness TTL for the per-thread active-execution flag (default 30 min) — unwedges threads after a crash mid-handoff. |
-| `DISCORDBOT_ANSWER_EDIT_INTERVAL_MS` | – | Edit cadence for the streamed answer message (default 1500 ms, clamped to ≥1500 to respect Discord rate limits). |
 | `DISCORD_MENTION_ROLE_IDS` | – | Role mentions that also trigger the bot. |
 | `DISCORDBOT_NAME_THREADS` | – | Set `false` to keep the adapter's generic thread names. |
 | `DISCORDBOT_CONVERSATION_MODE` | – | `thread` (default) or `inline_reply` for channel reply chains. |
@@ -82,7 +80,7 @@ DM has no guild, so the fail-closed allowlist check rejects it.
 
 A throwaway spike confirmed the three things the static build couldn't prove: discord.js's Gateway
 runs under Bun, a Gateway `MESSAGE_CREATE` dispatches in-process to `chat.onNewMention`, and a
-channel mention auto-creates a thread that the bot streams into. An `@`-mention produced a threaded
+channel mention auto-creates a thread that the bot answers in. An `@`-mention produced a threaded
 reply end-to-end. The spike has served its purpose and been removed.
 
 ## Develop / test

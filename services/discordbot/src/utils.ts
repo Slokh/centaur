@@ -155,7 +155,7 @@ function trimUrlPunctuation(candidate: string): { url: string; suffix: string } 
 
 // Discord delta (no slackbotv2 analog): Slack accepts ~40k-char messages, but
 // Discord caps content at 2000 chars and the chat adapter silently truncates
-// with "...". The answer streamer splits long answers across multiple
+// with "...". Buffered answer delivery splits long answers across multiple
 // messages with these helpers instead.
 
 export type DiscordChunkSplit = {
@@ -307,43 +307,5 @@ export class GuildExecutionLimiter {
 
   inFlight(guildId: string): number {
     return this.counts.get(guildId) ?? 0;
-  }
-}
-
-/**
- * Single-consumer async queue bridging a producer loop to an AsyncIterable
- * consumer (e.g. the chat SDK's streaming post). push() never blocks; end()
- * lets the consumer drain the remaining items and finish.
- */
-export class AsyncTextQueue implements AsyncIterable<string> {
-  private readonly values: string[] = [];
-  private done = false;
-  private wake: (() => void) | null = null;
-
-  push(value: string): void {
-    this.values.push(value);
-    this.wake?.();
-  }
-
-  end(): void {
-    this.done = true;
-    this.wake?.();
-  }
-
-  async *[Symbol.asyncIterator](): AsyncIterator<string> {
-    while (true) {
-      const value = this.values.shift();
-      if (value !== undefined) {
-        yield value;
-        continue;
-      }
-      if (this.done) return;
-      await new Promise<void>((resolve) => {
-        this.wake = () => {
-          this.wake = null;
-          resolve();
-        };
-      });
-    }
   }
 }

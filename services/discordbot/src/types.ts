@@ -123,8 +123,6 @@ export type DiscordbotOptions = {
    * wedge the thread forever — Gateway ingress has no redelivery to kick it).
    */
   activeExecutionTtlMs?: number;
-  /** Discord delta: edit cadence for the in-progress answer message. */
-  answerEditIntervalMs?: number;
   apiKey?: string;
   apiUrl: string;
   /** Private application Discord ingestion endpoint; requires the token too. */
