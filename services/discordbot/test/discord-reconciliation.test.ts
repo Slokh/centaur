@@ -278,6 +278,68 @@ describe("Discord archive reconciliation", () => {
     expect(await reconcileDiscordArchive(options, state)).toBe(1);
     expect(latestPageRequests).toBe(2);
   });
+
+  it("skips inaccessible channels without interrupting other channel backfills", async () => {
+    const state = createMemoryState();
+    await state.connect();
+    const delivered: Record<string, unknown>[] = [];
+    const warnings: Array<{ message: string; data?: unknown }> = [];
+    const logger = {
+      debug: () => undefined,
+      info: () => undefined,
+      warn: (message: string, data?: unknown) => {
+        warnings.push({ message, data });
+      },
+      error: () => undefined,
+      child: () => logger,
+    };
+    const options = {
+      apiUrl: "http://centaur",
+      applicationId: "app",
+      botToken: "bot",
+      publicKey: "key",
+      discordApiUrl: "http://discord",
+      guildAllowlist: ["1"],
+      applicationIngestionUrl: "http://application.local/v1/discord/events",
+      applicationIngestionToken: "secret",
+      logger,
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        if (request.url.startsWith("http://application.local")) {
+          recordDelivery(delivered, await request.json());
+          return new Response("{}", { status: 200 });
+        }
+        if (request.url.endsWith("/guilds/1/channels")) {
+          return Response.json([
+            { id: "10", type: 0, name: "private" },
+            { id: "11", type: 0, name: "general" },
+          ]);
+        }
+        if (request.url.endsWith("/guilds/1/threads/active")) {
+          return Response.json({ threads: [] });
+        }
+        if (request.url.includes("/threads/archived/public")) {
+          return Response.json({ threads: [], has_more: false });
+        }
+        if (request.url.includes("/channels/10/messages")) {
+          return new Response("missing access", { status: 403 });
+        }
+        if (request.url.includes("/channels/11/messages") && !request.url.includes("after=")) {
+          return Response.json([{ ...message("21"), channel_id: "11" }]);
+        }
+        return Response.json([]);
+      },
+    } satisfies DiscordbotOptions;
+
+    expect(await reconcileDiscordArchive(options, state)).toBe(1);
+    expect(delivered).toContainEqual(
+      expect.objectContaining({ type: "message_upsert", message_id: "21" }),
+    );
+    expect(warnings).toContainEqual(expect.objectContaining({
+      message: "discordbot_archive_channel_skipped",
+      data: { channel_id: "10", status: 403 },
+    }));
+  });
 });
 
 function message(id: string) {
