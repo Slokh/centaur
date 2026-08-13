@@ -61,6 +61,8 @@ jobs:
     outputs:
       services: ${{ steps.services.outputs.services }}
       platforms: ${{ steps.services.outputs.platforms }}
+      builds: ${{ steps.services.outputs.builds }}
+      images: ${{ steps.services.outputs.images }}
     steps:
       - name: Checkout for change detection
         if: github.event_name != 'workflow_dispatch'
@@ -162,8 +164,23 @@ jobs:
           else
             platforms='["linux/amd64"]'
           fi
+          definitions='[
+            {"service":"api-rs","image":"centaur-api-rs","context":".","dockerfile":"services/api-rs/Dockerfile","target":""},
+            {"service":"slackbotv2","image":"centaur-slackbotv2","context":".","dockerfile":"services/slackbotv2/Dockerfile","target":""},
+            {"service":"linearbot","image":"centaur-linearbot","context":".","dockerfile":"services/linearbot/Dockerfile","target":""},
+            {"service":"discordbot","image":"centaur-discordbot","context":".","dockerfile":"services/discordbot/Dockerfile","target":""},
+            {"service":"githubbot","image":"centaur-githubbot","context":".","dockerfile":"services/githubbot/Dockerfile","target":""},
+            {"service":"teamsbot","image":"centaur-teamsbot","context":".","dockerfile":"services/teamsbot/Dockerfile","target":""},
+            {"service":"agent","image":"centaur-agent","context":".","dockerfile":"services/sandbox/Dockerfile","target":"sandbox"},
+            {"service":"iron-proxy","image":"centaur-iron-proxy","context":".","dockerfile":"services/iron-proxy/Dockerfile","target":""},
+            {"service":"console","image":"centaur-console","context":"services/console","dockerfile":"services/console/Dockerfile","target":""}
+          ]'
+          images="$(jq -cn --argjson services "$services" --argjson definitions "$definitions" '[ $services[] as $service | $definitions[] | select(.service == $service) ]')"
+          builds="$(jq -cn --argjson images "$images" --argjson platforms "$platforms" '[ $images[] as $image | $platforms[] as $platform | $image + {platform: $platform} ]')"
           echo "services=$services" >> "$GITHUB_OUTPUT"
           echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "builds=$builds" >> "$GITHUB_OUTPUT"
 
   # Build each image with Depot's hosted builders, push by digest, and hand
   # the digests to the merge job below which assembles the multi-arch manifest.
@@ -176,54 +193,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: ${{ fromJSON(needs.select.outputs.services) }}
-        platform: ${{ fromJSON(needs.select.outputs.platforms) }}
-        include:
-          - service: api-rs
-            image: centaur-api-rs
-            context: .
-            dockerfile: services/api-rs/Dockerfile
-            target: ""
-          - service: slackbotv2
-            image: centaur-slackbotv2
-            context: .
-            dockerfile: services/slackbotv2/Dockerfile
-            target: ""
-          - service: linearbot
-            image: centaur-linearbot
-            context: .
-            dockerfile: services/linearbot/Dockerfile
-            target: ""
-          - service: discordbot
-            image: centaur-discordbot
-            context: .
-            dockerfile: services/discordbot/Dockerfile
-            target: ""
-          - service: githubbot
-            image: centaur-githubbot
-            context: .
-            dockerfile: services/githubbot/Dockerfile
-            target: ""
-          - service: teamsbot
-            image: centaur-teamsbot
-            context: .
-            dockerfile: services/teamsbot/Dockerfile
-            target: ""
-          - service: agent
-            image: centaur-agent
-            context: .
-            dockerfile: services/sandbox/Dockerfile
-            target: sandbox
-          - service: iron-proxy
-            image: centaur-iron-proxy
-            context: .
-            dockerfile: services/iron-proxy/Dockerfile
-            target: ""
-          - service: console
-            image: centaur-console
-            context: services/console
-            dockerfile: services/console/Dockerfile
-            target: ""
+        include: ${{ fromJSON(needs.select.outputs.builds) }}
 
     steps:
       - name: Checkout
@@ -319,26 +289,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        service: ${{ fromJSON(needs.select.outputs.services) }}
-        include:
-          - service: api-rs
-            image: centaur-api-rs
-          - service: slackbotv2
-            image: centaur-slackbotv2
-          - service: linearbot
-            image: centaur-linearbot
-          - service: agent
-            image: centaur-agent
-          - service: iron-proxy
-            image: centaur-iron-proxy
-          - service: console
-            image: centaur-console
-          - service: discordbot
-            image: centaur-discordbot
-          - service: githubbot
-            image: centaur-githubbot
-          - service: teamsbot
-            image: centaur-teamsbot
+        include: ${{ fromJSON(needs.select.outputs.images) }}
 
     steps:
       - name: Download digests
