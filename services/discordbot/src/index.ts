@@ -198,7 +198,6 @@ async function resolveVisibleChannelScope(
       currentChannelId: channelId,
       ...(threadId ? { currentThreadId: threadId } : {}),
       guildId,
-      rawMessage: message.raw,
       userId: message.author.userId,
     });
   } catch (error) {

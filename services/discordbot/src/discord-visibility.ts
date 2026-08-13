@@ -5,6 +5,7 @@ const ADMINISTRATOR = 1n << 3n;
 const MESSAGE_CHANNEL_TYPES = new Set([0, 5, 15, 16]);
 
 type DiscordRole = { id: string; permissions?: string };
+type DiscordMember = { roles?: string[] };
 type DiscordOverwrite = {
   id: string;
   type: number;
@@ -29,30 +30,37 @@ export async function resolveDiscordVisibleChannelIds(input: {
   currentChannelId: string;
   currentThreadId?: string;
   guildId: string;
-  rawMessage: unknown;
   userId: string;
   fetch?: typeof fetch;
 }): Promise<string[]> {
-  const memberRoleIds = discordMemberRoleIds(input.rawMessage);
   const apiBase = (input.apiUrl ?? DEFAULT_DISCORD_API_URL).replace(/\/$/, "");
   const fetchFn = input.fetch ?? fetch;
   const headers = { authorization: `Bot ${input.botToken}` };
-  const [rolesResponse, channelsResponse] = await Promise.all([
+  const [memberResponse, rolesResponse, channelsResponse] = await Promise.all([
+    fetchFn(`${apiBase}/guilds/${input.guildId}/members/${input.userId}`, {
+      headers,
+    }),
     fetchFn(`${apiBase}/guilds/${input.guildId}/roles`, { headers }),
     fetchFn(`${apiBase}/guilds/${input.guildId}/channels`, { headers }),
   ]);
-  if (!rolesResponse.ok || !channelsResponse.ok) {
+  if (!memberResponse.ok || !rolesResponse.ok || !channelsResponse.ok) {
     throw new Error(
-      `Discord visibility lookup failed (roles=${rolesResponse.status}, channels=${channelsResponse.status})`,
+      `Discord visibility lookup failed (member=${memberResponse.status}, roles=${rolesResponse.status}, channels=${channelsResponse.status})`,
     );
   }
+  const member = (await memberResponse.json()) as DiscordMember;
   const roles = (await rolesResponse.json()) as DiscordRole[];
   const channels = (await channelsResponse.json()) as DiscordChannel[];
-  if (!Array.isArray(roles) || !Array.isArray(channels)) {
+  if (
+    !Array.isArray(member.roles) ||
+    member.roles.some((role) => typeof role !== "string") ||
+    !Array.isArray(roles) ||
+    !Array.isArray(channels)
+  ) {
     throw new Error("Discord visibility lookup returned invalid payloads");
   }
 
-  const effectiveRoleIds = new Set([input.guildId, ...memberRoleIds]);
+  const effectiveRoleIds = new Set([input.guildId, ...member.roles]);
   let basePermissions = 0n;
   for (const role of roles) {
     if (effectiveRoleIds.has(role.id)) {
@@ -138,19 +146,4 @@ function permissionBits(value: string | undefined): bigint {
   } catch {
     throw new Error("Discord permission value is not an integer");
   }
-}
-
-function discordMemberRoleIds(rawMessage: unknown): string[] {
-  if (!rawMessage || typeof rawMessage !== "object") {
-    throw new Error("Discord message is missing member roles");
-  }
-  const member = (rawMessage as { member?: unknown }).member;
-  if (!member || typeof member !== "object") {
-    throw new Error("Discord message is missing member roles");
-  }
-  const roles = (member as { roles?: unknown }).roles;
-  if (!Array.isArray(roles) || roles.some((role) => typeof role !== "string")) {
-    throw new Error("Discord message member roles are invalid");
-  }
-  return roles;
 }
