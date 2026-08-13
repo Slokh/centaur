@@ -84,6 +84,8 @@ spec:
               value: {{ .Values.discordbot.applicationIngestion.archiveReconciliation.enabled | quote }}
             - name: DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_INTERVAL_SECONDS
               value: {{ .Values.discordbot.applicationIngestion.archiveReconciliation.intervalSeconds | quote }}
+            - name: DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_CONCURRENCY
+              value: {{ .Values.discordbot.applicationIngestion.archiveReconciliation.concurrency | quote }}
 {{- end }}
 {{- if .Values.discordbot.mentionRoleIds }}
             - name: DISCORD_MENTION_ROLE_IDS

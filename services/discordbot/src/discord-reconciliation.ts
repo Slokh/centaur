@@ -1,7 +1,7 @@
 import type { StateAdapter } from "chat";
 import {
   ingestObservedDiscordChannel,
-  ingestObservedDiscordMessage,
+  ingestObservedDiscordMessages,
   type ObservedDiscordMessage,
 } from "./discord-ingestion";
 import type { DiscordbotOptions } from "./types";
@@ -36,6 +36,7 @@ const BACKFILL_COMPLETE = "complete";
 const ARCHIVED_THREAD_CURSOR_PREFIX = "discordbot:application-ingestion:archived-thread-cursor:";
 const ARCHIVED_THREAD_SEEN_PREFIX = "discordbot:application-ingestion:archived-thread-seen:";
 const PAGE_LIMIT = 10;
+const DEFAULT_CHANNEL_CONCURRENCY = 4;
 const MESSAGE_CHANNEL_TYPES = new Set([0, 5, 10, 11, 12]);
 const THREAD_PARENT_CHANNEL_TYPES = new Set([0, 5, 15, 16]);
 
@@ -63,9 +64,23 @@ export async function reconcileDiscordArchive(
         parentId: channel.parent_id ?? undefined,
         deleted: false,
       }, state);
-      if (!MESSAGE_CHANNEL_TYPES.has(channel.type)) continue;
-      observed += await reconcileChannel(options, state, guildId, channel);
     }
+    const messageChannels = channels.filter((channel) =>
+      MESSAGE_CHANNEL_TYPES.has(channel.type)
+    );
+    const counts = await mapConcurrent(
+      messageChannels,
+      Math.min(
+        16,
+        Math.max(
+          1,
+          options.applicationArchiveReconciliationConcurrency ??
+            DEFAULT_CHANNEL_CONCURRENCY,
+        ),
+      ),
+      (channel) => reconcileChannel(options, state, guildId, channel),
+    );
+    observed += counts.reduce((total, count) => total + count, 0);
     observed += await reconcileArchivedPublicThreads(
       options,
       state,
@@ -185,14 +200,12 @@ async function reconcileChannel(
       return 0;
     }
     messages.sort((left, right) => compareSnowflakes(left.id, right.id));
-    for (const message of messages) {
-      await ingestObservedDiscordMessage(
-        options,
-        normalizeMessage(guildId, channel, message),
-        state,
-      );
-      observed += 1;
-    }
+    await ingestObservedDiscordMessages(
+      options,
+      messages.map((message) => normalizeMessage(guildId, channel, message)),
+      state,
+    );
+    observed += messages.length;
     after = messages.at(-1)!.id;
     await state.set(checkpointKey, after);
     await state.set(
@@ -207,16 +220,14 @@ async function reconcileChannel(
     const messages = await getMessages(options, channel.id, params);
     if (messages.length === 0) break;
     messages.sort((left, right) => compareSnowflakes(left.id, right.id));
-    for (const message of messages) {
-      await ingestObservedDiscordMessage(
-        options,
-        normalizeMessage(guildId, channel, message),
-        state,
-      );
-      after = message.id;
-      await state.set(checkpointKey, after);
-      observed += 1;
-    }
+    await ingestObservedDiscordMessages(
+      options,
+      messages.map((message) => normalizeMessage(guildId, channel, message)),
+      state,
+    );
+    after = messages.at(-1)!.id;
+    await state.set(checkpointKey, after);
+    observed += messages.length;
     if (messages.length < 100) break;
   }
 
@@ -234,14 +245,12 @@ async function reconcileChannel(
       break;
     }
     messages.sort((left, right) => compareSnowflakes(left.id, right.id));
-    for (const message of messages) {
-      await ingestObservedDiscordMessage(
-        options,
-        normalizeMessage(guildId, channel, message),
-        state,
-      );
-      observed += 1;
-    }
+    await ingestObservedDiscordMessages(
+      options,
+      messages.map((message) => normalizeMessage(guildId, channel, message)),
+      state,
+    );
+    observed += messages.length;
     before = messages.length < 100 ? BACKFILL_COMPLETE : messages[0]!.id;
     await state.set(backfillKey, before);
   }
@@ -293,11 +302,44 @@ function normalizeMessage(
 
 async function discordGet<T>(options: DiscordbotOptions, path: string): Promise<T> {
   const fetchFn = options.fetch ?? fetch;
-  const response = await fetchFn(`${options.discordApiUrl ?? "https://discord.com/api/v10"}${path}`, {
-    headers: { authorization: `Bot ${options.botToken}` },
-  });
-  if (!response.ok) throw new Error(`Discord reconciliation returned ${response.status} for ${path}`);
-  return response.json() as Promise<T>;
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const response = await fetchFn(`${options.discordApiUrl ?? "https://discord.com/api/v10"}${path}`, {
+      headers: { authorization: `Bot ${options.botToken}` },
+    });
+    if (response.ok) return response.json() as Promise<T>;
+    if (response.status !== 429 || attempt === 4) {
+      throw new Error(`Discord reconciliation returned ${response.status} for ${path}`);
+    }
+    const payload = await response.clone().json().catch(() => ({})) as {
+      retry_after?: unknown;
+    };
+    const retrySeconds = typeof payload.retry_after === "number"
+      ? payload.retry_after
+      : 1;
+    await Bun.sleep(Math.max(25, Math.ceil(retrySeconds * 1_000)));
+  }
+  throw new Error(`Discord reconciliation exhausted retries for ${path}`);
+}
+
+async function mapConcurrent<T, R>(
+  values: readonly T[],
+  concurrency: number,
+  work: (value: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(values.length);
+  let next = 0;
+  const workers = Array.from(
+    { length: Math.min(concurrency, values.length) },
+    async () => {
+      while (next < values.length) {
+        const index = next;
+        next += 1;
+        results[index] = await work(values[index]!);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return results;
 }
 
 function compareSnowflakes(left: string, right: string): number {

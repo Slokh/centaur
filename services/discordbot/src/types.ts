@@ -131,6 +131,7 @@ export type DiscordbotOptions = {
   /** Periodically reconcile Discord REST history into application ingestion. */
   applicationArchiveReconciliationEnabled?: boolean;
   applicationArchiveReconciliationIntervalMs?: number;
+  applicationArchiveReconciliationConcurrency?: number;
   applicationId: string;
   botToken: string;
   /** Layout for new channel mentions. Existing Discord threads remain threads. */

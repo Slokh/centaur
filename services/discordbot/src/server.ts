@@ -46,6 +46,9 @@ const options: DiscordbotOptions = {
     optionalSecondsEnv(
       "DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_INTERVAL_SECONDS",
     ),
+  applicationArchiveReconciliationConcurrency: optionalNumberEnv(
+    "DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_CONCURRENCY",
+  ),
   applicationId,
   botToken,
   conversationMode:

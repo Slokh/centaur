@@ -21,7 +21,7 @@ describe("Discord archive reconciliation", () => {
       fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
         const request = new Request(input, init);
         if (request.url.startsWith("http://application.local")) {
-          delivered.push(await request.json());
+          recordDelivery(delivered, await request.json());
           return new Response("{}", { status: 200 });
         }
         discordRequests.push(request.url);
@@ -80,7 +80,7 @@ describe("Discord archive reconciliation", () => {
       fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
         const request = new Request(input, init);
         if (request.url.startsWith("http://application.local")) {
-          delivered.push(await request.json());
+          recordDelivery(delivered, await request.json());
           return new Response("{}", { status: 200 });
         }
         discordRequests.push(request.url);
@@ -124,7 +124,7 @@ describe("Discord archive reconciliation", () => {
       fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
         const request = new Request(input, init);
         if (request.url.startsWith("http://application.local")) {
-          delivered.push(await request.json());
+          recordDelivery(delivered, await request.json());
           return new Response("{}", { status: 200 });
         }
         if (request.url.endsWith("/guilds/1/channels")) {
@@ -186,7 +186,7 @@ describe("Discord archive reconciliation", () => {
       fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
         const request = new Request(input, init);
         if (request.url.startsWith("http://application.local")) {
-          delivered.push(await request.json());
+          recordDelivery(delivered, await request.json());
           return new Response("{}", { status: 200 });
         }
         if (request.url.endsWith("/guilds/1/channels")) {
@@ -229,6 +229,55 @@ describe("Discord archive reconciliation", () => {
       expect.objectContaining({ type: "message_upsert", message_id: "60" }),
     );
   });
+
+  it("does not advance a channel checkpoint past failed batch delivery", async () => {
+    const state = createMemoryState();
+    await state.connect();
+    let failBatch = true;
+    let latestPageRequests = 0;
+    const options = {
+      apiUrl: "http://centaur",
+      applicationId: "app",
+      botToken: "bot",
+      publicKey: "key",
+      discordApiUrl: "http://discord",
+      guildAllowlist: ["1"],
+      applicationIngestionUrl: "http://application.local/v1/discord/events",
+      applicationIngestionToken: "secret",
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        if (request.url.startsWith("http://application.local")) {
+          const payload = await request.json() as { events?: unknown[] };
+          if (payload.events && failBatch) {
+            failBatch = false;
+            return new Response("temporary failure", { status: 503 });
+          }
+          return new Response("{}", { status: 200 });
+        }
+        if (request.url.endsWith("/guilds/1/channels")) {
+          return Response.json([{ id: "10", type: 0, name: "general" }]);
+        }
+        if (request.url.endsWith("/guilds/1/threads/active")) {
+          return Response.json({ threads: [] });
+        }
+        if (request.url.includes("/channels/10/threads/archived/public")) {
+          return Response.json({ threads: [], has_more: false });
+        }
+        if (request.url.includes("/channels/10/messages")) {
+          if (request.url.includes("after=")) return Response.json([]);
+          latestPageRequests += 1;
+          return Response.json([message("20")]);
+        }
+        return Response.json([]);
+      },
+    } satisfies DiscordbotOptions;
+
+    await expect(reconcileDiscordArchive(options, state)).rejects.toThrow(
+      "application ingestion returned 503",
+    );
+    expect(await reconcileDiscordArchive(options, state)).toBe(1);
+    expect(latestPageRequests).toBe(2);
+  });
 });
 
 function message(id: string) {
@@ -240,4 +289,16 @@ function message(id: string) {
     author: { id: "30", username: "member" },
     attachments: [],
   };
+}
+
+function recordDelivery(
+  delivered: Record<string, unknown>[],
+  payload: unknown,
+): void {
+  const candidate = payload as { events?: Record<string, unknown>[] };
+  if (Array.isArray(candidate.events)) {
+    delivered.push(...candidate.events);
+  } else {
+    delivered.push(payload as Record<string, unknown>);
+  }
 }

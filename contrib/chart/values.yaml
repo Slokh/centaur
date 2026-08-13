@@ -679,6 +679,7 @@ discordbot:
     archiveReconciliation:
       enabled: true
       intervalSeconds: 60
+      concurrency: 4
   extraEnv: {}
   resources: {}
 
