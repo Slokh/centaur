@@ -71,6 +71,10 @@ pub struct AgentSandboxConfig {
     pub tolerations: Vec<Toleration>,
     /// RuntimeClass for sandbox and iron-proxy pods (e.g. `gvisor`).
     pub runtime_class_name: Option<String>,
+    /// PriorityClass shared by sandbox and iron-proxy pods. Operators can set
+    /// this below control-plane workloads so core services preempt disposable
+    /// execution capacity during node loss or saturation.
+    pub priority_class_name: Option<String>,
     pub state_volume: Option<StateVolumeConfig>,
     pub iron_proxy: Option<IronProxyConfig>,
     pub iron_control: IronControlSettings,
@@ -127,6 +131,7 @@ impl AgentSandboxConfig {
             node_selector: BTreeMap::new(),
             tolerations: Vec::new(),
             runtime_class_name: None,
+            priority_class_name: None,
             state_volume: None,
             iron_proxy: None,
             iron_control,
@@ -840,6 +845,15 @@ fn build_agent_sandbox(
             .map(str::trim)
             .filter(|name| !name.is_empty()),
     );
+    insert_optional(
+        &mut pod_spec,
+        "priorityClassName",
+        config
+            .priority_class_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty()),
+    );
 
     let mut agent_spec = json!({
         "replicas": 1,
@@ -1123,6 +1137,7 @@ mod tests {
             ..Default::default()
         }];
         config.runtime_class_name = Some("gvisor".to_owned());
+        config.priority_class_name = Some("sandbox-low".to_owned());
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
         let pod_spec = &sandbox.spec.pod_template.spec;
@@ -1143,6 +1158,7 @@ mod tests {
         assert_eq!(tolerations[0].key.as_deref(), Some("example.com/sandbox"));
         assert_eq!(tolerations[0].effect.as_deref(), Some("NoSchedule"));
         assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("gvisor"));
+        assert_eq!(pod_spec.priority_class_name.as_deref(), Some("sandbox-low"));
     }
 
     #[test]
@@ -1154,6 +1170,7 @@ mod tests {
         let pod_spec = &sandbox.spec.pod_template.spec;
 
         assert!(pod_spec.node_selector.is_none());
+        assert!(pod_spec.priority_class_name.is_none());
         assert!(pod_spec.tolerations.is_none());
         assert!(pod_spec.runtime_class_name.is_none());
     }

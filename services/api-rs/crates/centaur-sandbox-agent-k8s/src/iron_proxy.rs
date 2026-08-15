@@ -388,7 +388,10 @@ impl AgentSandboxBackend {
                     &sync,
                     &self.config.node_selector,
                     &self.config.tolerations,
-                    self.config.runtime_class_name.as_deref(),
+                    PodClassNames {
+                        runtime: self.config.runtime_class_name.as_deref(),
+                        priority: self.config.priority_class_name.as_deref(),
+                    },
                 ),
             )
             .await
@@ -1219,6 +1222,12 @@ pub(crate) fn sandbox_ca_volume_json(iron_proxy: &IronProxyConfig) -> Value {
     })
 }
 
+#[derive(Default)]
+struct PodClassNames<'a> {
+    runtime: Option<&'a str>,
+    priority: Option<&'a str>,
+}
+
 fn build_iron_proxy_pod(
     id: &SandboxId,
     iron_proxy: &IronProxyConfig,
@@ -1226,7 +1235,7 @@ fn build_iron_proxy_pod(
     sync: &ProxySyncEnv,
     node_selector: &BTreeMap<String, String>,
     tolerations: &[k8s_openapi::api::core::v1::Toleration],
-    runtime_class_name: Option<&str>,
+    class_names: PodClassNames<'_>,
 ) -> Pod {
     let annotations = BTreeMap::from([
         (
@@ -1238,7 +1247,13 @@ fn build_iron_proxy_pod(
             resolved.principal_id.clone(),
         ),
     ]);
-    let runtime_class = runtime_class_name
+    let runtime_class = class_names
+        .runtime
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    let priority_class = class_names
+        .priority
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_owned);
@@ -1263,6 +1278,7 @@ fn build_iron_proxy_pod(
             node_selector: (!node_selector.is_empty()).then(|| node_selector.clone()),
             tolerations: (!tolerations.is_empty()).then(|| tolerations.to_vec()),
             runtime_class_name: runtime_class,
+            priority_class_name: priority_class,
             ..Default::default()
         }),
         ..Default::default()
@@ -2292,7 +2308,7 @@ mod tests {
             &sync,
             &BTreeMap::new(),
             &[],
-            None,
+            PodClassNames::default(),
         );
 
         let resources = pod.spec.as_ref().unwrap().containers[0]
@@ -2333,7 +2349,7 @@ mod tests {
             &sync,
             &BTreeMap::new(),
             &[],
-            None,
+            PodClassNames::default(),
         );
 
         assert!(pod.spec.as_ref().unwrap().containers[0].resources.is_none());
@@ -2358,7 +2374,7 @@ mod tests {
             &sync,
             &BTreeMap::new(),
             &[],
-            None,
+            PodClassNames::default(),
         );
         assert_eq!(
             pod.metadata
@@ -2483,7 +2499,7 @@ mod tests {
             &sync,
             &BTreeMap::new(),
             &[],
-            None,
+            PodClassNames::default(),
         );
         let pod_labels = pod.metadata.labels.as_ref().unwrap();
         assert!(!pod_labels.contains_key(OBSERVABILITY_ENABLED_LABEL));
@@ -2551,7 +2567,10 @@ mod tests {
             &sync,
             &node_selector,
             &tolerations,
-            Some("gvisor"),
+            PodClassNames {
+                runtime: Some("gvisor"),
+                priority: Some("sandbox-low"),
+            },
         );
         let pod_spec = pod.spec.unwrap();
         assert_eq!(
@@ -2564,6 +2583,7 @@ mod tests {
         );
         assert_eq!(pod_spec.tolerations.as_ref().unwrap().len(), 1);
         assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("gvisor"));
+        assert_eq!(pod_spec.priority_class_name.as_deref(), Some("sandbox-low"));
     }
 
     #[test]
@@ -2584,12 +2604,13 @@ mod tests {
             &sync,
             &BTreeMap::new(),
             &[],
-            None,
+            PodClassNames::default(),
         );
         let pod_spec = pod.spec.unwrap();
         assert!(pod_spec.node_selector.is_none());
         assert!(pod_spec.tolerations.is_none());
         assert!(pod_spec.runtime_class_name.is_none());
+        assert!(pod_spec.priority_class_name.is_none());
     }
 
     #[test]
