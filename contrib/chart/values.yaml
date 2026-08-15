@@ -3,6 +3,10 @@ fullnameOverride: ""
 
 global:
   imagePullSecrets: []
+  # Optional PriorityClass for chart-managed control-plane workloads. Keep this
+  # above sandbox.priorityClassName so essential services can preempt disposable
+  # agent capacity when a node is lost or the cluster is saturated.
+  priorityClassName: ""
 
 secretManager:
   envPrefix: ""
@@ -268,6 +272,9 @@ overlays:
   #   skillsSubdir: ""
 
 sandbox:
+  # Optional lower-priority class applied to runtime-created sandbox and paired
+  # iron-proxy pods.
+  priorityClassName: ""
   controller: pod
   image:
     repository: centaur-agent
