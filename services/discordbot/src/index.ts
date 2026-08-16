@@ -1351,6 +1351,15 @@ async function renderExecutionStream(
   trace?: DiscordbotTrace,
 ): Promise<void> {
   const logger = options.logger ?? noopLogger;
+  const responseFooter = (): string | undefined =>
+    buildDiscordResponseFooter({
+      elapsedMs:
+        trace && options.responseLatencyEnabled === true
+          ? Math.max(0, nowMs() - trace.startedAtMs)
+          : undefined,
+      isFirstAssistantMessage: isInitialExecution,
+      options,
+    });
   if (
     isInitialExecution &&
     options.nameThreads !== false &&
@@ -1380,6 +1389,7 @@ async function renderExecutionStream(
         options,
         discordTurnDeliveryKey(thread.id, message.id),
         trace,
+        responseFooter,
       );
       await narrator.finish(sawError ? "failed" : "done");
     } catch (error) {
@@ -1406,6 +1416,7 @@ async function renderExecutionStream(
       options,
       narrator,
       discordTurnDeliveryKey(thread.id, message.id),
+      responseFooter,
     );
     await narrator.finish("done");
   } catch (error) {
@@ -1431,6 +1442,7 @@ async function renderSplitExecutionStreams(
   options: DiscordbotOptions,
   narrator: DiscordNarrator,
   deliveryThreadId: string,
+  responseFooter?: () => string | undefined,
 ): Promise<void> {
   let answerText = "";
   for await (const chunk of harnessToChatSdkStream(
@@ -1443,7 +1455,11 @@ async function renderSplitExecutionStreams(
     }
     narrator.update(chunk);
   }
-  await postBufferedAnswerToThread(thread, answerText, deliveryThreadId);
+  await postBufferedAnswerToThread(
+    thread,
+    appendDiscordResponseFooter(answerText, responseFooter?.()),
+    deliveryThreadId,
+  );
 }
 
 /**
@@ -1514,6 +1530,7 @@ async function renderPlainTextExecutionStream(
   options: DiscordbotOptions,
   deliveryThreadId: string,
   trace?: DiscordbotTrace,
+  responseFooter?: () => string | undefined,
 ): Promise<boolean> {
   const logger = options.logger ?? noopLogger;
   const fallback = new DiscordRenderFallback();
@@ -1535,8 +1552,11 @@ async function renderPlainTextExecutionStream(
     }
     const text = suppressDiscordLinkEmbeds(
       truncateDiscordText(
-        fallback.text() ||
-          "Execution completed, but no final text was captured.",
+        appendDiscordResponseFooter(
+          fallback.text() ||
+            "Execution completed, but no final text was captured.",
+          responseFooter?.(),
+        ),
         DISCORD_FALLBACK_TEXT_MAX_CHARS,
         "Discord final answer",
       ),
@@ -1549,6 +1569,65 @@ async function renderPlainTextExecutionStream(
     stopTyping();
   }
   return sawError;
+}
+
+export function buildDiscordResponseFooter(input: {
+  elapsedMs?: number;
+  isFirstAssistantMessage: boolean;
+  options: Pick<
+    DiscordbotOptions,
+    | "responseLatencyEnabled"
+    | "responseMetadataHarness"
+    | "responseMetadataMode"
+    | "responseMetadataModel"
+    | "responseMetadataReasoning"
+  >;
+}): string | undefined {
+  const mode = input.options.responseMetadataMode ?? "first";
+  if (
+    mode === "never" ||
+    (mode === "first" && !input.isFirstAssistantMessage)
+  ) {
+    return undefined;
+  }
+  const segments: string[] = [];
+  const model = input.options.responseMetadataModel?.trim();
+  if (model) segments.push(model.toUpperCase());
+  const harness = titleCaseDisplay(input.options.responseMetadataHarness);
+  if (harness) segments.push(harness);
+  const reasoning = titleCaseDisplay(input.options.responseMetadataReasoning);
+  if (reasoning) segments.push(reasoning);
+  if (
+    input.options.responseLatencyEnabled === true &&
+    input.elapsedMs !== undefined
+  ) {
+    segments.push(formatResponseLatency(input.elapsedMs));
+  }
+  return segments.length > 0 ? `-# ${segments.join(" · ")}` : undefined;
+}
+
+function appendDiscordResponseFooter(answer: string, footer?: string): string {
+  if (!footer) return answer;
+  return `${answer.trimEnd()}\n\n${footer}`;
+}
+
+function titleCaseDisplay(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  if (!normalized) return undefined;
+  const key = normalized.toLowerCase();
+  if (key === "codex") return "Codex";
+  if (key === "nanocodex") return "Nanocodex";
+  if (key === "claudecode") return "Claude Code";
+  return key
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+function formatResponseLatency(milliseconds: number): string {
+  if (milliseconds < 1_000) return `${Math.round(milliseconds)}ms`;
+  return `${(milliseconds / 1_000).toFixed(1)}s`;
 }
 
 class DiscordRenderFallback {

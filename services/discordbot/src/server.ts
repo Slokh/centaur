@@ -77,6 +77,14 @@ const options: DiscordbotOptions = {
     optionalEnv("DISCORDBOT_PROGRESS_MODE") === "reactions"
       ? "reactions"
       : "narration",
+  responseMetadataMode: responseMetadataModeEnv(
+    "DISCORDBOT_RESPONSE_METADATA_MODE",
+  ),
+  responseMetadataHarness: stringEnv("DISCORDBOT_DEFAULT_HARNESS", "codex"),
+  responseMetadataModel: optionalEnv("CODEX_MODEL"),
+  responseMetadataReasoning: optionalEnv("CODEX_MODEL_REASONING_EFFORT"),
+  responseLatencyEnabled:
+    optionalEnv("DISCORDBOT_RESPONSE_LATENCY_ENABLED") === "true",
   stateKeyPrefix: optionalEnv("DISCORDBOT_STATE_KEY_PREFIX"),
   triggerBotAllowlist: optionalList("DISCORDBOT_TRIGGER_BOT_ALLOWLIST"),
   userName: stringEnv("DISCORDBOT_USER_NAME", "centaur"),
@@ -147,6 +155,11 @@ function optionalNumberEnv(name: string): number | undefined {
 function optionalSecondsEnv(name: string): number | undefined {
   const seconds = optionalNumberEnv(name);
   return seconds === undefined ? undefined : seconds * 1_000;
+}
+
+function responseMetadataModeEnv(name: string): "first" | "always" | "never" {
+  const value = optionalEnv(name)?.toLowerCase();
+  return value === "always" || value === "never" ? value : "first";
 }
 
 function log(level: string, message: string, data?: unknown): void {

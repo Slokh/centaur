@@ -75,6 +75,17 @@ spec:
               value: {{ .Values.discordbot.conversationMode | quote }}
             - name: DISCORDBOT_PROGRESS_MODE
               value: {{ .Values.discordbot.progressMode | quote }}
+            - name: DISCORDBOT_RESPONSE_METADATA_MODE
+              value: {{ .Values.discordbot.responseMetadataMode | quote }}
+            - name: DISCORDBOT_RESPONSE_LATENCY_ENABLED
+              value: {{ .Values.discordbot.responseLatencyEnabled | quote }}
+{{- range $name := tuple "CODEX_MODEL" "CODEX_MODEL_REASONING_EFFORT" }}
+{{- if and (hasKey $.Values.sandbox.extraEnv $name) (not (hasKey $.Values.discordbot.extraEnv $name)) }}
+            # Mirror the harness default so Discord describes what sandboxes run.
+            - name: {{ $name }}
+              value: {{ index $.Values.sandbox.extraEnv $name | toString | quote }}
+{{- end }}
+{{- end }}
 {{- if .Values.discordbot.applicationIngestion.enabled }}
             - name: DISCORDBOT_APPLICATION_INGESTION_URL
               value: {{ required "discordbot.applicationIngestion.url is required" .Values.discordbot.applicationIngestion.url | quote }}

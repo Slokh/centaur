@@ -154,6 +154,13 @@ export type DiscordbotOptions = {
   /** Public progress surface. `reactions` never posts reasoning or statuses. */
   progressMode?: "narration" | "reactions";
   publicKey: string;
+  /** Append model/harness/reasoning metadata to first, every, or no response. */
+  responseMetadataMode?: "first" | "always" | "never";
+  responseMetadataHarness?: string;
+  responseMetadataModel?: string;
+  responseMetadataReasoning?: string;
+  /** Include end-to-end turn latency in a rendered response metadata footer. */
+  responseLatencyEnabled?: boolean;
   recoverRenderObligationsOnStart?: boolean;
   /** Initial exponential backoff for render recovery. Default 250ms. */
   renderRetryInitialDelayMs?: number;
