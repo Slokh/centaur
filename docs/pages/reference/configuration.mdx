@@ -19,6 +19,7 @@ Use these as the main extension points:
 | `console.sqlExporter.*` | SQL Exporter configuration and scrape metadata for Console database metrics. |
 | `slackbot.extraEnv` | Slackbot HTTP, Slack, feedback, and cross-org behavior. |
 | `sandbox.extraEnv` | Extra variables copied into every sandbox pod through `KUBERNETES_SANDBOX_EXTRA_ENV`. |
+| `sandbox.prewarmTools`, `sandbox.prewarmTimeoutSeconds` | Tool CLIs that must successfully materialize their environments before sandbox readiness, plus the per-tool timeout. |
 | `overlays.sources` | Ordered repo-cache-backed overlay repos for tools, workflows, and skills; subdirs default to `tools`, `workflows`, and `.agents/skills`. |
 | `overlay.systemPrompt` | Small inline prompt overlay escape hatch. |
 
@@ -239,6 +240,7 @@ Sandbox entrypoint and wrappers:
 | --- | --- | --- |
 | `CENTAUR_HARNESS_CONFIG_DIR`, `CENTAUR_HARNESS_ADAPTER` | Sandbox image or `sandbox.extraEnv`. | Harness config directory and optional adapter executable. |
 | `CENTAUR_SKILL_DIRS` | Chart-rendered from `overlays.sources[*].skillsSubdir` (default `.agents/skills`) through `SESSION_SANDBOX_EXTRA_ENV`. | Ordered skill directories copied into the agent workspace. |
+| `CENTAUR_TOOL_PREWARM`, `CENTAUR_TOOL_PREWARM_TIMEOUT_SECONDS` | `sandbox.prewarmTools`, `sandbox.prewarmTimeoutSeconds`. | Comma-separated tool CLIs invoked with `--help` after shim installation and before readiness. Missing, failed, or timed-out configured tools fail sandbox startup. |
 | `AGENT_REPO`, `AGENT_PERSONA` | Runtime assignment metadata. | Workspace repo clone and persona prompt. |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Sandbox entrypoint or `sandbox.extraEnv`. | Google ADC path; entrypoint creates a local stub when unset. |
 | `CODEX_API_KEY`, `CODEX_HOME`, `CODEX_CONTINUE_THREAD_ID` | `sandbox.extraEnv` or runtime resume. | Codex auth/config/resume behavior. |

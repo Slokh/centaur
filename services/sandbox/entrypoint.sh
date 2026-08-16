@@ -390,15 +390,12 @@ mkdir -p "$HOME_DIR/uploads"
 WORKSPACE_DIR="$WORKSPACE_DIR" install-tool-shims --refresh-skills \
     || echo "warning: failed to reload Centaur skills" >&2
 
-# Materialize the application tool's uv environment before this sandbox is
-# advertised as ready. Repo-cache-backed tools are mounted at runtime, so an
-# image-build warmup alone cannot cover the source path agents actually invoke.
-# Keep this conditional: application is an optional tool in generic Centaur
-# deployments, and a missing tool must not prevent a sandbox from starting.
-if command -v application >/dev/null 2>&1; then
-    application --help >/dev/null \
-        || echo "warning: failed to prewarm the application tool" >&2
-fi
+# Materialize configured tool environments before this sandbox is advertised
+# as ready. Repo-cache-backed tools are mounted at runtime, so an image-build
+# warmup cannot cover the source paths agents actually invoke. Configured tools
+# are a readiness contract: fail startup on a missing, broken, or timed-out tool
+# instead of silently serving the first member request through a cold install.
+prewarm-tools
 
 # ── Background: refresh repo-cache-backed tools/skills in running sandboxes ───
 case "${CENTAUR_TOOLS_AUTO_RELOAD:-true}" in
