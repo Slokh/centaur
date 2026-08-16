@@ -445,6 +445,12 @@ spec:
 {{- if not (hasKey .Values.sandbox.extraEnv "COMPANY_CONTEXT_EMBEDDINGS_MODEL") }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_MODEL" "value" $companyContextEmbeddingsModel) }}
 {{- end }}
+{{- if not (hasKey .Values.sandbox.extraEnv "CENTAUR_TOOL_PREWARM") }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_TOOL_PREWARM" "value" (join "," .Values.sandbox.prewarmTools)) }}
+{{- end }}
+{{- if not (hasKey .Values.sandbox.extraEnv "CENTAUR_TOOL_PREWARM_TIMEOUT_SECONDS") }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_TOOL_PREWARM_TIMEOUT_SECONDS" "value" (.Values.sandbox.prewarmTimeoutSeconds | toString)) }}
+{{- end }}
 {{- range $k, $v := .Values.sandbox.extraEnv }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" $k "value" ($v | toString)) }}
 {{- end }}
