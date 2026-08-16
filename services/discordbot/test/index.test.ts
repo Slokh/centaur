@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "bun:test";
 import type { Logger, Thread } from "chat";
 import {
+  buildDiscordResponseFooter,
   clearConversationNameCacheForTests,
   hasLiveActiveExecution,
   postBufferedAnswerToThread,
@@ -180,6 +181,49 @@ describe("postBufferedAnswerToThread", () => {
     await postBufferedAnswerToThread(thread, "complete answer");
     expect(messages).toEqual([{ id: "msg-1", content: "complete answer" }]);
     expect(editCalls()).toBe(0);
+  });
+});
+
+describe("buildDiscordResponseFooter", () => {
+  it("renders model, harness, reasoning, and end-to-end latency", () => {
+    expect(
+      buildDiscordResponseFooter({
+        elapsedMs: 5_349,
+        isFirstAssistantMessage: false,
+        options: {
+          responseLatencyEnabled: true,
+          responseMetadataHarness: "codex",
+          responseMetadataMode: "always",
+          responseMetadataModel: "openai/gpt-5.6-terra",
+          responseMetadataReasoning: "medium",
+        },
+      }),
+    ).toBe("-# OPENAI/GPT-5.6-TERRA · Codex · Medium · 5.3s");
+  });
+
+  it("honors first and never modes", () => {
+    const options = {
+      responseMetadataHarness: "codex",
+      responseMetadataMode: "first" as const,
+    };
+    expect(
+      buildDiscordResponseFooter({
+        isFirstAssistantMessage: true,
+        options,
+      }),
+    ).toBe("-# Codex");
+    expect(
+      buildDiscordResponseFooter({
+        isFirstAssistantMessage: false,
+        options,
+      }),
+    ).toBeUndefined();
+    expect(
+      buildDiscordResponseFooter({
+        isFirstAssistantMessage: true,
+        options: { ...options, responseMetadataMode: "never" },
+      }),
+    ).toBeUndefined();
   });
 });
 

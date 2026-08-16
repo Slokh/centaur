@@ -441,6 +441,20 @@
         }
       }
     },
+    "discordbot": {
+      "type": "object",
+      "properties": {
+        "responseMetadataMode": {
+          "type": "string",
+          "enum": ["first", "always", "never"]
+        },
+        "responseLatencyEnabled": { "type": "boolean" },
+        "extraEnv": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
     "postgres": {
       "type": "object",
       "properties": {

@@ -686,6 +686,11 @@ discordbot:
   conversationMode: thread
   # Set reactions to suppress public status/reasoning text.
   progressMode: narration
+  # Append model, harness, and reasoning to the first completed response,
+  # every response, or no responses. The footer is a Discord subtext line.
+  responseMetadataMode: first
+  # Add end-to-end turn latency to the same footer when it is rendered.
+  responseLatencyEnabled: false
   applicationIngestion:
     enabled: false
     url: ""
