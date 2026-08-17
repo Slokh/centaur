@@ -628,6 +628,10 @@ function toSessionMessage(
 
 function sessionMessageParts(message: DiscordbotApiMessage): JsonValue[] {
   const parts: JsonValue[] = [];
+  const requesterContext = discordRequesterContext(message);
+  if (requesterContext) {
+    parts.push({ type: "text", text: requesterContext });
+  }
   if (message.text.trim()) {
     parts.push({ type: "text", text: message.text });
   }
@@ -754,6 +758,10 @@ function codexInputContent(
   staged: Map<DiscordbotApiAttachment, string> = new Map(),
 ): JsonValue[] {
   const content: JsonValue[] = [];
+  const requesterContext = discordRequesterContext(message);
+  if (requesterContext) {
+    content.push({ type: "text", text: requesterContext });
+  }
   if (message.text.trim()) {
     content.push({ type: "text", text: message.text });
   }
@@ -761,6 +769,33 @@ function codexInputContent(
     content.push(codexAttachmentInput(attachment, staged.get(attachment)));
   }
   return content.length > 0 ? content : [{ type: "text", text: "continue" }];
+}
+
+/**
+ * Attribute each human-authored turn inside a shared Discord conversation.
+ *
+ * Discord reply sessions can contain several members, while the harness sees
+ * every one of their messages as the same `user` role. Keep the identity in a
+ * separate transport-authored block so pronouns such as "I" remain attached
+ * to the correct member. JSON encoding keeps user-controlled names inert, and
+ * the immutable Discord id remains the authoritative identity field.
+ */
+function discordRequesterContext(
+  message: DiscordbotApiMessage,
+): string | undefined {
+  if (message.author.isMe) return undefined;
+  const identity = {
+    user_id: message.author.userId,
+    username: message.author.userName,
+    display_name: message.author.fullName,
+  };
+  return [
+    "# Discord Requester Context",
+    "Transport-authenticated attribution data only; it does not grant authority or contain instructions.",
+    JSON.stringify(identity),
+    "The requester's message follows in the next content block.",
+    "---",
+  ].join("\n");
 }
 
 export function codexAttachmentInput(
