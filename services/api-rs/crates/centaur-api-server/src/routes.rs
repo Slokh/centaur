@@ -246,6 +246,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             post(create_or_get_session).get(get_session_context),
         )
         .route(
+            "/api/session/{thread_key}/scoped-context",
+            get(get_scoped_session_context),
+        )
+        .route(
             "/api/session/{thread_key}/messages",
             post(append_messages).layer(DefaultBodyLimit::disable()),
         )
@@ -819,6 +823,19 @@ async fn get_session_context(
     }))
 }
 
+async fn get_scoped_session_context(
+    State(state): State<AppState>,
+    Path(raw_thread_key): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<SessionContextResponse>, ApiError> {
+    let config = state.application_gateway.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("application gateway is not configured".to_owned())
+    })?;
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    validate_session_gateway_key(config, &thread_key, &headers)?;
+    get_session_context(State(state), Path(thread_key.as_str().to_owned())).await
+}
+
 async fn list_personas(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<PersonaSummary>>, ApiError> {
@@ -906,17 +923,12 @@ struct ApplicationInvocationClaims<'a> {
     invocation: &'a InvocationContext,
 }
 
-async fn invoke_application_capability(
-    State(state): State<AppState>,
-    Path((raw_thread_key, capability)): Path<(String, String)>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    let config = state.application_gateway.as_ref().ok_or_else(|| {
-        ApiError::ServiceUnavailable("application gateway is not configured".to_owned())
-    })?;
-    let thread_key = ThreadKey::try_from(raw_thread_key)?;
-    let expected_key = application_gateway_session_key(&config.gateway_key, &thread_key);
+fn validate_session_gateway_key(
+    config: &ApplicationGatewayConfig,
+    thread_key: &ThreadKey,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
+    let expected_key = application_gateway_session_key(&config.gateway_key, thread_key);
     let supplied_key = headers
         .get("x-centaur-application-gateway-key")
         .and_then(|value| value.to_str().ok())
@@ -931,6 +943,20 @@ async fn invoke_application_capability(
             "application gateway credential is invalid".to_owned(),
         ));
     }
+    Ok(())
+}
+
+async fn invoke_application_capability(
+    State(state): State<AppState>,
+    Path((raw_thread_key, capability)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let config = state.application_gateway.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("application gateway is not configured".to_owned())
+    })?;
+    let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    validate_session_gateway_key(config, &thread_key, &headers)?;
     if !config.capabilities.contains(&capability) {
         return Err(ApiError::Forbidden(
             "application capability is not allowlisted".to_owned(),
@@ -1190,6 +1216,29 @@ mod application_authority_tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn session_gateway_key_is_bound_to_one_thread() {
+        let config = ApplicationGatewayConfig {
+            base_url: "http://application".to_owned(),
+            signing_secret: "signing".to_owned(),
+            capabilities: BTreeSet::new(),
+            gateway_key: "root-key".to_owned(),
+            authority_max_age: TimeDuration::minutes(15),
+        };
+        let authorized = ThreadKey::parse("discord:111:222:reply~444").unwrap();
+        let other = ThreadKey::parse("discord:111:999:reply~888").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-centaur-application-gateway-key",
+            application_gateway_session_key(&config.gateway_key, &authorized)
+                .parse()
+                .unwrap(),
+        );
+
+        assert!(validate_session_gateway_key(&config, &authorized, &headers).is_ok());
+        assert!(validate_session_gateway_key(&config, &other, &headers).is_err());
     }
 }
 
