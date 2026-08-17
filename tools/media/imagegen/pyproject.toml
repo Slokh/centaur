@@ -1,6 +1,6 @@
 [project]
 name = "imagegen"
-description = "Generate images through OpenRouter's dedicated image API"
+description = "Generate and edit images through OpenRouter's dedicated image API"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [

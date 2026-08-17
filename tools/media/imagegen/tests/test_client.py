@@ -76,6 +76,87 @@ def test_generate_rejects_invalid_base64(monkeypatch, tmp_path) -> None:
         ImagegenClient(api_key="key").generate("robot", str(tmp_path / "out.png"))
 
 
+def test_generate_sends_local_reference_as_bounded_data_url(
+    monkeypatch, tmp_path
+) -> None:
+    reference = tmp_path / "reference.png"
+    reference.write_bytes(b"png-reference")
+    seen = {}
+
+    def fake_post(self, url, **kwargs):
+        seen["json"] = kwargs["json"]
+        return response(
+            200,
+            {"data": [{"b64_json": base64.b64encode(b"edited").decode()}]},
+        )
+
+    monkeypatch.setattr(httpx.Client, "post", fake_post)
+    ImagegenClient(api_key="key").generate(
+        "add a small red balloon",
+        str(tmp_path / "edited.png"),
+        input_references=[str(reference)],
+    )
+
+    assert seen["json"]["input_references"] == [
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": "data:image/png;base64,"
+                + base64.b64encode(b"png-reference").decode()
+            },
+        }
+    ]
+
+
+def test_generate_rejects_unsupported_reference_format(tmp_path) -> None:
+    reference = tmp_path / "reference.gif"
+    reference.write_bytes(b"gif")
+    with pytest.raises(ValueError, match="unsupported reference image format"):
+        ImagegenClient(api_key="key").generate(
+            "edit it",
+            str(tmp_path / "edited.png"),
+            input_references=[str(reference)],
+        )
+
+
+def test_generate_accepts_credential_free_https_reference(monkeypatch, tmp_path) -> None:
+    seen = {}
+
+    def fake_post(self, url, **kwargs):
+        seen["json"] = kwargs["json"]
+        return response(
+            200,
+            {"data": [{"b64_json": base64.b64encode(b"edited").decode()}]},
+        )
+
+    monkeypatch.setattr(httpx.Client, "post", fake_post)
+    reference = "https://cdn.example.test/image.png?signature=opaque"
+    ImagegenClient(api_key="key").generate(
+        "edit it",
+        str(tmp_path / "edited.png"),
+        input_references=[reference],
+    )
+
+    assert seen["json"]["input_references"][0]["image_url"]["url"] == reference
+
+
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "http://example.test/image.png",
+        "https://user:password@example.test/image.png",
+        "file:///tmp/image.png",
+    ],
+)
+def test_generate_rejects_unsafe_reference_urls(reference, tmp_path) -> None:
+    with pytest.raises(ValueError, match="credential-free HTTPS URL"):
+        ImagegenClient(api_key="key").generate(
+            "edit it",
+            str(tmp_path / "edited.png"),
+            input_references=[reference],
+        )
+
+
 def test_generate_surfaces_provider_error(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(
         httpx.Client,
