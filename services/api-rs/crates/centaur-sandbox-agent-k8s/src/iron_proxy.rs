@@ -1014,10 +1014,20 @@ impl AgentSandboxBackend {
                     )));
                 }
                 Ok(pod) if Instant::now() >= deadline => {
+                    let reasons = pod_not_ready_reasons(&pod);
+                    tracing::warn!(
+                        proxy_pod = %resolved.proxy_pod_name,
+                        phase = ?pod.status.as_ref().and_then(|status| status.phase.as_deref()),
+                        reasons = %reasons,
+                        "iron-proxy pod did not become ready before timeout"
+                    );
                     return Err(SandboxError::NotReady(format!(
-                        "iron-proxy pod {} did not become running before timeout; latest phase: {:?}",
+                        "iron-proxy pod {} did not become running before timeout; latest phase: {:?}; reasons: {}",
                         resolved.proxy_pod_name,
-                        pod.status.and_then(|status| status.phase)
+                        pod.status
+                            .as_ref()
+                            .and_then(|status| status.phase.as_deref()),
+                        reasons,
                     )));
                 }
                 Ok(_) => sleep(Duration::from_millis(500)).await,
@@ -1943,6 +1953,45 @@ fn pod_stopped(pod: &Pod) -> bool {
         .is_some_and(|phase| {
             phase.eq_ignore_ascii_case("succeeded") || phase.eq_ignore_ascii_case("failed")
         })
+}
+
+/// Bounded Kubernetes reason codes that explain why a pod has not become
+/// ready. Reasons are safe to surface through the sandbox error boundary;
+/// condition messages can contain node names and cluster topology, so they
+/// remain in Kubernetes rather than being copied into member-facing errors.
+fn pod_not_ready_reasons(pod: &Pod) -> String {
+    let Some(status) = pod.status.as_ref() else {
+        return "status-unavailable".to_owned();
+    };
+    let mut reasons = BTreeSet::new();
+    for condition in status.conditions.iter().flatten() {
+        if condition.status != "True"
+            && let Some(reason) = condition.reason.as_deref().and_then(bounded_reason)
+        {
+            reasons.insert(reason.to_owned());
+        }
+    }
+    for container in status.container_statuses.iter().flatten() {
+        if let Some(reason) = container
+            .state
+            .as_ref()
+            .and_then(|state| state.waiting.as_ref())
+            .and_then(|waiting| waiting.reason.as_deref())
+            .and_then(bounded_reason)
+        {
+            reasons.insert(reason.to_owned());
+        }
+    }
+    if reasons.is_empty() {
+        "none-reported".to_owned()
+    } else {
+        reasons.into_iter().take(4).collect::<Vec<_>>().join(",")
+    }
+}
+
+fn bounded_reason(reason: &str) -> Option<&str> {
+    let reason = reason.trim();
+    (!reason.is_empty() && reason.len() <= 80 && reason.is_ascii()).then_some(reason)
 }
 
 fn sandbox_owner_reference(sandbox: &crate::crd::Sandbox) -> Option<Value> {
@@ -2967,6 +3016,46 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn pending_proxy_reasons_are_bounded_and_omit_condition_messages() {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateWaiting, ContainerStatus, PodCondition, PodStatus,
+        };
+        let pod = Pod {
+            status: Some(PodStatus {
+                phase: Some("Pending".to_owned()),
+                conditions: Some(vec![PodCondition {
+                    type_: "PodScheduled".to_owned(),
+                    status: "False".to_owned(),
+                    reason: Some("Unschedulable".to_owned()),
+                    message: Some("0/3 nodes available: private-node-name".to_owned()),
+                    ..Default::default()
+                }]),
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "iron-proxy".to_owned(),
+                    image: "proxy:test".to_owned(),
+                    image_id: String::new(),
+                    ready: false,
+                    restart_count: 0,
+                    state: Some(ContainerState {
+                        waiting: Some(ContainerStateWaiting {
+                            reason: Some("ImagePullBackOff".to_owned()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let reasons = pod_not_ready_reasons(&pod);
+        assert_eq!(reasons, "ImagePullBackOff,Unschedulable");
+        assert!(!reasons.contains("private-node-name"));
     }
 
     #[test]
