@@ -94,9 +94,11 @@ def current_thread_key() -> str:
     except LookupError:
         thread_key = None
     if not thread_key:
+        thread_key = os.environ.get("CENTAUR_THREAD_KEY", "").strip() or None
+    if not thread_key:
         raise RuntimeError(
             "this operation must run inside a scoped thread: no thread_key "
-            "in the tool context."
+            "in the tool context or environment."
         )
     return thread_key
 

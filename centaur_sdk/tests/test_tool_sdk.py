@@ -14,6 +14,7 @@ from centaur_sdk import (
     current_session_context,
     current_scoped_discord_thread,
     current_slack_thread,
+    current_thread_key,
     reset_tool_context,
     save_attachment,
     secret,
@@ -36,6 +37,25 @@ class MappingBackend(SecretBackend):
 
     async def list_keys(self) -> list[str]:
         return sorted(k for k, v in self.values.items() if v is not None)
+
+
+def test_current_thread_key_falls_back_to_sandbox_environment(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "discord:guild:channel:reply~message")
+
+    assert current_thread_key() == "discord:guild:channel:reply~message"
+
+
+def test_current_thread_key_prefers_explicit_tool_context(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "discord:environment")
+    token = set_tool_context(ToolContext(name="fake-tool", thread_key="discord:context"))
+    try:
+        assert current_thread_key() == "discord:context"
+    finally:
+        reset_tool_context(token)
 
 
 def test_secret_prefers_tool_context_over_backend(monkeypatch: pytest.MonkeyPatch):
