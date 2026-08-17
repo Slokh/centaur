@@ -24,4 +24,4 @@ build-backend = "hatchling.build"
 
 [tool.centaur]
 module = "client.py"
-secrets = [{type = "http", name = "DISCORD_BOT_TOKEN", mode = "inject", inject_header = "Authorization", hosts = ["discord.com"]}]
+secrets = [{type = "http", name = "DISCORD_BOT_TOKEN", mode = "inject", inject_header = "Authorization", inject_formatter = "Bot {{ .Value }}", hosts = ["discord.com"]}]
