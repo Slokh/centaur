@@ -243,9 +243,8 @@ impl AgentSandboxBackend {
         id: &SandboxId,
         sandbox: &crd::Sandbox,
     ) -> SandboxResult<ObservedSandbox> {
-        let replicas = sandbox.spec.replicas.unwrap_or(1);
         let pod = self.get_pod(id).await?;
-        let status = sandbox_status_from_pod(replicas, pod.as_ref());
+        let status = sandbox_status(sandbox, pod.as_ref());
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
             .with_created_at(sandbox_creation_time(sandbox))
             .with_suspended_since(sandbox_paused_at(sandbox)))
@@ -415,9 +414,8 @@ impl SandboxBackend for AgentSandboxBackend {
         let Some(sandbox) = self.get_sandbox(id).await? else {
             return Ok(SandboxStatus::Gone);
         };
-        let replicas = sandbox.spec.replicas.unwrap_or(1);
         let pod = self.get_pod(id).await?;
-        Ok(sandbox_status_from_pod(replicas, pod.as_ref()))
+        Ok(sandbox_status(&sandbox, pod.as_ref()))
     }
 
     async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
@@ -627,6 +625,19 @@ fn sandbox_paused_at(sandbox: &crd::Sandbox) -> Option<SystemTime> {
         .get(PAUSED_AT_ANNOTATION)?;
     let timestamp = raw.parse::<jiff::Timestamp>().ok()?;
     Some(SystemTime::from(timestamp))
+}
+
+fn sandbox_status(sandbox: &crd::Sandbox, pod: Option<&Pod>) -> SandboxStatus {
+    // Kubernetes keeps terminating objects readable until finalization. They
+    // cannot be resumed: patches may be accepted while their backing pod is
+    // permanently stuck terminating on a lost node. Treat the assignment as
+    // gone so callers replace it immediately instead of waiting the full
+    // sandbox readiness timeout and recreating proxy resources for a doomed
+    // owner.
+    if sandbox.metadata.deletion_timestamp.is_some() {
+        return SandboxStatus::Gone;
+    }
+    sandbox_status_from_pod(sandbox.spec.replicas.unwrap_or(1), pod)
 }
 
 fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
@@ -1503,6 +1514,23 @@ mod tests {
         assert_eq!(
             sandbox_status_from_pod(1, Some(&failed_pod)),
             SandboxStatus::Stopped
+        );
+    }
+
+    #[test]
+    fn deleting_agent_sandbox_is_gone_even_while_suspended_pod_remains() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        let mut sandbox =
+            build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        sandbox.spec.replicas = Some(0);
+        sandbox.metadata.deletion_timestamp =
+            Some(serde_json::from_value(json!("2026-08-17T22:00:00Z")).unwrap());
+
+        let ready_pod = pod_with_phase_and_ready("Running", true);
+        assert_eq!(
+            sandbox_status(&sandbox, Some(&ready_pod)),
+            SandboxStatus::Gone
         );
     }
 
