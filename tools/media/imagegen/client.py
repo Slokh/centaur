@@ -4,6 +4,7 @@ import base64
 import binascii
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -12,7 +13,15 @@ from centaur_sdk import secret
 BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_MODEL = "google/gemini-3-pro-image-preview"
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_INPUT_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_INPUT_REFERENCES = 4
 SUPPORTED_FORMATS = {"png", "jpeg", "webp"}
+INPUT_MEDIA_TYPES = {
+    ".jpeg": "image/jpeg",
+    ".jpg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
 
 
 class ImagegenClient:
@@ -50,8 +59,9 @@ class ImagegenClient:
         size: str | None = None,
         quality: str | None = None,
         output_format: str = "png",
+        input_references: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Generate one image and save it to ``output_path``."""
+        """Generate or edit one image and save it to ``output_path``."""
         if not prompt.strip():
             raise ValueError("prompt is required")
         if output_format not in SUPPORTED_FORMATS:
@@ -63,6 +73,18 @@ class ImagegenClient:
             "n": 1,
             "output_format": output_format,
         }
+        if input_references:
+            if len(input_references) > MAX_INPUT_REFERENCES:
+                raise ValueError(
+                    f"at most {MAX_INPUT_REFERENCES} reference images are supported"
+                )
+            payload["input_references"] = [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": self._reference_image_url(reference)},
+                }
+                for reference in input_references
+            ]
         for name, value in (
             ("aspect_ratio", aspect_ratio),
             ("size", size),
@@ -106,6 +128,44 @@ class ImagegenClient:
             "bytes": len(image),
             "cost": usage.get("cost"),
         }
+
+    @staticmethod
+    def _reference_image_url(raw_reference: str) -> str:
+        parsed = urlparse(raw_reference)
+        if parsed.scheme:
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or len(raw_reference) > 4_096
+            ):
+                raise ValueError("reference image URL must be a bounded credential-free HTTPS URL")
+            return raw_reference
+
+        raw_path = raw_reference
+        path = Path(raw_path).expanduser()
+        media_type = INPUT_MEDIA_TYPES.get(path.suffix.lower())
+        if media_type is None:
+            raise ValueError(
+                f"unsupported reference image format: {path.suffix or '(none)'}"
+            )
+        try:
+            size = path.stat().st_size
+        except OSError as error:
+            raise ValueError(f"could not read reference image: {path}") from error
+        if size <= 0:
+            raise ValueError(f"reference image is empty: {path}")
+        if size > MAX_INPUT_IMAGE_BYTES:
+            raise ValueError(
+                f"reference image is too large ({size} bytes > "
+                f"{MAX_INPUT_IMAGE_BYTES} byte limit)"
+            )
+        try:
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        except OSError as error:
+            raise ValueError(f"could not read reference image: {path}") from error
+        return f"data:{media_type};base64,{encoded}"
 
     @staticmethod
     def _raise_for_status(response: httpx.Response) -> None:
