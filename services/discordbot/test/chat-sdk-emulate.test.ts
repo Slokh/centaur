@@ -1666,6 +1666,7 @@ function sessionMessageTexts(messages: DiscordbotSessionMessage[]): string[] {
         part.type === "text" &&
         typeof part.text === "string"
       ) {
+        if (part.text.startsWith("# Discord Requester Context\n")) return [];
         return [part.text];
       }
       return [];
