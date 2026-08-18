@@ -574,9 +574,11 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
         (&Method::POST, "/api/session/{thread_key}")
         | (&Method::POST, "/api/session/{thread_key}/messages")
         | (&Method::POST, "/api/session/{thread_key}/execute")
-        | (&Method::POST, "/api/session/{thread_key}/interrupt")
-        | (&Method::POST, "/api/session/{thread_key}/application/{capability}") => {
+        | (&Method::POST, "/api/session/{thread_key}/interrupt") => {
             capability(Capability::SessionsWrite)
+        }
+        (&Method::POST, "/api/session/{thread_key}/application/{capability}") => {
+            Some(RouteAccess::PrincipalOnly)
         }
         (&Method::POST, "/api/sandboxes/drain") => capability(Capability::SandboxesDrain),
         (&Method::GET, "/api/workflows/schedules")
@@ -622,7 +624,7 @@ mod route_access_tests {
                 &Method::POST,
                 "/api/session/{thread_key}/application/{capability}"
             ),
-            Some(RouteAccess::Capability(Capability::SessionsWrite))
+            Some(RouteAccess::PrincipalOnly)
         ));
     }
 }
@@ -1148,6 +1150,7 @@ fn validate_session_gateway_key(
 
 async fn invoke_application_capability(
     State(state): State<AppState>,
+    Extension(caller): Extension<AuthenticatedCaller>,
     Path((raw_thread_key, capability)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
@@ -1156,6 +1159,7 @@ async fn invoke_application_capability(
         ApiError::ServiceUnavailable("application gateway is not configured".to_owned())
     })?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
+    authorize_principal_session_read(&state.runtime()?, &caller, &thread_key).await?;
     validate_session_gateway_key(config, &thread_key, &headers)?;
     if !config.capabilities.contains(&capability) {
         return Err(ApiError::Forbidden(
