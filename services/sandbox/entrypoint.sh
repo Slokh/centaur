@@ -5,6 +5,14 @@ HOME_DIR="$(eval echo ~)"
 FIREWALL_HOSTNAME="${FIREWALL_HOST:-firewall}"
 STATE_DIR="${CENTAUR_STATE_DIR:-$HOME_DIR/state}"
 
+case "${CENTAUR_BASE_SKILLS_ENABLED:-true}" in
+    0|false|False|FALSE|no|No|NO|off|Off|OFF)
+        # Baked Centaur development skills are useful for general-purpose
+        # sandboxes, but product overlays can provide a smaller skill surface.
+        rm -rf "$HOME_DIR/.agents/skills" "$HOME_DIR/centaur-skills"
+        ;;
+esac
+
 append_tool_dirs() {
     if [ -z "${1:-}" ]; then
         return
