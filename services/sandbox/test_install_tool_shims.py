@@ -437,5 +437,32 @@ class RefreshInstallTest(unittest.TestCase):
             index = json.loads((bin_dir / ".centaur-tools.json").read_text())
             self.assertEqual([tool["name"] for tool in index], ["websearch"])
 
+
+class SkillSourcesTest(unittest.TestCase):
+    def test_base_skills_can_be_disabled_without_hiding_overlay_skills(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            overlay = Path(tmp) / "product-skills"
+            home.mkdir()
+            overlay.mkdir()
+
+            with (
+                mock.patch.object(install_tool_shims, "_home_dir", return_value=home),
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "CENTAUR_BASE_SKILLS_ENABLED": "false",
+                        "CENTAUR_SKILL_DIRS": str(overlay),
+                    },
+                    clear=False,
+                ),
+            ):
+                sources = install_tool_shims._skill_sources()
+
+            self.assertNotIn(home / ".agents" / "skills", sources)
+            self.assertNotIn(home / "centaur-skills", sources)
+            self.assertIn(overlay, sources)
+
+
 if __name__ == "__main__":
     unittest.main()

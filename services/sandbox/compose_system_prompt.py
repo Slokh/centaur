@@ -36,10 +36,19 @@ def compose_system_prompt(
     target_prompt: Path,
     repo_mount: Path,
     inline_overlay: str | None = None,
+    prompt_mode: str = "append",
 ) -> None:
+    if prompt_mode not in {"append", "replace"}:
+        raise ValueError(f"unknown system prompt mode: {prompt_mode}")
+
     base_prompt = home_dir / "AGENTS_BASE.md"
     baked_prompt = home_dir / "AGENTS.md"
-    if base_prompt.is_file():
+    inline_text = (
+        inline_overlay.strip() if inline_overlay and inline_overlay.strip() else None
+    )
+    if prompt_mode == "replace" and inline_text:
+        target_prompt.write_text(f"{inline_text}\n")
+    elif base_prompt.is_file():
         target_prompt.write_text(base_prompt.read_text())
     elif baked_prompt.is_file():
         target_prompt.write_text(baked_prompt.read_text())
@@ -52,10 +61,10 @@ def compose_system_prompt(
     if _append_prompt(target_prompt, home_overlay):
         appended.add(home_overlay.resolve())
 
-    if inline_overlay and inline_overlay.strip():
+    if prompt_mode == "append" and inline_text:
         with target_prompt.open("a") as target_file:
             target_file.write(SEPARATOR)
-            target_file.write(inline_overlay.strip())
+            target_file.write(inline_text)
             target_file.write("\n")
 
     for prompt_path in _mounted_overlay_prompts(repo_mount, baked_prompt):
@@ -63,6 +72,10 @@ def compose_system_prompt(
             continue
         resolved = prompt_path.resolve()
         if resolved in appended:
+            continue
+        # The chart can provide the same prompt inline while the repository is
+        # also mounted for tools and skills. Include that policy once.
+        if inline_text and prompt_path.read_text().strip() == inline_text:
             continue
         if _append_prompt(target_prompt, prompt_path):
             appended.add(resolved)
@@ -81,6 +94,7 @@ def main() -> int:
         target_prompt=Path(args.target_prompt),
         repo_mount=Path(args.repo_mount) if args.repo_mount else home_dir / "github",
         inline_overlay=os.environ.get("CENTAUR_SYSTEM_PROMPT"),
+        prompt_mode=os.environ.get("CENTAUR_SYSTEM_PROMPT_MODE", "append"),
     )
     return 0
 
