@@ -1483,6 +1483,38 @@ impl PgSessionStore {
         Ok(rows)
     }
 
+    pub async fn reserve_obsolete_ready_warm_sandboxes(
+        &self,
+        current_workload_key: &str,
+        min_age: Duration,
+    ) -> Result<Vec<String>, SessionStoreError> {
+        let rows = sqlx::query_scalar::<_, String>(
+            r#"
+            with candidates as (
+                select sandbox_id
+                from session_warm_sandboxes
+                where status = 'ready'
+                  and workload_key <> $1
+                  and created_at <= now() - ($2::float8 * interval '1 second')
+                order by created_at, sandbox_id
+                for update skip locked
+            )
+            update session_warm_sandboxes warm
+            set
+                status = 'evicting',
+                updated_at = now()
+            from candidates
+            where warm.sandbox_id = candidates.sandbox_id
+            returning warm.sandbox_id
+            "#,
+        )
+        .bind(current_workload_key)
+        .bind(min_age.as_secs_f64())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     pub async fn list_stale_evicting_warm_sandbox_ids(
         &self,
         min_age: Duration,

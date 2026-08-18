@@ -10,6 +10,7 @@ use crate::SandboxManager;
 
 pub type WarmSandboxSpecFactory = Arc<dyn Fn() -> SandboxSpec + Send + Sync>;
 const STALE_EVICTING_WARM_SANDBOX_AGE: Duration = Duration::from_secs(300);
+const OBSOLETE_WORKLOAD_WARM_SANDBOX_AGE: Duration = Duration::from_secs(300);
 
 pub struct WarmPoolConfig {
     pub target_size: usize,
@@ -124,6 +125,7 @@ impl WarmPoolManager {
     }
 
     async fn replenish_once(&self) -> Result<(), WarmPoolError> {
+        self.prune_obsolete_workload_sandboxes().await?;
         self.prune_stale_ready_sandboxes().await?;
         self.prune_stale_evicting_sandboxes().await?;
 
@@ -150,6 +152,41 @@ impl WarmPoolManager {
             }
         }
 
+        Ok(())
+    }
+
+    async fn prune_obsolete_workload_sandboxes(&self) -> Result<(), WarmPoolError> {
+        for sandbox_id in self
+            .store
+            .reserve_obsolete_ready_warm_sandboxes(
+                self.workload_key.as_str(),
+                OBSOLETE_WORKLOAD_WARM_SANDBOX_AGE,
+            )
+            .await?
+        {
+            let id = SandboxId::new(sandbox_id.as_str());
+            let reason = match self.manager.status(&id).await {
+                Ok(status) if status_consumes_running_slot(&status) => {
+                    match self.manager.stop(&id).await {
+                        Ok(()) | Err(SandboxError::NotFound(_)) => {
+                            "obsolete workload warm sandbox stopped".to_owned()
+                        }
+                        Err(error) => return Err(WarmPoolError::Sandbox(error)),
+                    }
+                }
+                Ok(status) => {
+                    format!("obsolete workload warm sandbox was not running: {status:?}")
+                }
+                Err(SandboxError::NotFound(_)) => {
+                    "obsolete workload warm sandbox was not found".to_owned()
+                }
+                Err(error) => return Err(WarmPoolError::Sandbox(error)),
+            };
+            warn!(%sandbox_id, %reason, "retiring obsolete workload warm sandbox");
+            self.store
+                .mark_warm_sandbox_failed(&sandbox_id, &reason)
+                .await?;
+        }
         Ok(())
     }
 
@@ -397,6 +434,62 @@ mod tests {
                 .await
                 .expect("list referenced sandboxes")
                 .contains(&stale_sandbox)
+        );
+    }
+
+    #[tokio::test]
+    async fn replenisher_retires_running_warm_sandboxes_for_old_workloads() {
+        let _serial = TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let suffix = unique_suffix();
+        let workload_key = format!("test-current-{suffix}");
+        let old_workload_key = format!("test-old-{suffix}");
+        let old_sandbox = format!("old-running-{suffix}");
+
+        store
+            .insert_ready_warm_sandbox(&old_sandbox, &old_workload_key)
+            .await
+            .expect("insert old warm sandbox");
+        sqlx::query(
+            "update session_warm_sandboxes set created_at = now() - interval '10 minutes' where sandbox_id = $1",
+        )
+        .bind(&old_sandbox)
+        .execute(store.pool())
+        .await
+        .expect("age old warm sandbox");
+
+        let backend = Arc::new(TestBackend::new(format!("fresh-{suffix}")));
+        backend.set_status(&old_sandbox, SandboxStatus::Running);
+        let pool = WarmPoolManager::new(
+            Arc::new(SandboxManager::new(backend.clone())),
+            store.clone(),
+            Arc::new(|| SandboxSpec::new("image")),
+            workload_key,
+            WarmPoolConfig {
+                target_size: 0,
+                replenish_interval: Duration::from_secs(60),
+                bootstrap_iron_control_principal: "prn_test_bootstrap".to_owned(),
+                max_running_sandboxes: Some(2),
+            },
+        );
+
+        pool.replenish_once().await.expect("replenish warm pool");
+
+        assert_eq!(
+            backend
+                .status(&SandboxId::new(&old_sandbox))
+                .await
+                .expect("old sandbox status"),
+            SandboxStatus::Stopped
+        );
+        assert_eq!(
+            store
+                .count_ready_warm_sandboxes(&old_workload_key)
+                .await
+                .expect("count old ready warm sandboxes"),
+            0
         );
     }
 
