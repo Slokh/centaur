@@ -109,8 +109,9 @@ class _FakeOpenAIClient:
 
 
 class _FakeHttpResponse:
-    def __init__(self, payload: dict) -> None:
+    def __init__(self, payload: dict | None = None, *, raw: bytes | None = None) -> None:
         self._payload = payload
+        self._raw = raw
 
     def __enter__(self):
         return self
@@ -118,8 +119,9 @@ class _FakeHttpResponse:
     def __exit__(self, exc_type, exc, traceback):
         return False
 
-    def read(self) -> bytes:
-        return json.dumps(self._payload).encode()
+    def read(self, size: int = -1) -> bytes:
+        raw = self._raw if self._raw is not None else json.dumps(self._payload).encode()
+        return raw if size < 0 else raw[:size]
 
 
 @pytest.fixture(autouse=True)
@@ -241,6 +243,27 @@ def test_application_backed_source_requires_configured_operation(monkeypatch):
 
     assert result["status"] == "error"
     assert "does not support operation 'stats'" in result["error"]
+
+
+def test_application_backed_source_rejects_oversized_agent_context(monkeypatch):
+    monkeypatch.setenv(
+        "COMPANY_CONTEXT_APPLICATION_SOURCES",
+        json.dumps({"discord": {"attachments": "memory.attachments"}}),
+    )
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "discord:guild:channel:reply~message")
+    monkeypatch.setenv("CENTAUR_APPLICATION_GATEWAY_KEY", "session-key")
+    monkeypatch.setattr(
+        company_context_client.urllib.request,
+        "urlopen",
+        lambda request, timeout: _FakeHttpResponse(
+            raw=b"x" * (company_context_client.MAX_APPLICATION_SOURCE_RESPONSE_BYTES + 1)
+        ),
+    )
+
+    result = CompanyContextClient().attachments("group picture", source="discord")
+
+    assert result["status"] == "error"
+    assert "64 KiB agent-context limit" in result["error"]
 
 
 @pytest.mark.parametrize("sql", ["", "   "])

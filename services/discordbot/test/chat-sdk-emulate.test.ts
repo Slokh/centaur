@@ -496,7 +496,7 @@ describe("discordbot", () => {
     expect(hasReaction(threadId, mentionId, "PUT", "❌")).toBe(false);
   });
 
-  it("renders raw turn.failed session output as visible final text and settles ❌", async () => {
+  it("renders a sanitized turn.failed message and settles ❌", async () => {
     codexApi.autoRespond = false;
 
     const threadId = discordApi.nextId();
@@ -536,8 +536,9 @@ describe("discordbot", () => {
 
     await waitForSettle(threadId, mentionId, "❌");
     expect(answerPostsIn(threadId).join("\n")).toContain(
-      "Execution failed: Reconnecting... 2/5: unexpected status 502 Bad Gateway",
+      "Execution failed: The model provider is temporarily unavailable. Please try again.",
     );
+    expect(answerPostsIn(threadId).join("\n")).not.toContain("502 Bad Gateway");
   }, 15_000);
 
   it("renders successful completions with no final answer as visible text", async () => {
@@ -1038,7 +1039,10 @@ describe("discordbot", () => {
     // No duplicate posting across the retries; one final failure message.
     const posts = botPostsIn(threadId);
     expect(posts).toHaveLength(1);
-    expect(posts[0]).toContain("Streaming retries exhausted");
+    expect(posts[0]).toContain(
+      "Execution failed: The agent could not complete this request. Please try again.",
+    );
+    expect(posts[0]).not.toContain("Streaming retries exhausted");
 
     const threadState = await state.get<Record<string, unknown>>(
       `thread-state:${key}`,

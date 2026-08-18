@@ -2468,7 +2468,7 @@ describe('slackbotv2', () => {
     await Promise.all(firstWaits)
   })
 
-  it('renders raw turn.failed session output as visible final text', async () => {
+  it('renders a sanitized turn.failed message as visible final text', async () => {
     codexApi.autoRespond = false
 
     const parent = await postUserMessage('Context before a raw failure.')
@@ -2527,14 +2527,15 @@ describe('slackbotv2', () => {
     expect(markdownChunks).toEqual([
       {
         type: 'markdown_text',
-        text: 'Execution failed: Reconnecting... 2/5: unexpected status 502 Bad Gateway'
+        text: 'Execution failed: The model provider is temporarily unavailable. Please try again.'
       }
     ])
     const renderedText = transcripts[0]!.chunks.map(chunkText).filter(Boolean).join('\n')
     expect(renderedText).toContain('Command execution')
     expect(renderedText).toContain(
-      'Execution failed: Reconnecting... 2/5: unexpected status 502 Bad Gateway'
+      'Execution failed: The model provider is temporarily unavailable. Please try again.'
     )
+    expect(renderedText).not.toContain('502 Bad Gateway')
   })
 
   it('renders successful completions with no final answer as visible Slack text', async () => {

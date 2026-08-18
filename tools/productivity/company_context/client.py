@@ -61,6 +61,7 @@ APPLICATION_GATEWAY_KEY_ENV = "CENTAUR_APPLICATION_GATEWAY_KEY"
 THREAD_KEY_ENV = "CENTAUR_THREAD_KEY"
 CENTAUR_API_URL_ENV = "CENTAUR_API_URL"
 DEFAULT_CENTAUR_API_URL = "http://centaur-api-rs:8080"
+MAX_APPLICATION_SOURCE_RESPONSE_BYTES = 64 * 1024
 
 _SEARCH_TERM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*")
 _STOP_WORDS = {
@@ -178,7 +179,13 @@ def _call_application_source(capability: str, payload: dict[str, Any]) -> dict[s
     )
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
-            result = json.loads(response.read())
+            raw_result = response.read(MAX_APPLICATION_SOURCE_RESPONSE_BYTES + 1)
+            if len(raw_result) > MAX_APPLICATION_SOURCE_RESPONSE_BYTES:
+                raise RuntimeError(
+                    "application-backed context response exceeded the 64 KiB agent-context limit; "
+                    "narrow the query or lower the result limit"
+                )
+            result = json.loads(raw_result)
     except urllib.error.HTTPError as error:
         detail = error.read().decode(errors="replace").strip()
         raise RuntimeError(
