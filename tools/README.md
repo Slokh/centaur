@@ -68,7 +68,7 @@ The open-source tool inventory lives in this `tools/` tree and changes over time
   returned by the explicit operator-facing `discord-message` command and can be
   disabled with `--no-content`.
 - `centaur-console`: inspect sandbox permissions and configured OAuth apps.
-- `centaur-skills`: discover and read private and public Console-authored skills.
+- `centaur-skills`: discover, author, and manage editors for private and public Console-authored skills.
 - `datadog`: query Datadog logs, metrics, monitors, hosts, and dashboards
   read-only with `DD_API_KEY` and `DD_APP_KEY`.
 - `preqin`: query Preqin Operational API fund and fund-manager data, with
