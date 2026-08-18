@@ -74,6 +74,22 @@ afterAll(async () => {
 });
 
 describe("discordbot", () => {
+  it("shares one retrying state-readiness gate across startup consumers", async () => {
+    const state = createMemoryState();
+    const connect = state.connect.bind(state);
+    let attempts = 0;
+    state.connect = async () => {
+      attempts += 1;
+      if (attempts < 3) throw new Error("database is moving nodes");
+      await connect();
+    };
+    bot = createTestBot({ state });
+
+    await Promise.all([bot.ready(), bot.ready(), bot.ready()]);
+
+    expect(attempts).toBe(3);
+  });
+
   it("keeps implicit reply pings in one inline-reply session", async () => {
     bot = createTestBot({ conversationMode: "inline_reply" });
 
