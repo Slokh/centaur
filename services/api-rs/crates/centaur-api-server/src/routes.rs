@@ -567,13 +567,15 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
     let capability = |capability| Some(RouteAccess::Capability(capability));
     match (method, route) {
         (&Method::GET, "/api/session/{thread_key}")
-        | (&Method::GET, "/api/session/{thread_key}/events") => {
+        | (&Method::GET, "/api/session/{thread_key}/events")
+        | (&Method::GET, "/api/session/{thread_key}/scoped-context") => {
             capability(Capability::SessionsRead)
         }
         (&Method::POST, "/api/session/{thread_key}")
         | (&Method::POST, "/api/session/{thread_key}/messages")
         | (&Method::POST, "/api/session/{thread_key}/execute")
-        | (&Method::POST, "/api/session/{thread_key}/interrupt") => {
+        | (&Method::POST, "/api/session/{thread_key}/interrupt")
+        | (&Method::POST, "/api/session/{thread_key}/application/{capability}") => {
             capability(Capability::SessionsWrite)
         }
         (&Method::POST, "/api/sandboxes/drain") => capability(Capability::SandboxesDrain),
@@ -602,6 +604,26 @@ fn route_access(method: &Method, route: &str) -> Option<RouteAccess> {
             capability(Capability::AdminSync)
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod route_access_tests {
+    use super::{Capability, Method, RouteAccess, route_access};
+
+    #[test]
+    fn application_gateway_session_routes_have_explicit_access_policies() {
+        assert!(matches!(
+            route_access(&Method::GET, "/api/session/{thread_key}/scoped-context"),
+            Some(RouteAccess::Capability(Capability::SessionsRead))
+        ));
+        assert!(matches!(
+            route_access(
+                &Method::POST,
+                "/api/session/{thread_key}/application/{capability}"
+            ),
+            Some(RouteAccess::Capability(Capability::SessionsWrite))
+        ));
     }
 }
 
