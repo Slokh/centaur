@@ -272,6 +272,7 @@ fn run_blocks_turn<H: HarnessServer, W: Write>(
     result
 }
 
+#[allow(clippy::large_enum_variant)]
 enum BlocksReaderInput {
     Command(BlocksCommand),
     Error(String),

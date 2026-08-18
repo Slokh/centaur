@@ -258,6 +258,7 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
     Ok(())
 }
 
+#[allow(clippy::large_enum_variant)]
 enum CodexBlocksReaderInput {
     Command(BlocksCommand),
     Error(String),
