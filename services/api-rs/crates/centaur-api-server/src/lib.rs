@@ -380,6 +380,24 @@ mod tests {
             ),
             (
                 Request::builder()
+                    .uri("/api/session/slack%3AC123%3A123.456/scoped-context")
+                    .header(header::AUTHORIZATION, &authorized)
+                    .body(Body::empty())
+                    .unwrap(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/session/slack%3AC123%3A123.456/application/memory.search")
+                    .header(header::AUTHORIZATION, &authorized)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                Request::builder()
                     .method(Method::POST)
                     .uri("/api/session/discord%3A123%3A456")
                     .header(header::AUTHORIZATION, &authorized)
