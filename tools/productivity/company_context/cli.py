@@ -191,7 +191,11 @@ def attachments(
     limit: int = typer.Option(10, "--limit", "-n", help="Max attachments."),
     json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
 ) -> None:
-    """Search attachment evidence in an execution-bound context source."""
+    """Search attachment evidence across the member-visible source scope.
+
+    This command accepts QUERY, --source, and --limit. It has no --channel-id
+    option; include a channel name in QUERY when the source supports it.
+    """
     result = CompanyContextClient().attachments(query, source=source, limit=limit)
     _require_ok(result)
     _print_json(result)
