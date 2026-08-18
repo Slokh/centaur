@@ -480,8 +480,6 @@ pub struct Principal {
     pub labels: BTreeMap<String, String>,
     #[serde(default = "default_true")]
     pub sandbox_observability_enabled: bool,
-    #[serde(default = "default_true")]
-    pub sandbox_api_server_enabled: bool,
 }
 
 /// Request body for creating/updating one Slack permission row on a principal.
@@ -693,6 +691,9 @@ impl Grant {
 pub struct ProxyInput {
     pub name: String,
     pub principal_id: String,
+    /// Always serialized (``null`` when absent) so create and assign share one
+    /// wire shape; the console treats an omitted key as "leave unchanged".
+    pub requester_principal_id: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub labels: BTreeMap<String, String>,
 }
