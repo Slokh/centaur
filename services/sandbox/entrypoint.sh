@@ -426,6 +426,13 @@ unset _centaur_tools_auto_reload
 TARGET_PROMPT="$WORKSPACE_DIR/AGENTS.md"
 compose-system-prompt --home-dir "$HOME_DIR" --target-prompt "$TARGET_PROMPT"
 
+if [ "${CENTAUR_SYSTEM_PROMPT_MODE:-append}" = "replace" ]; then
+    # The baked prompt is a fallback for general Centaur sandboxes. Remove the
+    # ancestor copy after composing a replacement so harness discovery cannot
+    # load both the product prompt and the development fallback.
+    rm -f "$HOME_DIR/AGENTS.md"
+fi
+
 if [ "${CENTAUR_SANDBOX_OBSERVABILITY_ENABLED:-true}" = "false" ] && [ -f "$TARGET_PROMPT" ]; then
     cat >> "$TARGET_PROMPT" <<'EOF'
 
