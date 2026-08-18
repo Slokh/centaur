@@ -95,6 +95,14 @@ def current_thread_key() -> str:
     return thread_key
 
 
+def _require_api_server_enabled(operation: str) -> None:
+    if secret("CENTAUR_SANDBOX_API_SERVER_ENABLED", "true").strip().lower() == "false":
+        raise RuntimeError(
+            f"{operation} requires the API server sandbox capability, but it is disabled "
+            "for this principal."
+        )
+
+
 def current_session_context() -> dict[str, Any]:
     """Return API-owned context for the current thread.
 

@@ -281,6 +281,23 @@ def test_current_scoped_discord_thread_sends_session_bound_gateway_key(
         reset_tool_context(token)
 
 
+def test_current_scoped_discord_thread_requires_api_server_capability(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="discord:111:222:reply~444",
+            secrets={"CENTAUR_SANDBOX_API_SERVER_ENABLED": "false"},
+        )
+    )
+    try:
+        with pytest.raises(RuntimeError, match="API server sandbox capability"):
+            current_scoped_discord_thread()
+    finally:
+        reset_tool_context(token)
+
+
 def test_current_chat_destination_tags_platform(monkeypatch: pytest.MonkeyPatch):
     token = _discord_context("discord:111:222:333", monkeypatch)
     try:
