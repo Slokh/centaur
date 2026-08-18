@@ -222,6 +222,11 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
   }
 
   const state = options.state ?? createDefaultState(options, logger);
+  // All startup consumers share one retry loop. Without this single-flight
+  // gate, recovery tasks and Gateway initialization race independent
+  // state.connect() calls, and Chat.initialize() can terminate the process on
+  // the first ECONNREFUSED while Postgres is moving between nodes.
+  const ready = singleFlight(() => ensureStateConnected(state, options));
   const discord = createDiscordAdapter({
     apiUrl: options.discordApiUrl,
     applicationId: options.applicationId,
@@ -325,7 +330,7 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
   );
 
   if (options.applicationIngestionUrl && options.applicationIngestionToken) {
-    scheduleApplicationIngestionRecovery(state, options);
+    scheduleApplicationIngestionRecovery(state, options, ready);
   }
 
   chat.onNewMention(async (thread, message, context) => {
@@ -363,10 +368,10 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
   });
 
   if (options.recoverRenderObligationsOnStart !== false) {
-    scheduleRenderObligationRecovery(chat, state, options);
+    scheduleRenderObligationRecovery(chat, state, options, ready);
   }
 
-  return { app, chat, adapter: discord };
+  return { app, chat, adapter: discord, ready };
 }
 
 function allowedQueuedMessages(
@@ -986,17 +991,21 @@ function scheduleRenderObligationRecovery(
   chat: Chat<Record<string, Adapter>, DiscordbotThreadState>,
   state: StateAdapter,
   options: DiscordbotOptions,
+  ready: () => Promise<void>,
 ): void {
-  backgroundWaitUntil(recoverRenderObligationsWithRetry(chat, state, options));
+  backgroundWaitUntil(
+    recoverRenderObligationsWithRetry(chat, state, options, ready),
+  );
 }
 
 function scheduleApplicationIngestionRecovery(
   state: StateAdapter,
   options: DiscordbotOptions,
+  ready: () => Promise<void>,
 ): void {
   backgroundWaitUntil(
     (async () => {
-      await ensureStateConnected(state, options);
+      await ready();
       const recoverOutbox = async () => {
         try {
           const pending = await recoverApplicationIngestion(options, state);
@@ -1054,10 +1063,11 @@ async function recoverRenderObligationsWithRetry(
   chat: Chat<Record<string, Adapter>, DiscordbotThreadState>,
   state: StateAdapter,
   options: DiscordbotOptions,
+  ready: () => Promise<void>,
 ): Promise<void> {
   // Wait for Postgres before scanning for obligations. This is also what warms the
   // shared pool at startup, so transient connect failures don't wedge the bot.
-  await ensureStateConnected(state, options);
+  await ready();
   let attempt = 0;
   while (true) {
     try {

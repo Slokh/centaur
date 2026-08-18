@@ -91,7 +91,7 @@ const options: DiscordbotOptions = {
   logger: consoleLogger,
 };
 
-const { app, chat, adapter } = createDiscordbot(options);
+const { app, chat, adapter, ready } = createDiscordbot(options);
 const server = Bun.serve({ port, fetch: app.fetch });
 
 log("info", "discordbot_started", {
@@ -110,6 +110,11 @@ const shutdown = async (signal: string): Promise<void> => {
 process.on("SIGTERM", () => void shutdown("SIGTERM"));
 process.on("SIGINT", () => void shutdown("SIGINT"));
 
+// Do not open Discord ingress until durable state is available. `ready()`
+// retries transient Postgres/node failures indefinitely and is shared with the
+// startup recovery jobs, so one unavailable dependency cannot crash-loop the
+// singleton Gateway consumer.
+await ready();
 await gateway.start(chat, adapter);
 
 function optionalEnv(name: string): string | undefined {

@@ -186,6 +186,8 @@ export type Discordbot = {
   app: Hono;
   chat: Chat;
   adapter: GatewayCapableAdapter;
+  /** Wait until the durable state backend is available before accepting ingress. */
+  ready: () => Promise<void>;
 };
 
 export type DiscordbotThreadState = {
