@@ -73,8 +73,24 @@ const PG_CLIENT_PASSWORD_ENV: &str = "IRON_PROXY_PG_CLIENT_PASSWORD";
 // apply latency (the pre-barrier behavior).
 const PROXY_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const PROXY_ACK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PROXY_ACK_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const PROXY_ACK_PROBE_WINDOW: Duration = Duration::from_secs(2);
 const PROXY_REASSIGN_FALLBACK_DELAY: Duration = Duration::from_secs(6);
+
+#[derive(Clone, Copy)]
+struct ProxyAckTimings {
+    ack_timeout: Duration,
+    probe_window: Duration,
+    poll_interval: Duration,
+    sync_interval: Duration,
+}
+
+const PROXY_ACK_TIMINGS: ProxyAckTimings = ProxyAckTimings {
+    ack_timeout: PROXY_ACK_TIMEOUT,
+    probe_window: PROXY_ACK_PROBE_WINDOW,
+    poll_interval: PROXY_ACK_POLL_INTERVAL,
+    sync_interval: PROXY_ACK_SYNC_INTERVAL,
+};
 
 #[derive(Clone, Debug)]
 pub struct IronProxyConfig {
@@ -876,9 +892,7 @@ impl AgentSandboxBackend {
             &endpoint,
             principal_id,
             config_hash,
-            PROXY_ACK_TIMEOUT,
-            PROXY_ACK_PROBE_WINDOW,
-            PROXY_ACK_POLL_INTERVAL,
+            PROXY_ACK_TIMINGS,
         )
         .await)
     }
@@ -1095,26 +1109,27 @@ async fn wait_for_proxy_ack(
     endpoint: &ProxyManagementEndpoint,
     principal_id: &str,
     config_hash: Option<&str>,
-    ack_timeout: Duration,
-    probe_window: Duration,
-    poll_interval: Duration,
+    timings: ProxyAckTimings,
 ) -> ProxyAck {
     let started = Instant::now();
-    let mut poked = false;
+    let mut last_sync_poke = None;
     let mut management_confirmed = false;
     loop {
         // Poke an immediate out-of-band sync so the barrier does not ride the
-        // proxy's 5s poll cadence; retried until it lands (the status poll
-        // below still converges without it, just slower).
-        if !poked {
-            poked = matches!(
-                client
-                    .post(format!("{}/v1/sync", endpoint.base_url))
-                    .bearer_auth(&endpoint.api_key)
-                    .send()
-                    .await,
-                Ok(response) if response.status().is_success()
-            );
+        // proxy's 5s poll cadence. A successful 202 only means the request was
+        // accepted: it can race a sync already in flight and apply no newer
+        // state, so poke again at a bounded cadence until status confirms the
+        // assignment.
+        let elapsed = started.elapsed();
+        if last_sync_poke
+            .is_none_or(|last: Duration| elapsed.saturating_sub(last) >= timings.sync_interval)
+        {
+            let _ = client
+                .post(format!("{}/v1/sync", endpoint.base_url))
+                .bearer_auth(&endpoint.api_key)
+                .send()
+                .await;
+            last_sync_poke = Some(elapsed);
         }
         let status = client
             .get(format!("{}/v1/status", endpoint.base_url))
@@ -1137,13 +1152,13 @@ async fn wait_for_proxy_ack(
             }
         }
         let elapsed = started.elapsed();
-        if !management_confirmed && elapsed >= probe_window {
+        if !management_confirmed && elapsed >= timings.probe_window {
             return ProxyAck::ManagementUnavailable;
         }
-        if elapsed >= ack_timeout {
+        if elapsed >= timings.ack_timeout {
             return ProxyAck::TimedOut;
         }
-        sleep(poll_interval).await;
+        sleep(timings.poll_interval).await;
     }
 }
 
@@ -3168,16 +3183,19 @@ mod tests {
             &endpoint,
             "prin_claimed",
             None,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            Duration::from_millis(10),
+            ProxyAckTimings {
+                ack_timeout: Duration::from_secs(5),
+                probe_window: Duration::from_secs(5),
+                poll_interval: Duration::from_millis(10),
+                sync_interval: Duration::from_millis(20),
+            },
         )
         .await;
 
         assert_eq!(ack, ProxyAck::Applied);
         assert!(
-            sync_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
-            "the barrier should poke an immediate out-of-band sync"
+            sync_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the barrier should re-poke an accepted sync until status confirms it"
         );
         server.abort();
     }
@@ -3195,9 +3213,12 @@ mod tests {
             &endpoint,
             "prin_claimed",
             None,
-            Duration::from_millis(400),
-            Duration::from_millis(200),
-            Duration::from_millis(25),
+            ProxyAckTimings {
+                ack_timeout: Duration::from_millis(400),
+                probe_window: Duration::from_millis(200),
+                poll_interval: Duration::from_millis(25),
+                sync_interval: Duration::from_millis(50),
+            },
         )
         .await;
 
@@ -3218,9 +3239,12 @@ mod tests {
             &endpoint,
             "prin_claimed",
             Some("sha256:expected"),
-            Duration::from_millis(200),
-            Duration::from_millis(200),
-            Duration::from_millis(10),
+            ProxyAckTimings {
+                ack_timeout: Duration::from_millis(200),
+                probe_window: Duration::from_millis(200),
+                poll_interval: Duration::from_millis(10),
+                sync_interval: Duration::from_millis(25),
+            },
         )
         .await;
 
@@ -3245,9 +3269,12 @@ mod tests {
             &endpoint,
             "prin_claimed",
             None,
-            Duration::from_secs(2),
-            Duration::from_millis(300),
-            Duration::from_millis(50),
+            ProxyAckTimings {
+                ack_timeout: Duration::from_secs(2),
+                probe_window: Duration::from_millis(300),
+                poll_interval: Duration::from_millis(50),
+                sync_interval: Duration::from_millis(100),
+            },
         )
         .await;
 

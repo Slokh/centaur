@@ -220,7 +220,8 @@ impl ChatDestination {
                 format!(
                     "[chat surface: Discord · channel {channel_id}{thread}{reply} (guild {guild_id}). \
                      Centaur delivers your reply to this thread automatically — do not repost it with the discord tool. \
-                     Send files here with `discord-upload FILE`.]"
+                     Send files here with `discord-upload FILE`. A local file is not visible in Discord: only claim it was attached or shown after `discord-upload` succeeds. \
+                     If generation succeeded but upload failed, reuse the same local file when retrying; do not regenerate unless the user asks for changes.]"
                 )
             }
             Self::Linear {
@@ -864,6 +865,8 @@ mod tests {
         assert!(discord.contains("Discord"));
         assert!(discord.contains("222"));
         assert!(discord.contains("discord-upload FILE"));
+        assert!(discord.contains("only claim it was attached or shown after"));
+        assert!(discord.contains("reuse the same local file"));
 
         let linear = ThreadKey::parse("linear:ISSUE:c:CMT")
             .unwrap()
