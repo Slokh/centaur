@@ -103,6 +103,7 @@ const RENDER_RECOVERY_LEASE_TTL_MS = 2 * 60 * 1000;
 const RENDER_LEASE_REFRESH_INTERVAL_MS = 60 * 1000;
 const RENDER_RETRY_INITIAL_DELAY_MS = 250;
 const RENDER_RETRY_MAX_DELAY_MS = 5_000;
+const APPLICATION_INGESTION_RECOVERY_INTERVAL_MS = 30_000;
 // Discord caps message content at 2000 chars; leave headroom so the honest
 // "[truncated ...]" suffix lands instead of the adapter's silent "..." cut.
 // Link suppression adds two characters per URL. Keeping the raw chunk at 1500
@@ -1006,7 +1007,10 @@ function scheduleApplicationIngestionRecovery(
   backgroundWaitUntil(
     (async () => {
       await ready();
-      const recoverOutbox = async () => {
+      // The durable index can be large after an archive backfill. Coalesce
+      // timer ticks so a slow scan cannot retain multiple full key sets and
+      // grow the long-lived Gateway process until Kubernetes OOM-kills it.
+      const recoverOutbox = singleFlight(async () => {
         try {
           const pending = await recoverApplicationIngestion(options, state);
           if (pending > 0) {
@@ -1019,7 +1023,7 @@ function scheduleApplicationIngestionRecovery(
             error: errorMessage(error),
           });
         }
-      };
+      });
       const reconcileArchive = singleFlight(async () => {
         try {
           const observed = await reconcileDiscordArchive(options, state);
@@ -1042,7 +1046,7 @@ function scheduleApplicationIngestionRecovery(
       ]);
       const outboxTimer = setInterval(
         () => backgroundWaitUntil(recoverOutbox()),
-        5_000,
+        APPLICATION_INGESTION_RECOVERY_INTERVAL_MS,
       );
       outboxTimer.unref();
       if (archiveReconciliationEnabled) {
