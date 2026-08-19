@@ -4,6 +4,32 @@ import { reconcileDiscordArchive } from "../src/discord-reconciliation";
 import type { DiscordbotOptions } from "../src/types";
 
 describe("Discord archive reconciliation", () => {
+  it("discards failed Discord response bodies", async () => {
+    let cancelled = false;
+    const state = createMemoryState();
+    await state.connect();
+    const options = {
+      apiUrl: "http://centaur",
+      applicationId: "app",
+      botToken: "bot",
+      publicKey: "key",
+      discordApiUrl: "http://discord",
+      guildAllowlist: ["1"],
+      applicationIngestionUrl: "http://application.local/v1/discord/events",
+      applicationIngestionToken: "secret",
+      fetch: async () => new Response(new ReadableStream({
+        cancel() {
+          cancelled = true;
+        },
+      }), { status: 503 }),
+    } satisfies DiscordbotOptions;
+
+    await expect(reconcileDiscordArchive(options, state)).rejects.toThrow(
+      "Discord reconciliation returned 503",
+    );
+    expect(cancelled).toBeTrue();
+  });
+
   it("backfills messages and advances a per-channel checkpoint", async () => {
     const state = createMemoryState();
     await state.connect();

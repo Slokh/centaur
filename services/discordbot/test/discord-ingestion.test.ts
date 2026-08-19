@@ -9,6 +9,35 @@ import {
 import type { DiscordbotOptions } from "../src/types";
 
 describe("Discord application ingestion", () => {
+  it("discards successful application response bodies", async () => {
+    let cancelled = false;
+    const options = {
+      apiUrl: "http://centaur",
+      applicationId: "app",
+      botToken: "bot",
+      publicKey: "key",
+      applicationIngestionUrl: "http://application.local/v1/discord/events",
+      applicationIngestionToken: "ingest-secret",
+      fetch: async () => new Response(new ReadableStream({
+        cancel() {
+          cancelled = true;
+        },
+      }), { status: 200 }),
+    } satisfies DiscordbotOptions;
+
+    await ingestObservedDiscordMessage(options, {
+      guildId: "G1",
+      channelId: "C1",
+      messageId: "M0",
+      authorId: "U1",
+      content: "release the response",
+      createdAt: "2026-08-10T10:00:00.000Z",
+      attachments: [],
+    });
+
+    expect(cancelled).toBeTrue();
+  });
+
   it("normalizes a thread message and sends an idempotent source key", async () => {
     let request: Request | undefined;
     const options = {

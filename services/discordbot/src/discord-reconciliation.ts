@@ -5,6 +5,7 @@ import {
   type ObservedDiscordMessage,
 } from "./discord-ingestion";
 import type { DiscordbotOptions } from "./types";
+import { discardResponseBody } from "./utils";
 
 type DiscordChannel = {
   id: string;
@@ -354,11 +355,13 @@ async function discordGet<T>(options: DiscordbotOptions, path: string): Promise<
     });
     if (response.ok) return response.json() as Promise<T>;
     if (response.status !== 429 || attempt === 4) {
+      await discardResponseBody(response);
       throw new DiscordReconciliationError(response.status, path);
     }
     const payload = await response.clone().json().catch(() => ({})) as {
       retry_after?: unknown;
     };
+    await discardResponseBody(response);
     const retrySeconds = typeof payload.retry_after === "number"
       ? payload.retry_after
       : 1;
