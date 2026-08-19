@@ -1,6 +1,9 @@
 import { createGatewayController } from "./gateway";
 import { createDiscordbot, type DiscordbotOptions } from "./index";
 import { resolveDiscordVisibleChannelIds } from "./discord-visibility";
+import { PostgresApplicationIngestionOutbox } from "./application-ingestion-outbox";
+import { errorMessage } from "./utils";
+import pg from "pg";
 
 const port = numberEnv("PORT", 3001);
 const apiUrl = stringEnv("CENTAUR_API_URL", "http://127.0.0.1:8080");
@@ -31,14 +34,45 @@ if (!postgresUrl) {
   );
 }
 
+const applicationIngestionUrl = optionalEnv(
+  "DISCORDBOT_APPLICATION_INGESTION_URL",
+);
+const applicationIngestionToken = optionalEnv(
+  "DISCORDBOT_APPLICATION_INGESTION_TOKEN",
+);
+const applicationWorkerEnabled =
+  optionalEnv("DISCORDBOT_APPLICATION_WORKER_ENABLED") === "true";
+const applicationIngestionPool =
+  applicationWorkerEnabled &&
+  applicationIngestionUrl &&
+  applicationIngestionToken
+    ? new pg.Pool({
+        connectionString: postgresUrl,
+        connectionTimeoutMillis: 5_000,
+        max: 2,
+        query_timeout: 5_000,
+      })
+    : undefined;
+applicationIngestionPool?.on("error", (error) => {
+  log("warn", "discordbot_application_outbox_pool_error", {
+    error: errorMessage(error),
+  });
+});
+const applicationIngestionOutbox =
+  applicationIngestionPool
+    ? new PostgresApplicationIngestionOutbox({
+        keyPrefix: optionalEnv("DISCORDBOT_STATE_KEY_PREFIX"),
+        pool: applicationIngestionPool,
+      })
+    : undefined;
+
 const options: DiscordbotOptions = {
   activeExecutionTtlMs: optionalNumberEnv("DISCORDBOT_ACTIVE_EXECUTION_TTL_MS"),
   apiUrl,
   apiKey: optionalEnv("DISCORDBOT_API_KEY"),
-  applicationIngestionUrl: optionalEnv("DISCORDBOT_APPLICATION_INGESTION_URL"),
-  applicationIngestionToken: optionalEnv(
-    "DISCORDBOT_APPLICATION_INGESTION_TOKEN",
-  ),
+  applicationIngestionUrl,
+  applicationIngestionToken,
+  applicationIngestionOutbox,
   applicationArchiveReconciliationEnabled:
     optionalEnv("DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_ENABLED") !==
     "false",
@@ -103,6 +137,7 @@ const shutdown = async (signal: string): Promise<void> => {
   log("info", "discordbot_shutdown_started", { signal });
   await gateway.shutdown();
   await chat.shutdown().catch(() => undefined);
+  await applicationIngestionOutbox?.disconnect().catch(() => undefined);
   server.stop();
   log("info", "discordbot_shutdown_complete", { signal });
   process.exit(0);

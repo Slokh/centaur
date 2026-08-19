@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import { createMemoryState } from "@chat-adapter/state-memory";
+import { MemoryApplicationIngestionOutbox } from "../src/application-ingestion-outbox";
 import { reconcileDiscordArchive } from "../src/discord-reconciliation";
 import type { DiscordbotOptions } from "../src/types";
 
@@ -303,6 +304,54 @@ describe("Discord archive reconciliation", () => {
     );
     expect(await reconcileDiscordArchive(options, state)).toBe(1);
     expect(latestPageRequests).toBe(2);
+  });
+
+  it("advances a checkpoint after durable enqueue without awaiting application HTTP", async () => {
+    const state = createMemoryState();
+    const outbox = new MemoryApplicationIngestionOutbox();
+    await state.connect();
+    await outbox.connect();
+    let applicationRequests = 0;
+    let latestPageRequests = 0;
+    const options = {
+      apiUrl: "http://centaur",
+      applicationId: "app",
+      applicationIngestionOutbox: outbox,
+      applicationIngestionToken: "secret",
+      applicationIngestionUrl: "http://application.local/v1/discord/events",
+      botToken: "bot",
+      discordApiUrl: "http://discord",
+      guildAllowlist: ["1"],
+      publicKey: "key",
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        if (request.url.startsWith("http://application.local")) {
+          applicationRequests += 1;
+          return new Response("unavailable", { status: 503 });
+        }
+        if (request.url.endsWith("/guilds/1/channels")) {
+          return Response.json([{ id: "10", type: 0, name: "general" }]);
+        }
+        if (request.url.endsWith("/guilds/1/threads/active")) {
+          return Response.json({ threads: [] });
+        }
+        if (request.url.includes("/channels/10/threads/archived/public")) {
+          return Response.json({ threads: [], has_more: false });
+        }
+        if (request.url.includes("/channels/10/messages")) {
+          if (request.url.includes("after=")) return Response.json([]);
+          latestPageRequests += 1;
+          return Response.json([message("20")]);
+        }
+        return Response.json([]);
+      },
+    } satisfies DiscordbotOptions;
+
+    expect(await reconcileDiscordArchive(options, state)).toBe(1);
+    expect(await outbox.pendingCount()).toBe(2);
+    expect(applicationRequests).toBe(0);
+    expect(await reconcileDiscordArchive(options, state)).toBe(0);
+    expect(latestPageRequests).toBe(1);
   });
 
   it("skips inaccessible channels without interrupting other channel backfills", async () => {

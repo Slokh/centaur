@@ -94,12 +94,8 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%s%s" .Values.secretManager.envPrefix .Values.discordbot.applicationIngestion.tokenSecretKey }}
-            - name: DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_ENABLED
-              value: {{ .Values.discordbot.applicationIngestion.archiveReconciliation.enabled | quote }}
-            - name: DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_INTERVAL_SECONDS
-              value: {{ .Values.discordbot.applicationIngestion.archiveReconciliation.intervalSeconds | quote }}
-            - name: DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_CONCURRENCY
-              value: {{ .Values.discordbot.applicationIngestion.archiveReconciliation.concurrency | quote }}
+            - name: DISCORDBOT_APPLICATION_WORKER_ENABLED
+              value: {{ .Values.discordbot.applicationIngestion.worker.enabled | quote }}
 {{- end }}
 {{- if .Values.discordbot.mentionRoleIds }}
             - name: DISCORD_MENTION_ROLE_IDS
@@ -121,17 +117,17 @@ spec:
           # kill the pod mid-login (each restart burns the 1000/24h IDENTIFY budget).
           startupProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: 3001
             periodSeconds: 5
             failureThreshold: 24
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: 3001
           livenessProbe:
             httpGet:
-              path: /health
+              path: /live
               port: 3001
             periodSeconds: 15
           securityContext:

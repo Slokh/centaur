@@ -698,6 +698,19 @@ discordbot:
     enabled: false
     url: ""
     tokenSecretKey: DISCORDBOT_APPLICATION_INGESTION_TOKEN
+    # Run delivery recovery and Discord REST reconciliation outside the
+    # singleton Gateway process so background failures cannot disconnect chat.
+    worker:
+      enabled: true
+      recoveryIntervalMs: 1000
+      batchSize: 25
+      concurrency: 4
+      leaseMs: 300000
+      deliveryTimeoutMs: 15000
+      archiveBacklogHighWatermark: 10000
+      applicationEgressPorts:
+        - 443
+      resources: {}
     archiveReconciliation:
       enabled: true
       intervalSeconds: 60

@@ -16,7 +16,7 @@ import {
   type StateAdapter,
   type Thread,
 } from "chat";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import pg from "pg";
 import {
   discordTurnDeliveryKey,
@@ -31,10 +31,8 @@ import {
   ingestDeletedDiscordMessage,
   ingestObservedDiscordChannel,
   ingestObservedDiscordMessage,
-  recoverApplicationIngestion,
 } from "./discord-ingestion";
 import { fetchThreadStarterMessage } from "./discord-starter";
-import { reconcileDiscordArchive } from "./discord-reconciliation";
 import {
   deriveThreadName,
   fetchDiscordChannelName,
@@ -103,7 +101,6 @@ const RENDER_RECOVERY_LEASE_TTL_MS = 2 * 60 * 1000;
 const RENDER_LEASE_REFRESH_INTERVAL_MS = 60 * 1000;
 const RENDER_RETRY_INITIAL_DELAY_MS = 250;
 const RENDER_RETRY_MAX_DELAY_MS = 5_000;
-const APPLICATION_INGESTION_RECOVERY_INTERVAL_MS = 30_000;
 // Discord caps message content at 2000 chars; leave headroom so the honest
 // "[truncated ...]" suffix lands instead of the adapter's silent "..." cut.
 // Link suppression adds two characters per URL. Keeping the raw chunk at 1500
@@ -227,7 +224,12 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
   // gate, recovery tasks and Gateway initialization race independent
   // state.connect() calls, and Chat.initialize() can terminate the process on
   // the first ECONNREFUSED while Postgres is moving between nodes.
-  const ready = singleFlight(() => ensureStateConnected(state, options));
+  const ready = singleFlight(async () => {
+    await Promise.all([
+      ensureStateConnected(state, options),
+      ensureApplicationOutboxConnected(options),
+    ]);
+  });
   const discord = createDiscordAdapter({
     apiUrl: options.discordApiUrl,
     applicationId: options.applicationId,
@@ -238,15 +240,27 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
       // Observation is a durable background concern, not part of Discord's
       // acknowledgement path. Even the outbox's state writes may involve a
       // remote database and must not delay mention routing, typing, or 👀.
-      backgroundWaitUntil(ingestObservedDiscordMessage(options, message, state));
+      observeApplicationIngestion(
+        ingestObservedDiscordMessage(options, message),
+        options,
+        "message",
+      );
     },
     onMessageDeleted: async (message) => {
       if (!isAllowedDiscordGuild(message.guildId, options)) return;
-      backgroundWaitUntil(ingestDeletedDiscordMessage(options, message, state));
+      observeApplicationIngestion(
+        ingestDeletedDiscordMessage(options, message),
+        options,
+        "message_delete",
+      );
     },
     onChannelObserved: async (channel) => {
       if (!isAllowedDiscordGuild(channel.guildId, options)) return;
-      backgroundWaitUntil(ingestObservedDiscordChannel(options, channel, state));
+      observeApplicationIngestion(
+        ingestObservedDiscordChannel(options, channel),
+        options,
+        "channel",
+      );
     },
     publicKey: options.publicKey,
     mentionRoleIds: options.mentionRoleIds,
@@ -330,10 +344,6 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
       DEFAULT_MAX_CONCURRENT_EXECUTIONS_PER_GUILD,
   );
 
-  if (options.applicationIngestionUrl && options.applicationIngestionToken) {
-    scheduleApplicationIngestionRecovery(state, options, ready);
-  }
-
   chat.onNewMention(async (thread, message, context) => {
     if (!isAllowedDiscordMessage(message, options, logger)) return;
     await thread.subscribe();
@@ -358,15 +368,28 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
   });
 
   const app = new Hono();
-  app.get("/health", (c) => {
+  app.get("/live", (c) => c.json({ ok: true, service: "discordbot" }));
+  const readiness = async (c: Context) => {
     const gatewayActive = options.isGatewayActive
       ? options.isGatewayActive()
       : true;
-    return c.json(
-      { ok: gatewayActive, service: "discordbot", gateway: gatewayActive },
-      gatewayActive ? 200 : 503,
+    const stateReady = await isStateHealthy(
+      state,
+      options.applicationIngestionOutbox,
     );
-  });
+    const readyNow = gatewayActive && stateReady;
+    return c.json(
+      {
+        ok: readyNow,
+        service: "discordbot",
+        gateway: gatewayActive,
+        state: stateReady,
+      },
+      readyNow ? 200 : 503,
+    );
+  };
+  app.get("/ready", readiness);
+  app.get("/health", readiness);
 
   if (options.recoverRenderObligationsOnStart !== false) {
     scheduleRenderObligationRecovery(chat, state, options, ready);
@@ -395,7 +418,11 @@ function createDefaultState(
   // while the pod's network is still being programmed at startup). With no
   // listener, node-postgres rethrows it as an uncaught exception and the process
   // crashes/spews. Logging and swallowing lets the pool reconnect on the next query.
-  const pool = new pg.Pool({ connectionString: options.postgresUrl });
+  const pool = new pg.Pool({
+    connectionString: options.postgresUrl,
+    connectionTimeoutMillis: 5_000,
+    query_timeout: 5_000,
+  });
   pool.on("error", (error) => {
     stateLogger.warn("postgres pool error", { error: errorMessage(error) });
   });
@@ -438,6 +465,50 @@ async function ensureStateConnected(
       });
       await sleep(delayMs);
     }
+  }
+}
+
+async function ensureApplicationOutboxConnected(
+  options: DiscordbotOptions,
+): Promise<void> {
+  const outbox = options.applicationIngestionOutbox;
+  if (!outbox) return;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await outbox.connect();
+      if (attempt > 0) {
+        traceLog(options, "discordbot_application_outbox_connected", undefined, {
+          attempts: attempt + 1,
+        });
+      }
+      return;
+    } catch (error) {
+      const delayMs = Math.min(
+        POSTGRES_CONNECT_INITIAL_DELAY_MS * 2 ** attempt,
+        POSTGRES_CONNECT_MAX_DELAY_MS,
+      );
+      traceLog(options, "discordbot_application_outbox_connect_retry", undefined, {
+        attempt: attempt + 1,
+        delay_ms: delayMs,
+        error: errorMessage(error),
+      });
+      await sleep(delayMs);
+    }
+  }
+}
+
+async function isStateHealthy(
+  state: StateAdapter,
+  outbox: DiscordbotOptions["applicationIngestionOutbox"],
+): Promise<boolean> {
+  try {
+    await Promise.all([
+      state.get("discordbot:health"),
+      outbox?.healthCheck(),
+    ]);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -996,70 +1067,6 @@ function scheduleRenderObligationRecovery(
 ): void {
   backgroundWaitUntil(
     recoverRenderObligationsWithRetry(chat, state, options, ready),
-  );
-}
-
-function scheduleApplicationIngestionRecovery(
-  state: StateAdapter,
-  options: DiscordbotOptions,
-  ready: () => Promise<void>,
-): void {
-  backgroundWaitUntil(
-    (async () => {
-      await ready();
-      // The durable index can be large after an archive backfill. Coalesce
-      // timer ticks so a slow scan cannot retain multiple full key sets and
-      // grow the long-lived Gateway process until Kubernetes OOM-kills it.
-      const recoverOutbox = singleFlight(async () => {
-        try {
-          const pending = await recoverApplicationIngestion(options, state);
-          if (pending > 0) {
-            traceLog(options, "discordbot_application_ingestion_pending", undefined, {
-              pending_count: pending,
-            });
-          }
-        } catch (error) {
-          traceLog(options, "discordbot_application_ingestion_recovery_failed", undefined, {
-            error: errorMessage(error),
-          });
-        }
-      });
-      const reconcileArchive = singleFlight(async () => {
-        try {
-          const observed = await reconcileDiscordArchive(options, state);
-          if (observed > 0) {
-            traceLog(options, "discordbot_application_archive_reconciled", undefined, {
-              observed_count: observed,
-            });
-          }
-        } catch (error) {
-          traceLog(options, "discordbot_application_archive_reconciliation_failed", undefined, {
-            error: errorMessage(error),
-          });
-        }
-      });
-      const archiveReconciliationEnabled =
-        options.applicationArchiveReconciliationEnabled !== false;
-      await Promise.all([
-        recoverOutbox(),
-        ...(archiveReconciliationEnabled ? [reconcileArchive()] : []),
-      ]);
-      const outboxTimer = setInterval(
-        () => backgroundWaitUntil(recoverOutbox()),
-        APPLICATION_INGESTION_RECOVERY_INTERVAL_MS,
-      );
-      outboxTimer.unref();
-      if (archiveReconciliationEnabled) {
-        const archiveTimer = setInterval(
-          () => backgroundWaitUntil(reconcileArchive()),
-          Math.max(
-            1_000,
-            options.applicationArchiveReconciliationIntervalMs ?? 60_000,
-          ),
-        );
-        archiveTimer.unref();
-      }
-    })(),
   );
 }
 
@@ -1802,6 +1809,21 @@ function backgroundWaitUntil(promise: Promise<unknown>): void {
   // Discord ingress runs in a long-lived Gateway process (no per-request waitUntil);
   // background work just needs its rejections swallowed after they are traced.
   void promise.catch(() => undefined);
+}
+
+function observeApplicationIngestion(
+  promise: Promise<unknown>,
+  options: DiscordbotOptions,
+  observationType: string,
+): void {
+  backgroundWaitUntil(
+    promise.catch((error) => {
+      traceLog(options, "discordbot_application_ingestion_enqueue_failed", undefined, {
+        error: errorMessage(error),
+        observation_type: observationType,
+      });
+    }),
+  );
 }
 
 // Mirrors slackbotv2's rendererOptions: forwards the configured mapper and
