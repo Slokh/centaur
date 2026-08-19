@@ -76,6 +76,47 @@ describe("Discord replay context", () => {
     expect(result.source_message_id).toBe("10");
     expect(attempts).toBeGreaterThan(1);
   });
+
+  test("uses a forwarded snapshot without crossing into its source channel", async () => {
+    const forwarded = {
+      ...message("10", "member", "", "99"),
+      message_reference: { channel_id: "3", message_id: "99" },
+      message_snapshots: [
+        { message: { content: "Original answer from another channel" } },
+      ],
+    };
+    const messages = new Map([
+      ["10", forwarded],
+      ["11", message("11", "member", "why?", "10")],
+      ["12", message("12", "ai", "final", "11", true)],
+    ]);
+    const requested: string[] = [];
+    const fetch = async (input: RequestInfo | URL) => {
+      const url = String(input);
+      requested.push(url);
+      if (url.endsWith("/channels/2")) return json({ id: "2", type: 0 });
+      if (url.includes("/messages?")) return json([...messages.values()].slice(1));
+      const id = url.match(/\/messages\/(\d+)$/)?.[1];
+      if (id) return json(messages.get(id));
+      if (url.endsWith("/guilds/1/members/member")) return json({ roles: [] });
+      if (url.endsWith("/guilds/1/roles")) {
+        return json([{ id: "1", permissions: String(1n << 10n) }]);
+      }
+      if (url.endsWith("/guilds/1/channels")) return json([{ id: "2", type: 0 }]);
+      return new Response(null, { status: 404 });
+    };
+    const result = await resolveDiscordReplayContext({
+      applicationId: "ai",
+      botToken: "secret",
+      fetch: fetch as typeof globalThis.fetch,
+      reference: "https://discord.com/channels/1/2/12",
+    });
+    expect(result.messages.map((item) => item.text)).toEqual([
+      "[forwarded message] Original answer from another channel",
+      "why?",
+    ]);
+    expect(requested.some((url) => url.includes("/channels/3/"))).toBe(false);
+  });
 });
 
 function message(

@@ -1,5 +1,6 @@
 import { DEFAULT_DISCORD_API_URL } from "./discord-threading";
 import { resolveDiscordVisibleChannelIds } from "./discord-visibility";
+import { withDiscordMessageText } from "./discord-starter";
 
 type DiscordAuthor = {
   bot?: boolean;
@@ -14,7 +15,8 @@ type DiscordMessage = {
   channel_id: string;
   content?: string;
   id: string;
-  message_reference?: { message_id?: string };
+  message_reference?: { channel_id?: string; message_id?: string };
+  message_snapshots?: Array<{ message?: Record<string, unknown> }>;
   timestamp: string;
 };
 
@@ -79,10 +81,13 @@ export async function resolveDiscordReplayContext(input: {
   let cursor = target;
   const visited = new Set<string>([target.id]);
   for (let depth = 0; depth < 50; depth += 1) {
+    if ((cursor.message_snapshots?.length ?? 0) > 0) break;
     const parentId = cursor.message_reference?.message_id;
     if (!parentId || visited.has(parentId)) break;
+    const parentChannelId =
+      cursor.message_reference?.channel_id ?? cursor.channel_id;
     const parent = await getJson<DiscordMessage>(
-      `/channels/${parsed.channelId}/messages/${parentId}`,
+      `/channels/${parentChannelId}/messages/${parentId}`,
     );
     ancestors.push(parent);
     visited.add(parent.id);
@@ -169,7 +174,7 @@ export function parseDiscordPermalink(reference: string): {
 }
 
 function replayText(message: DiscordMessage): string {
-  const content = message.content?.trim() ?? "";
+  const content = withDiscordMessageText(message.content?.trim() ?? "", message);
   const attachments = (message.attachments ?? [])
     .map((attachment) =>
       `[attachment: ${attachment.filename ?? attachment.id}${

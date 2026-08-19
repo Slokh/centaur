@@ -176,6 +176,16 @@ describe("withDiscordEmbedText", () => {
     expect(text).toBe("heads up\n\n[embed] Alert\nsomething broke");
   });
 
+  it("flattens forwarded message snapshots", () => {
+    expect(
+      withDiscordEmbedText("", {
+        message_snapshots: [
+          { message: { content: "Original answer", embeds: [] } },
+        ],
+      }),
+    ).toBe("[forwarded message] Original answer");
+  });
+
   it("returns the text unchanged without embeds", () => {
     expect(withDiscordEmbedText("plain", { embeds: [] })).toBe("plain");
     expect(withDiscordEmbedText("plain", undefined)).toBe("plain");

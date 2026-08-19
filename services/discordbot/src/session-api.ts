@@ -1,7 +1,7 @@
 import type { RustSessionStreamEvent } from "@centaur/harness-events";
 import type { Attachment, Message } from "chat";
 import { parseDiscordThreadKey } from "./discord-allowlist";
-import { withDiscordEmbedText } from "./discord-starter";
+import { withDiscordMessageText } from "./discord-starter";
 import type {
   DiscordbotApiAttachment,
   DiscordbotApiMessage,
@@ -142,7 +142,7 @@ function discordApiErrorCode(error: unknown): number | undefined {
   return undefined;
 }
 
-// Discord delta (no slackbotv2 analog): sticker-only/forwarded/poll/system
+// Discord delta (no slackbotv2 analog): sticker-only/poll/system
 // mentions serialize to empty text with no attachments; executing them would
 // fabricate a synthetic "continue" turn. Callers skip execution and react ❓.
 export function isContentlessApiMessage(
@@ -173,7 +173,7 @@ export async function serializeMessage(
     raw: message.raw,
     // Discord delta: webhook-style messages (Sentry alerts etc.) carry their
     // payload in embeds, which the chat adapter drops from `text`.
-    text: withDiscordEmbedText(message.text, message.raw),
+    text: withDiscordMessageText(message.text, message.raw),
     threadId: message.threadId,
     timestamp: message.metadata.dateSent.toISOString(),
   };

@@ -63,21 +63,124 @@ export async function fetchThreadStarterMessage(
   }
 }
 
+/** Recover the bounded visible reply chain when an inline session starts mid-chain. */
+export async function fetchInlineReplyContext(
+  options: DiscordbotOptions,
+  threadKey: string,
+  currentMessage: DiscordbotApiMessage,
+  logger: Logger,
+): Promise<DiscordbotApiMessage[]> {
+  const parsed = parseDiscordThreadKey(threadKey);
+  if (!parsed.replyToMessageId || !isJsonObject(currentMessage.raw)) {
+    return [currentMessage];
+  }
+
+  const fetchFn = options.fetch ?? fetch;
+  const apiBase = (options.discordApiUrl ?? DEFAULT_DISCORD_API_URL).replace(
+    /\/$/,
+    "",
+  );
+  const messages = [currentMessage];
+  const visited = new Set<string>([currentMessage.id]);
+  let cursor = currentMessage.raw;
+
+  for (let depth = 0; depth < 32; depth += 1) {
+    const reference = isJsonObject(cursor.message_reference)
+      ? cursor.message_reference
+      : undefined;
+    const parentId = nonEmptyString(reference?.message_id);
+    if (!parentId || visited.has(parentId)) break;
+
+    // A forward's immutable snapshot is visible in the destination and is
+    // flattened below. Do not cross into its source channel using bot authority.
+    if (hasForwardedSnapshot(cursor)) break;
+
+    const embeddedParent = isJsonObject(cursor.referenced_message)
+      ? cursor.referenced_message
+      : undefined;
+    let parent: JsonObject | undefined;
+    if (embeddedParent && embeddedParent.id === parentId) {
+      parent = embeddedParent;
+    } else {
+      const channelId =
+        nonEmptyString(reference?.channel_id) ??
+        nonEmptyString(cursor.channel_id) ??
+        parsed.channelId;
+      if (!channelId) break;
+      try {
+        const response = await fetchFn(
+          `${apiBase}/channels/${channelId}/messages/${parentId}`,
+          { headers: { authorization: `Bot ${options.botToken}` } },
+        );
+        if (!response.ok) {
+          logger.warn("discordbot_inline_reply_parent_fetch_failed", {
+            message_id: parentId,
+            status: response.status,
+          });
+          break;
+        }
+        const raw: unknown = await response.json();
+        if (!isJsonObject(raw)) break;
+        parent = raw;
+      } catch (error) {
+        logger.warn("discordbot_inline_reply_parent_fetch_error", {
+          error: error instanceof Error ? error.message : String(error),
+          message_id: parentId,
+        });
+        break;
+      }
+    }
+
+    const serialized = rawMessageToApiMessage(
+      parent,
+      threadKey,
+      options.applicationId,
+    );
+    if (!serialized) break;
+    messages.push(serialized);
+    visited.add(parentId);
+    cursor = parent;
+  }
+
+  return messages.reverse();
+}
+
 /**
  * Append flattened embed content to a message's text. Webhook-style messages
  * (Sentry alerts, GitHub notifications) carry their payload entirely in
  * `embeds` with empty `content`; the chat adapter only surfaces `content`, so
  * without this the agent sees an empty message.
  */
-export function withDiscordEmbedText(text: string, raw: unknown): string {
+export function withDiscordMessageText(text: string, raw: unknown): string {
   if (!isJsonObject(raw)) return text;
+  const snapshots = Array.isArray(raw.message_snapshots)
+    ? raw.message_snapshots
+    : [];
+  const snapshotText = snapshots
+    .map((snapshot) => {
+      if (!isJsonObject(snapshot) || !isJsonObject(snapshot.message)) return "";
+      const message = snapshot.message;
+      return withDiscordMessageText(
+        nonEmptyString(message.content) ?? "",
+        message,
+      );
+    })
+    .filter(Boolean)
+    .map((snapshot) => `[forwarded message] ${snapshot}`)
+    .join("\n\n");
   const embeds = Array.isArray(raw.embeds) ? raw.embeds : [];
   const embedText = embeds
     .map((embed) => embedToText(embed))
     .filter(Boolean)
     .join("\n\n");
-  if (!embedText) return text;
-  return text.trim() ? `${text}\n\n${embedText}` : embedText;
+  return [text.trim(), snapshotText, embedText].filter(Boolean).join("\n\n");
+}
+
+/** @deprecated Use withDiscordMessageText for all structured Discord text. */
+export const withDiscordEmbedText = withDiscordMessageText;
+
+function hasForwardedSnapshot(raw: JsonObject): boolean {
+  return Array.isArray(raw.message_snapshots) && raw.message_snapshots.length > 0;
 }
 
 function embedToText(embed: unknown): string {
@@ -112,7 +215,7 @@ function embedToText(embed: unknown): string {
   return `[embed] ${lines.join("\n")}`;
 }
 
-function rawMessageToApiMessage(
+export function rawMessageToApiMessage(
   raw: unknown,
   threadKey: string,
   botUserId: string,
@@ -133,7 +236,7 @@ function rawMessageToApiMessage(
     id: raw.id,
     isMention: false,
     raw,
-    text: withDiscordEmbedText(nonEmptyString(raw.content) ?? "", raw),
+    text: withDiscordMessageText(nonEmptyString(raw.content) ?? "", raw),
     threadId: threadKey,
     timestamp: nonEmptyString(raw.timestamp) ?? "",
   };

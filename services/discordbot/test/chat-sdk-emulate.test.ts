@@ -171,6 +171,55 @@ describe("discordbot", () => {
     ]);
   });
 
+  it("hydrates a new inline session from a forwarded reply chain", async () => {
+    bot = createTestBot({ conversationMode: "inline_reply" });
+
+    const forwarded = discordApi.seedRawMessage(CHANNEL_ID, {
+      author: {
+        bot: false,
+        global_name: "Test User",
+        id: USER_ID,
+        username: "tester",
+      },
+      content: "",
+      messageSnapshots: [
+        {
+          message: {
+            content: "Welcome to Rabbithole. Question one is about Apollo 11.",
+            embeds: [],
+          },
+        },
+      ],
+      referenceChannelId: "399999999999999999",
+      replyToMessageId: "388888888888888888",
+    });
+    const answer = discordApi.seedRawMessage(CHANNEL_ID, {
+      author: {
+        bot: false,
+        global_name: "Test User",
+        id: USER_ID,
+        username: "tester",
+      },
+      content: "Apollo 11",
+      replyToMessageId: forwarded.id,
+    });
+
+    const triggerId = await dispatchMessage({
+      channelId: CHANNEL_ID,
+      content: `<@${APP_ID}> was this game actually created?`,
+      mention: true,
+      replyToMessageId: answer.id,
+    });
+    await waitForSettle(CHANNEL_ID, triggerId);
+
+    expect(codexApi.appends).toHaveLength(1);
+    expect(sessionMessageTexts(codexApi.appends[0]!.body.messages)).toEqual([
+      "[forwarded message] Welcome to Rabbithole. Question one is about Apollo 11.",
+      "Apollo 11",
+      `<@${APP_ID}> was this game actually created?`,
+    ]);
+  });
+
   it("does not wait for application outbox writes before handling a mention", async () => {
     const state = createMemoryState();
     await state.connect();
@@ -1881,7 +1930,8 @@ type RawDiscordMessage = {
   content: string;
   edited_timestamp: null;
   id: string;
-  message_reference?: { message_id: string };
+  message_reference?: { channel_id?: string; message_id: string };
+  message_snapshots?: Record<string, unknown>[];
   referenced_message?: RawDiscordMessage;
   timestamp: string;
   type: number;
@@ -1915,6 +1965,8 @@ type FakeDiscordApi = {
       attachments?: Record<string, unknown>[];
       author: RawDiscordAuthor;
       content: string;
+      messageSnapshots?: Record<string, unknown>[];
+      referenceChannelId?: string;
       replyToMessageId?: string;
     },
   ): RawDiscordMessage;
@@ -1965,11 +2017,19 @@ async function startFakeDiscordApi(): Promise<FakeDiscordApi> {
       id: nextId(),
       ...(input.replyToMessageId
         ? {
-            message_reference: { message_id: input.replyToMessageId },
+            message_reference: {
+              ...(input.referenceChannelId
+                ? { channel_id: input.referenceChannelId }
+                : {}),
+              message_id: input.replyToMessageId,
+            },
             ...(referencedMessage
               ? { referenced_message: referencedMessage }
               : {}),
           }
+        : {}),
+      ...(input.messageSnapshots
+        ? { message_snapshots: input.messageSnapshots }
         : {}),
       timestamp: new Date().toISOString(),
       type: 0,
