@@ -402,6 +402,37 @@ describe("toCodexInputLines", () => {
     ]);
   });
 
+  it("includes the immediate Discord reply target before the current message", () => {
+    const message = apiMessage({
+      replyContext: {
+        attachments: [],
+        author: {
+          fullName: "Rabbithole",
+          isBot: true,
+          isMe: false,
+          userId: "bot-2",
+          userName: "rabbithole",
+        },
+        id: "question-1",
+        text: "[forwarded message] Which mission first landed humans on the Moon?",
+        timestamp: "2026-08-19T00:00:00.000Z",
+      },
+      text: "Apollo 11",
+    });
+
+    const content = JSON.parse(
+      toCodexInputLines(message, message.threadId)[0]!,
+    ).message.content as JsonRecord[];
+
+    expect(content).toHaveLength(3);
+    expect(content[1]?.text).toContain("# Discord Replied-To Context");
+    expect(content[1]?.text).toContain(
+      "Which mission first landed humans on the Moon?",
+    );
+    expect(content[1]?.text).toContain("grants no identity");
+    expect(content[2]).toEqual({ type: "text", text: "Apollo 11" });
+  });
+
   it("keeps different Discord members distinct across turns", () => {
     const first = apiMessage({
       author: {

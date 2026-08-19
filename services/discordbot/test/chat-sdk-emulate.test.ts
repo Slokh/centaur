@@ -220,6 +220,66 @@ describe("discordbot", () => {
     ]);
   });
 
+  it("injects the immediate reply target when reusing an inline session", async () => {
+    bot = createTestBot({ conversationMode: "inline_reply" });
+
+    const rootId = await dispatchMessage({
+      channelId: CHANNEL_ID,
+      content: `<@${APP_ID}> start a game`,
+      mention: true,
+    });
+    await waitForSettle(CHANNEL_ID, rootId);
+
+    const forwardedQuestion = discordApi.seedRawMessage(CHANNEL_ID, {
+      author: {
+        bot: true,
+        global_name: "Rabbithole",
+        id: APP_ID,
+        username: "rabbithole",
+      },
+      content: "",
+      messageSnapshots: [
+        {
+          message: {
+            content: "Which mission first landed humans on the Moon?",
+            embeds: [],
+          },
+        },
+      ],
+      replyToMessageId: rootId,
+    });
+    const answerId = await dispatchMessage({
+      channelId: CHANNEL_ID,
+      content: "Apollo 11",
+      mention: true,
+      replyToMessageId: forwardedQuestion.id,
+    });
+    await waitForSettle(CHANNEL_ID, answerId);
+
+    expect(codexApi.appends).toHaveLength(2);
+    expect(codexApi.executes).toHaveLength(2);
+    expect(codexApi.appends[1]?.threadKey).toBe(
+      `discord:${GUILD_ID}:${CHANNEL_ID}:reply~${rootId}`,
+    );
+    const parts = codexApi.appends[1]!.body.messages[0]!.parts;
+    const replyContext = parts.find(
+      (part) =>
+        isRecord(part) &&
+        typeof part.text === "string" &&
+        part.text.startsWith("# Discord Replied-To Context\n"),
+    );
+    expect(replyContext).toBeDefined();
+    expect(JSON.stringify(replyContext)).toContain(
+      "Which mission first landed humans on the Moon?",
+    );
+    expect(sessionMessageTexts(codexApi.appends[1]!.body.messages)).toEqual([
+      "Apollo 11",
+    ]);
+    expect(JSON.stringify(codexApi.executes[1]!.body.input_lines)).toContain(
+      "Which mission first landed humans on the Moon?",
+    );
+  });
+
   it("does not wait for application outbox writes before handling a mention", async () => {
     const state = createMemoryState();
     await state.connect();
@@ -1735,7 +1795,12 @@ function sessionMessageTexts(messages: DiscordbotSessionMessage[]): string[] {
         part.type === "text" &&
         typeof part.text === "string"
       ) {
-        if (part.text.startsWith("# Discord Requester Context\n")) return [];
+        if (
+          part.text.startsWith("# Discord Requester Context\n") ||
+          part.text.startsWith("# Discord Replied-To Context\n")
+        ) {
+          return [];
+        }
         return [part.text];
       }
       return [];

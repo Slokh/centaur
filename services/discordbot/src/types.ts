@@ -30,12 +30,22 @@ export type DiscordbotApiAttachment = {
   width?: number;
 };
 
+export type DiscordbotReplyContext = {
+  attachments: DiscordbotApiAttachment[];
+  author: DiscordbotApiAuthor;
+  id: string;
+  text: string;
+  timestamp: string;
+};
+
 export type DiscordbotApiMessage = {
   attachments: DiscordbotApiAttachment[];
   author: DiscordbotApiAuthor;
   id: string;
   isMention: boolean;
   raw: unknown;
+  /** Immediate Discord reply target, authenticated and bounded by ingress. */
+  replyContext?: DiscordbotReplyContext;
   text: string;
   threadId: string;
   timestamp: string;

@@ -522,9 +522,7 @@ def _discord_http_client(
         assert request.headers["Authorization"] == "Bot test-token"
         if request.url.path.endswith("/messages/1537142385174384830"):
             return httpx.Response(200, json=target_message)
-        if trigger_message and request.url.path.endswith(
-            f"/messages/{trigger_message['id']}"
-        ):
+        if trigger_message and request.url.path.endswith(f"/messages/{trigger_message['id']}"):
             return httpx.Response(200, json=trigger_message)
         if request.url.path.endswith("/channels/1407795944711524462"):
             return httpx.Response(
@@ -630,6 +628,55 @@ def test_discord_investigation_attributes_inline_reply_to_followup_turn(monkeypa
     assert result["parsed"]["thread_key"].endswith("reply~1537142298947756043")
     assert result["discord"]["source_message"]["content"] == "in japan"
     assert result["analysis"]["response_latency_ms"] == 5350
+
+
+def test_discord_findings_scope_warm_pool_events_to_current_execution() -> None:
+    source_time = dt.datetime(2026, 8, 19, 1, 0, 0, tzinfo=dt.UTC)
+    response_time = source_time + dt.timedelta(seconds=26)
+    postgres = {
+        "session_executions": {
+            "rows": [
+                {
+                    "execution_id": "exe_current",
+                    "created_at": source_time + dt.timedelta(milliseconds=480),
+                    "completed_at": response_time - dt.timedelta(milliseconds=80),
+                },
+                {
+                    "execution_id": "exe_old",
+                    "created_at": source_time - dt.timedelta(hours=8),
+                    "completed_at": source_time - dt.timedelta(hours=8) + dt.timedelta(seconds=3),
+                },
+            ]
+        },
+        "session_events": {
+            "rows": [
+                {
+                    "execution_id": "exe_old",
+                    "event_type": "session.warm_sandbox_claimed",
+                    "created_at": source_time - dt.timedelta(hours=8),
+                },
+                {
+                    "execution_id": "exe_current",
+                    "event_type": "session.sandbox_resumed",
+                    "created_at": source_time + dt.timedelta(seconds=7),
+                },
+            ]
+        },
+    }
+    discord = {
+        "source_message": {"id": "source", "timestamp": source_time.isoformat()},
+        "message": {"id": "response", "timestamp": response_time.isoformat(), "content": "ok"},
+    }
+
+    analysis = CentaurInvestigatorClient._discord_findings(
+        discord=discord,
+        postgres=postgres,
+        timeline=[],
+    )
+
+    assert analysis["warm_pool_hit"] is False
+    assert analysis["sandbox_resumed"] is True
+    assert "resumed its assigned sandbox" in analysis["summary"]
 
 
 def test_discord_investigation_can_omit_message_content(monkeypatch) -> None:
