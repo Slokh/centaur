@@ -36,6 +36,7 @@ const BACKFILL_PREFIX = "discordbot:application-ingestion:channel-backfill:";
 const BACKFILL_COMPLETE = "complete";
 const ARCHIVED_THREAD_CURSOR_PREFIX = "discordbot:application-ingestion:archived-thread-cursor:";
 const ARCHIVED_THREAD_SEEN_PREFIX = "discordbot:application-ingestion:archived-thread-seen:";
+const CHANNEL_SNAPSHOT_PREFIX = "discordbot:application-ingestion:channel-snapshot:";
 const PAGE_LIMIT = 10;
 const DEFAULT_CHANNEL_CONCURRENCY = 4;
 const MESSAGE_CHANNEL_TYPES = new Set([0, 5, 10, 11, 12]);
@@ -57,14 +58,7 @@ export async function reconcileDiscordArchive(
     const active = await discordGet<{ threads?: DiscordChannel[] }>(options, `/guilds/${guildId}/threads/active`);
     const channels = deduplicateChannels([...guildChannels, ...(active.threads ?? [])]);
     for (const channel of channels) {
-      await ingestObservedDiscordChannel(options, {
-        guildId,
-        channelId: channel.id,
-        name: channel.name,
-        kind: String(channel.type),
-        parentId: channel.parent_id ?? undefined,
-        deleted: false,
-      });
+      await reconcileObservedChannel(options, state, guildId, channel);
     }
     const messageChannels = channels.filter((channel) =>
       MESSAGE_CHANNEL_TYPES.has(channel.type)
@@ -106,6 +100,32 @@ export async function reconcileDiscordArchive(
     );
   }
   return observed;
+}
+
+async function reconcileObservedChannel(
+  options: DiscordbotOptions,
+  state: StateAdapter,
+  guildId: string,
+  channel: DiscordChannel,
+): Promise<void> {
+  const snapshotKey = `${CHANNEL_SNAPSHOT_PREFIX}${guildId}:${channel.id}`;
+  const snapshot = JSON.stringify({
+    name: channel.name ?? null,
+    kind: String(channel.type),
+    parentId: channel.parent_id ?? null,
+  });
+  if (await state.get<string>(snapshotKey) === snapshot) return;
+  await ingestObservedDiscordChannel(options, {
+    guildId,
+    channelId: channel.id,
+    name: channel.name,
+    kind: String(channel.type),
+    parentId: channel.parent_id ?? undefined,
+    deleted: false,
+  });
+  // Persist only after the observation is durably queued. A crash between
+  // these writes safely replays one idempotent channel upsert.
+  await state.set(snapshotKey, snapshot);
 }
 
 async function reconcileArchivedPublicThreads(
