@@ -1,10 +1,15 @@
 import type { DiscordbotFetch, DiscordbotOptions } from "./types";
-import type { StateAdapter } from "chat";
+import type {
+  ApplicationIngestionClaim,
+  ApplicationIngestionOutbox,
+} from "./application-ingestion-outbox";
 import { discardResponseBody } from "./utils";
 
-const INGESTION_INDEX_KEY = "discordbot:application-ingestion:index";
-const INGESTION_EVENT_PREFIX = "discordbot:application-ingestion:event:";
-const INGESTION_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+const DEFAULT_DELIVERY_TIMEOUT_MS = 15_000;
+const DEFAULT_RECOVERY_BATCH_SIZE = 25;
+const DEFAULT_RECOVERY_CONCURRENCY = 4;
+const DEFAULT_RECOVERY_LEASE_MS = 5 * 60_000;
+const MAX_RETRY_DELAY_MS = 15 * 60_000;
 
 export type ObservedDiscordMessage = {
   guildId: string;
@@ -37,13 +42,14 @@ export type ObservedDiscordMessage = {
 export async function ingestObservedDiscordMessage(
   options: DiscordbotOptions,
   message: ObservedDiscordMessage,
-  state?: StateAdapter,
+  outbox: ApplicationIngestionOutbox | undefined =
+    options.applicationIngestionOutbox,
 ): Promise<void> {
   if (!options.applicationIngestionUrl || !options.applicationIngestionToken) {
     return;
   }
   for (const event of messageIngestionEvents(message)) {
-    await persistAndPostIngestionEvent(options, state, event);
+    await persistIngestionEvent(options, outbox, event);
   }
 }
 
@@ -56,13 +62,14 @@ export async function ingestObservedDiscordMessage(
 export async function ingestObservedDiscordMessages(
   options: DiscordbotOptions,
   messages: readonly ObservedDiscordMessage[],
-  state?: StateAdapter,
+  outbox: ApplicationIngestionOutbox | undefined =
+    options.applicationIngestionOutbox,
 ): Promise<void> {
   if (messages.length === 0) return;
   const events = deduplicateEvents(messages.flatMap(messageIngestionEvents));
   const first = messages[0]!;
   const last = messages.at(-1)!;
-  await persistAndPostIngestionBatch(options, state, {
+  await persistIngestionEvent(options, outbox, {
     source_key: `batch:${first.guildId}:${first.channelId}:${first.messageId}:${last.messageId}`,
     events,
   });
@@ -84,9 +91,10 @@ export function discordAttachmentExpiry(url: string): string | null {
 export async function ingestDeletedDiscordMessage(
   options: DiscordbotOptions,
   message: { guildId: string; channelId: string; messageId: string; deletedAt: string },
-  state?: StateAdapter,
+  outbox: ApplicationIngestionOutbox | undefined =
+    options.applicationIngestionOutbox,
 ): Promise<void> {
-  await persistAndPostIngestionEvent(options, state, {
+  await persistIngestionEvent(options, outbox, {
     guild_id: message.guildId,
     source_key: `message-delete:${message.messageId}:${message.deletedAt}`,
     type: "message_delete",
@@ -99,9 +107,10 @@ export async function ingestDeletedDiscordMessage(
 export async function ingestObservedDiscordChannel(
   options: DiscordbotOptions,
   channel: { guildId: string; channelId: string; name?: string; kind: string; parentId?: string; deleted: boolean },
-  state?: StateAdapter,
+  outbox: ApplicationIngestionOutbox | undefined =
+    options.applicationIngestionOutbox,
 ): Promise<void> {
-  await persistAndPostIngestionEvent(options, state, channel.deleted ? {
+  await persistIngestionEvent(options, outbox, channel.deleted ? {
     guild_id: channel.guildId,
     source_key: `channel-delete:${channel.channelId}`,
     type: "channel_delete",
@@ -117,50 +126,15 @@ export async function ingestObservedDiscordChannel(
   });
 }
 
-async function persistAndPostIngestionEvent(
+async function persistIngestionEvent(
   options: DiscordbotOptions,
-  state: StateAdapter | undefined,
+  outbox: ApplicationIngestionOutbox | undefined,
   payload: Record<string, unknown>,
 ): Promise<void> {
-  if (!state) return postIngestionEvent(options, payload);
+  if (!outbox) return postIngestionEvent(options, payload);
   const sourceKey = String(payload.source_key ?? "");
   if (!sourceKey) throw new Error("application ingestion event lacks source_key");
-  const eventKey = `${INGESTION_EVENT_PREFIX}${sourceKey}`;
-  await state.set(eventKey, payload, INGESTION_RETENTION_MS);
-  await state.appendToList(INGESTION_INDEX_KEY, sourceKey, {
-    maxLength: 100_000,
-    ttlMs: INGESTION_RETENTION_MS,
-  });
-  // The durable outbox write above is the ingress contract. Application
-  // delivery must not sit on the mention/typing critical path: Discord's
-  // Gateway has already delivered the message and the application endpoint
-  // can be arbitrarily slow. Deliver in the background and retain the outbox
-  // entry on failure for the recovery loop. Source keys keep a recovery race
-  // or process restart idempotent at the application boundary.
-  void postIngestionEvent(options, payload)
-    .then(() => state.delete(eventKey))
-    .catch(() => undefined);
-}
-
-async function persistAndPostIngestionBatch(
-  options: DiscordbotOptions,
-  state: StateAdapter | undefined,
-  payload: Record<string, unknown>,
-): Promise<void> {
-  if (!state) return postIngestionEvent(options, payload);
-  const sourceKey = String(payload.source_key ?? "");
-  if (!sourceKey) throw new Error("application ingestion batch lacks source_key");
-  const eventKey = `${INGESTION_EVENT_PREFIX}${sourceKey}`;
-  await state.set(eventKey, payload, INGESTION_RETENTION_MS);
-  await state.appendToList(INGESTION_INDEX_KEY, sourceKey, {
-    maxLength: 100_000,
-    ttlMs: INGESTION_RETENTION_MS,
-  });
-  // Archive workers are already off the Gateway path. Await delivery here so
-  // channel concurrency also bounds load on the private application. A failed
-  // request remains in the durable outbox and prevents checkpoint advancement.
-  await postIngestionEvent(options, payload);
-  await state.delete(eventKey);
+  await outbox.enqueue(sourceKey, payload);
 }
 
 function messageIngestionEvents(
@@ -210,25 +184,50 @@ function deduplicateEvents(
   return [...new Map(events.map((event) => [String(event.source_key), event])).values()];
 }
 
+export type ApplicationIngestionRecoveryResult = {
+  claimed: number;
+  delivered: number;
+  failed: number;
+};
+
 export async function recoverApplicationIngestion(
   options: DiscordbotOptions,
-  state: StateAdapter,
-): Promise<number> {
-  if (!options.applicationIngestionUrl || !options.applicationIngestionToken) return 0;
-  const sourceKeys = Array.from(new Set(await state.getList<string>(INGESTION_INDEX_KEY)));
-  let pending = 0;
-  for (const sourceKey of sourceKeys) {
-    const eventKey = `${INGESTION_EVENT_PREFIX}${sourceKey}`;
-    const payload = await state.get<Record<string, unknown>>(eventKey);
-    if (!payload) continue;
-    try {
-      await postIngestionEvent(options, payload);
-      await state.delete(eventKey);
-    } catch {
-      pending += 1;
-    }
+  outbox: ApplicationIngestionOutbox = requiredOutbox(options),
+): Promise<ApplicationIngestionRecoveryResult> {
+  if (!options.applicationIngestionUrl || !options.applicationIngestionToken) {
+    return { claimed: 0, delivered: 0, failed: 0 };
   }
-  return pending;
+  const claims = await outbox.claim(
+    options.applicationIngestionRecoveryBatchSize ??
+      DEFAULT_RECOVERY_BATCH_SIZE,
+    options.applicationIngestionRecoveryLeaseMs ?? DEFAULT_RECOVERY_LEASE_MS,
+  );
+  let delivered = 0;
+  let failed = 0;
+  const concurrency = Math.max(
+    1,
+    Math.min(
+      claims.length,
+      options.applicationIngestionRecoveryConcurrency ??
+        DEFAULT_RECOVERY_CONCURRENCY,
+    ),
+  );
+  let cursor = 0;
+  await Promise.all(
+    Array.from({ length: concurrency }, async () => {
+      for (;;) {
+        const claim = claims[cursor++];
+        if (!claim) return;
+        if (await deliverClaim(options, outbox, claim)) delivered += 1;
+        else failed += 1;
+      }
+    }),
+  );
+  return {
+    claimed: claims.length,
+    delivered,
+    failed,
+  };
 }
 
 async function postIngestionEvent(
@@ -237,6 +236,9 @@ async function postIngestionEvent(
 ): Promise<void> {
   if (!options.applicationIngestionUrl || !options.applicationIngestionToken) return;
   const fetchFn: DiscordbotFetch = options.fetch ?? fetch;
+  const timeoutMs =
+    options.applicationIngestionDeliveryTimeoutMs ??
+    DEFAULT_DELIVERY_TIMEOUT_MS;
   const response = await fetchFn(options.applicationIngestionUrl, {
     method: "POST",
     headers: {
@@ -244,9 +246,39 @@ async function postIngestionEvent(
       "content-type": "application/json",
     },
     body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(timeoutMs),
   });
   await discardResponseBody(response);
   if (!response.ok) {
     throw new Error(`application ingestion returned ${response.status}`);
   }
+}
+
+async function deliverClaim(
+  options: DiscordbotOptions,
+  outbox: ApplicationIngestionOutbox,
+  claim: ApplicationIngestionClaim,
+): Promise<boolean> {
+  try {
+    await postIngestionEvent(options, claim.payload);
+    return await outbox.acknowledge(claim);
+  } catch (error) {
+    await outbox.retry(
+      claim,
+      retryDelayMs(claim.attempt),
+      error instanceof Error ? error.message : String(error),
+    );
+    return false;
+  }
+}
+
+function retryDelayMs(attempt: number): number {
+  return Math.min(1_000 * 2 ** Math.min(Math.max(attempt - 1, 0), 10), MAX_RETRY_DELAY_MS);
+}
+
+function requiredOutbox(options: DiscordbotOptions): ApplicationIngestionOutbox {
+  if (!options.applicationIngestionOutbox) {
+    throw new Error("application ingestion recovery requires a durable outbox");
+  }
+  return options.applicationIngestionOutbox;
 }

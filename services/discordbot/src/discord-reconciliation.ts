@@ -64,7 +64,7 @@ export async function reconcileDiscordArchive(
         kind: String(channel.type),
         parentId: channel.parent_id ?? undefined,
         deleted: false,
-      }, state);
+      });
     }
     const messageChannels = channels.filter((channel) =>
       MESSAGE_CHANNEL_TYPES.has(channel.type)
@@ -200,7 +200,6 @@ async function reconcileUnseenArchivedThreads(
         parentId: thread.parent_id ?? undefined,
         deleted: false,
       },
-      state,
     );
     observed += await reconcileChannel(options, state, guildId, thread);
     // Marking seen is the final step. Failure before this point replays an
@@ -250,7 +249,6 @@ async function reconcileChannel(
     await ingestObservedDiscordMessages(
       options,
       messages.map((message) => normalizeMessage(guildId, channel, message)),
-      state,
     );
     observed += messages.length;
     after = messages.at(-1)!.id;
@@ -270,7 +268,6 @@ async function reconcileChannel(
     await ingestObservedDiscordMessages(
       options,
       messages.map((message) => normalizeMessage(guildId, channel, message)),
-      state,
     );
     after = messages.at(-1)!.id;
     await state.set(checkpointKey, after);
@@ -295,7 +292,6 @@ async function reconcileChannel(
     await ingestObservedDiscordMessages(
       options,
       messages.map((message) => normalizeMessage(guildId, channel, message)),
-      state,
     );
     observed += messages.length;
     before = messages.length < 100 ? BACKFILL_COMPLETE : messages[0]!.id;

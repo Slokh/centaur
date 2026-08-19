@@ -1,8 +1,10 @@
 import { beforeEach, describe, expect, it } from "bun:test";
+import { createMemoryState } from "@chat-adapter/state-memory";
 import type { Logger, Thread } from "chat";
 import {
   buildDiscordResponseFooter,
   clearConversationNameCacheForTests,
+  createDiscordbot,
   hasLiveActiveExecution,
   postBufferedAnswerToThread,
   resolveDiscordConversationName,
@@ -20,6 +22,32 @@ const noopLogger = {
     return noopLogger;
   },
 } as unknown as Logger;
+
+describe("Discordbot health", () => {
+  it("keeps process liveness separate from Gateway readiness", async () => {
+    const state = createMemoryState();
+    let gatewayActive = false;
+    const bot = createDiscordbot({
+      apiUrl: "http://localhost",
+      applicationId: "app",
+      botToken: "token",
+      guildAllowlist: ["guild"],
+      isGatewayActive: () => gatewayActive,
+      logger: noopLogger,
+      publicKey: "key",
+      recoverRenderObligationsOnStart: false,
+      state,
+    });
+    await bot.ready();
+
+    expect((await bot.app.request("/live")).status).toBe(200);
+    expect((await bot.app.request("/ready")).status).toBe(503);
+    gatewayActive = true;
+    expect((await bot.app.request("/ready")).status).toBe(200);
+    expect((await bot.app.request("/health")).status).toBe(200);
+    await bot.chat.shutdown();
+  });
+});
 
 describe("hasLiveActiveExecution", () => {
   it("is false when no execution is marked", () => {

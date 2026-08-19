@@ -2625,29 +2625,28 @@ async function handleMockCodexRequest(
       input.streams.delete(res);
       input.streamThreadKeys.delete(res);
     });
-    // Do not expose the stream to tests until the initial SSE bytes have
-    // flushed. Merely calling writeHead() is not a client-readiness signal in
-    // Bun: a terminal event emitted in that gap can remain unread even though
-    // the fake's server-side stream set already contains the response.
-    res.write(": connected\n\n", () => {
-      if (res.destroyed) return;
-      input.streams.add(res);
-      input.streamThreadKeys.set(res, threadKey);
-      // Events can arrive between request acceptance and this flushed-write
-      // callback. Replay the durable fake ledger after registration so those
-      // events are delivered exactly once to the newly ready response.
-      for (const event of input.events) {
-        if (
-          event.threadKey === threadKey &&
-          event.id > afterEventId &&
-          (!executionId ||
-            !event.executionId ||
-            event.executionId === executionId)
-        ) {
-          writeMockSseEvent(res, event);
-        }
+    // Flush and register synchronously. Waiting for the write callback is
+    // racy under Bun's fetch pool: it can be delayed until Node's keep-alive
+    // timeout even though the request reached this handler. All later SSE
+    // writes share this response and remain ordered in Node's output buffer.
+    res.flushHeaders();
+    res.write(": connected\n\n");
+    if (res.destroyed) return;
+    input.streams.add(res);
+    input.streamThreadKeys.set(res, threadKey);
+    // Events can arrive between request acceptance and stream registration.
+    // Replay the durable fake ledger after registration so none are lost.
+    for (const event of input.events) {
+      if (
+        event.threadKey === threadKey &&
+        event.id > afterEventId &&
+        (!executionId ||
+          !event.executionId ||
+          event.executionId === executionId)
+      ) {
+        writeMockSseEvent(res, event);
       }
-    });
+    }
     return;
   }
 
