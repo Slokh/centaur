@@ -84,7 +84,9 @@ describe("Discord archive reconciliation", () => {
       normalized_payload: expect.objectContaining({ embeds: [{ title: "v1" }] }),
     }));
 
+    const deliveriesAfterInitialReconciliation = delivered.length;
     expect(await reconcileDiscordArchive(options, state)).toBe(0);
+    expect(delivered).toHaveLength(deliveriesAfterInitialReconciliation);
     expect(discordRequests.some((url) => url.includes("after=20"))).toBeTrue();
   });
 
