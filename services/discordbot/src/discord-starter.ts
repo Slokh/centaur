@@ -5,6 +5,7 @@ import type {
   DiscordbotApiAttachment,
   DiscordbotApiMessage,
   DiscordbotOptions,
+  DiscordbotReplyContext,
   JsonObject,
 } from "./types";
 import { isJsonObject } from "./utils";
@@ -143,6 +144,88 @@ export async function fetchInlineReplyContext(
   }
 
   return messages.reverse();
+}
+
+/**
+ * Resolve the immediate message targeted by a reused inline-reply turn.
+ *
+ * New sessions already hydrate their bounded visible reply chain. Reused
+ * sessions still need the current reply target because a member may branch
+ * back to an older message that is not represented by their new text. Prefer
+ * Discord's embedded copy and only fetch within the current channel boundary.
+ */
+export async function fetchImmediateReplyContext(
+  options: DiscordbotOptions,
+  threadKey: string,
+  currentMessage: DiscordbotApiMessage,
+  logger: Logger,
+): Promise<DiscordbotReplyContext | undefined> {
+  if (!isJsonObject(currentMessage.raw)) return undefined;
+  const reference = isJsonObject(currentMessage.raw.message_reference)
+    ? currentMessage.raw.message_reference
+    : undefined;
+  const parentId = nonEmptyString(reference?.message_id);
+  if (!parentId) return undefined;
+
+  const embedded = isJsonObject(currentMessage.raw.referenced_message)
+    ? currentMessage.raw.referenced_message
+    : undefined;
+  let parent: JsonObject | undefined;
+  if (embedded && embedded.id === parentId) {
+    parent = embedded;
+  } else {
+    const parsed = parseDiscordThreadKey(threadKey);
+    const currentChannelId =
+      nonEmptyString(currentMessage.raw.channel_id) ?? parsed.channelId;
+    const referenceChannelId =
+      nonEmptyString(reference?.channel_id) ?? currentChannelId;
+    // Cross-channel forwards expose an immutable message snapshot on the
+    // destination message. Never use bot authority to fetch their source.
+    if (!currentChannelId || referenceChannelId !== currentChannelId) {
+      return undefined;
+    }
+    const fetchFn = options.fetch ?? fetch;
+    const apiBase = (options.discordApiUrl ?? DEFAULT_DISCORD_API_URL).replace(
+      /\/$/,
+      "",
+    );
+    try {
+      const response = await fetchFn(
+        `${apiBase}/channels/${currentChannelId}/messages/${parentId}`,
+        { headers: { authorization: `Bot ${options.botToken}` } },
+      );
+      if (!response.ok) {
+        logger.warn("discordbot_immediate_reply_context_fetch_failed", {
+          message_id: parentId,
+          status: response.status,
+        });
+        return undefined;
+      }
+      const raw: unknown = await response.json();
+      if (!isJsonObject(raw)) return undefined;
+      parent = raw;
+    } catch (error) {
+      logger.warn("discordbot_immediate_reply_context_fetch_error", {
+        error: error instanceof Error ? error.message : String(error),
+        message_id: parentId,
+      });
+      return undefined;
+    }
+  }
+
+  const serialized = rawMessageToApiMessage(
+    parent,
+    threadKey,
+    options.applicationId,
+  );
+  if (!serialized) return undefined;
+  return {
+    attachments: serialized.attachments,
+    author: serialized.author,
+    id: serialized.id,
+    text: serialized.text.slice(0, 16_000),
+    timestamp: serialized.timestamp,
+  };
 }
 
 /**

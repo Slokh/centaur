@@ -1436,11 +1436,71 @@ class CentaurInvestigatorClient:
             findings.append(f"Discord response latency was {response_latency_ms}ms.")
 
         event_rows = (postgres.get("session_events") or {}).get("rows", [])
+        execution_rows = (postgres.get("session_executions") or {}).get("rows", [])
+        execution_candidates: list[tuple[datetime, dict[str, Any]]] = []
+        for execution in execution_rows:
+            created_at = _parse_datetime(execution.get("created_at"))
+            if created_at is None or source_time is None or created_at < source_time:
+                continue
+            if response_time is not None and created_at > response_time:
+                continue
+            execution_candidates.append((created_at, execution))
+        selected_execution = (
+            min(execution_candidates, key=lambda item: item[0])[1] if execution_candidates else None
+        )
+        selected_execution_id = (
+            str(selected_execution.get("execution_id"))
+            if selected_execution and selected_execution.get("execution_id")
+            else None
+        )
+        execution_start = (
+            _parse_datetime(selected_execution.get("created_at"))
+            if selected_execution
+            else source_time
+        )
+        execution_end = (
+            _parse_datetime(selected_execution.get("completed_at"))
+            if selected_execution
+            else response_time
+        ) or response_time
+
+        def belongs_to_selected_execution(row: dict[str, Any], time_key: str) -> bool:
+            row_execution_id = row.get("execution_id")
+            if row_execution_id:
+                return bool(
+                    selected_execution_id and str(row_execution_id) == selected_execution_id
+                )
+            at = _parse_datetime(row.get(time_key))
+            return bool(
+                at
+                and execution_start
+                and at >= execution_start
+                and (execution_end is None or at <= execution_end)
+            )
+
         warm_pool_hit = any(
-            row.get("event_type") == "session.warm_sandbox_claimed" for row in event_rows
-        ) or any(row.get("stage") == "sandbox_ensure_warm_claimed" for row in timeline)
+            row.get("event_type") == "session.warm_sandbox_claimed"
+            and belongs_to_selected_execution(row, "created_at")
+            for row in event_rows
+        ) or any(
+            row.get("stage") == "sandbox_ensure_warm_claimed"
+            and belongs_to_selected_execution({**row, **(row.get("details") or {})}, "at")
+            for row in timeline
+        )
         if warm_pool_hit:
             findings.append("The execution claimed a warm sandbox.")
+
+        sandbox_resumed = any(
+            row.get("event_type") == "session.sandbox_resumed"
+            and belongs_to_selected_execution(row, "created_at")
+            for row in event_rows
+        ) or any(
+            row.get("stage") in {"session.sandbox_resumed", "sandbox_resumed"}
+            and belongs_to_selected_execution({**row, **(row.get("details") or {})}, "at")
+            for row in timeline
+        )
+        if sandbox_resumed:
+            findings.append("The execution resumed its assigned sandbox.")
 
         diagnosis = None
         if "CENTAUR_THREAD_KEY" in content and "missing" in content.lower():
@@ -1456,6 +1516,7 @@ class CentaurInvestigatorClient:
             "warnings": warnings,
             "diagnosis": diagnosis,
             "response_latency_ms": response_latency_ms,
+            "sandbox_resumed": sandbox_resumed,
             "warm_pool_hit": warm_pool_hit,
             "primary_source": "discord_api_and_postgres_readonly_tables",
         }

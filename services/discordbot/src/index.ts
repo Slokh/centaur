@@ -33,6 +33,7 @@ import {
   ingestObservedDiscordMessage,
 } from "./discord-ingestion";
 import {
+  fetchImmediateReplyContext,
   fetchInlineReplyContext,
   fetchThreadStarterMessage,
 } from "./discord-starter";
@@ -609,6 +610,18 @@ async function syncThreadMessageToSession(
     phase_ms: elapsedMs(serializeStartedAtMs),
   });
 
+  const isInlineReply = Boolean(
+    parseDiscordThreadKey(thread.id).replyToMessageId,
+  );
+  if (shouldStartExecution && isInlineReply && !shouldIncludeContext) {
+    serializedMessage.replyContext = await fetchImmediateReplyContext(
+      input.options,
+      thread.id,
+      serializedMessage,
+      input.options.logger ?? noopLogger,
+    );
+  }
+
   // Discord delta (no slackbotv2 analog): a sticker-only/poll/system
   // mention serializes to empty text with no attachments; executing it would
   // fabricate a synthetic "continue" turn. React ❓ and skip instead.
@@ -625,9 +638,6 @@ async function syncThreadMessageToSession(
 
   let context: DiscordbotApiMessage[] | undefined;
 
-  const isInlineReply = Boolean(
-    parseDiscordThreadKey(thread.id).replyToMessageId,
-  );
   if (shouldIncludeContext && !state.historyForwarded) {
     const contextStartedAtMs = nowMs();
     try {
