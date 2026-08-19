@@ -17,6 +17,15 @@ export function elapsedMs(startedAtMs: number): number {
   return Math.max(0, Math.round(nowMs() - startedAtMs));
 }
 
+/** Release an HTTP response body when the caller does not consume it. */
+export async function discardResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Disposal is best-effort and must not replace the request's real result.
+  }
+}
+
 /** Coalesces overlapping calls onto one in-flight operation. */
 export function singleFlight<T>(operation: () => Promise<T>): () => Promise<T> {
   let active: Promise<T> | undefined;

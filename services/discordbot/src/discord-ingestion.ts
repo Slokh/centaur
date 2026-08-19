@@ -1,5 +1,6 @@
 import type { DiscordbotFetch, DiscordbotOptions } from "./types";
 import type { StateAdapter } from "chat";
+import { discardResponseBody } from "./utils";
 
 const INGESTION_INDEX_KEY = "discordbot:application-ingestion:index";
 const INGESTION_EVENT_PREFIX = "discordbot:application-ingestion:event:";
@@ -244,6 +245,7 @@ async function postIngestionEvent(
     },
     body: JSON.stringify(payload),
   });
+  await discardResponseBody(response);
   if (!response.ok) {
     throw new Error(`application ingestion returned ${response.status}`);
   }
