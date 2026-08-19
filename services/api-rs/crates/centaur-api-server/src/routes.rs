@@ -921,10 +921,19 @@ async fn get_session_context(
     Extension(caller): Extension<AuthenticatedCaller>,
     Path(raw_thread_key): Path<String>,
 ) -> Result<Json<SessionContextResponse>, ApiError> {
+    resolve_session_context(state, caller, raw_thread_key, false).await
+}
+
+async fn resolve_session_context(
+    state: AppState,
+    caller: AuthenticatedCaller,
+    raw_thread_key: String,
+    use_active_execution_reply: bool,
+) -> Result<Json<SessionContextResponse>, ApiError> {
     let runtime = state.runtime()?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     authorize_principal_session_read(&runtime, &caller, &thread_key).await?;
-    let destination = match runtime.session(&thread_key).await {
+    let mut destination = match runtime.session(&thread_key).await {
         Ok(session) => session.resolved_chat_destination(),
         Err(error) => {
             tracing::debug!(
@@ -935,6 +944,21 @@ async fn get_session_context(
             thread_key.chat_destination()
         }
     };
+    if use_active_execution_reply {
+        match runtime.active_execution(&thread_key).await {
+            Ok(Some(execution)) => {
+                destination = scoped_destination_for_execution(destination, &execution.metadata);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %thread_key,
+                    %error,
+                    "active execution unavailable while resolving scoped chat destination"
+                );
+            }
+        }
+    }
     let platform = destination
         .as_ref()
         .map(ChatDestination::platform)
@@ -1036,12 +1060,37 @@ async fn get_scoped_session_context(
     })?;
     let thread_key = ThreadKey::try_from(raw_thread_key)?;
     validate_session_gateway_key(config, &thread_key, &headers)?;
-    get_session_context(
-        State(state),
-        Extension(caller),
-        Path(thread_key.as_str().to_owned()),
-    )
-    .await
+    resolve_session_context(state, caller, thread_key.as_str().to_owned(), true).await
+}
+
+fn scoped_destination_for_execution(
+    destination: Option<ChatDestination>,
+    execution_metadata: &Value,
+) -> Option<ChatDestination> {
+    let invocation = execution_metadata
+        .get("invocation")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<InvocationContext>(value).ok());
+    let Some(invocation) = invocation else {
+        return destination;
+    };
+    if validate_invocation_context(&invocation, destination.as_ref()).is_err() {
+        return destination;
+    }
+    match destination {
+        Some(ChatDestination::Discord {
+            guild_id,
+            channel_id,
+            thread_id,
+            ..
+        }) => Some(ChatDestination::Discord {
+            guild_id,
+            channel_id,
+            thread_id,
+            reply_to_message_id: Some(invocation.source.message_id),
+        }),
+        other => other,
+    }
 }
 
 async fn append_messages(
@@ -1099,12 +1148,17 @@ fn execution_metadata_with_invocation(
     metadata: Option<Value>,
     invocation: Option<InvocationContext>,
 ) -> Option<Value> {
-    let Some(invocation) = invocation else {
-        return metadata;
-    };
+    if metadata.is_none() && invocation.is_none() {
+        return None;
+    }
     let mut metadata = metadata.unwrap_or_else(|| json!({}));
     if let Value::Object(object) = &mut metadata {
-        object.insert("invocation".to_owned(), json!(invocation));
+        // `invocation` is a control-plane-owned field. Never preserve a value
+        // supplied through free-form metadata.
+        object.remove("invocation");
+        if let Some(invocation) = invocation {
+            object.insert("invocation".to_owned(), json!(invocation));
+        }
     }
     Some(metadata)
 }
@@ -1443,6 +1497,69 @@ mod application_authority_tests {
 
         assert!(validate_session_gateway_key(&config, &authorized, &headers).is_ok());
         assert!(validate_session_gateway_key(&config, &other, &headers).is_err());
+    }
+
+    #[test]
+    fn scoped_discord_destination_uses_active_invocation_message() {
+        let destination = ChatDestination::Discord {
+            guild_id: "guild".to_owned(),
+            channel_id: "channel".to_owned(),
+            thread_id: None,
+            reply_to_message_id: Some("root-message".to_owned()),
+        };
+        let metadata =
+            execution_metadata_with_invocation(None, Some(invocation(OffsetDateTime::now_utc())))
+                .unwrap();
+
+        assert_eq!(
+            scoped_destination_for_execution(Some(destination), &metadata),
+            Some(ChatDestination::Discord {
+                guild_id: "guild".to_owned(),
+                channel_id: "channel".to_owned(),
+                thread_id: None,
+                reply_to_message_id: Some("message".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn scoped_destination_rejects_untrusted_or_mismatched_invocation_metadata() {
+        let destination = ChatDestination::Discord {
+            guild_id: "guild".to_owned(),
+            channel_id: "channel".to_owned(),
+            thread_id: None,
+            reply_to_message_id: Some("root-message".to_owned()),
+        };
+        let mut mismatched = invocation(OffsetDateTime::now_utc());
+        mismatched.conversation.channel_id = "other-channel".to_owned();
+
+        assert_eq!(
+            scoped_destination_for_execution(
+                Some(destination.clone()),
+                &json!({"invocation": mismatched}),
+            ),
+            Some(destination.clone())
+        );
+        assert_eq!(
+            scoped_destination_for_execution(
+                Some(destination.clone()),
+                &json!({"invocation": "not trusted structure"}),
+            ),
+            Some(destination)
+        );
+    }
+
+    #[test]
+    fn free_form_metadata_cannot_forge_invocation() {
+        assert_eq!(execution_metadata_with_invocation(None, None), None);
+        let metadata = execution_metadata_with_invocation(
+            Some(json!({"invocation": {"source": {"message_id": "forged"}}, "kept": true})),
+            None,
+        )
+        .unwrap();
+
+        assert!(metadata.get("invocation").is_none());
+        assert_eq!(metadata.get("kept"), Some(&json!(true)));
     }
 }
 
