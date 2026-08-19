@@ -32,7 +32,10 @@ import {
   ingestObservedDiscordChannel,
   ingestObservedDiscordMessage,
 } from "./discord-ingestion";
-import { fetchThreadStarterMessage } from "./discord-starter";
+import {
+  fetchInlineReplyContext,
+  fetchThreadStarterMessage,
+} from "./discord-starter";
 import {
   deriveThreadName,
   fetchDiscordChannelName,
@@ -606,7 +609,7 @@ async function syncThreadMessageToSession(
     phase_ms: elapsedMs(serializeStartedAtMs),
   });
 
-  // Discord delta (no slackbotv2 analog): a sticker-only/forwarded/poll/system
+  // Discord delta (no slackbotv2 analog): a sticker-only/poll/system
   // mention serializes to empty text with no attachments; executing it would
   // fabricate a synthetic "continue" turn. React ❓ and skip instead.
   if (shouldStartExecution && isContentlessApiMessage(serializedMessage)) {
@@ -625,10 +628,17 @@ async function syncThreadMessageToSession(
   const isInlineReply = Boolean(
     parseDiscordThreadKey(thread.id).replyToMessageId,
   );
-  if (shouldIncludeContext && !state.historyForwarded && !isInlineReply) {
+  if (shouldIncludeContext && !state.historyForwarded) {
     const contextStartedAtMs = nowMs();
     try {
-      context = await collectInitialContext(thread, message);
+      context = isInlineReply
+        ? await fetchInlineReplyContext(
+            input.options,
+            thread.id,
+            serializedMessage,
+            input.options.logger ?? noopLogger,
+          )
+        : await collectInitialContext(thread, message);
     } catch (error) {
       if (!isDiscordPermissionError(error)) throw error;
       // Discord delta (no slackbotv2 analog): a 403 here (missing Read Message
@@ -660,11 +670,13 @@ async function syncThreadMessageToSession(
     // in the parent channel, so thread history alone misses it (Slack's
     // conversations.replies includes the parent). Prefer the fetched starter
     // over any thread-starter stub already in the history.
-    const starter = await fetchThreadStarterMessage(
-      input.options,
-      thread.id,
-      input.options.logger ?? noopLogger,
-    );
+    const starter = isInlineReply
+      ? null
+      : await fetchThreadStarterMessage(
+          input.options,
+          thread.id,
+          input.options.logger ?? noopLogger,
+        );
     if (starter) {
       context = [starter, ...context.filter((item) => item.id !== starter.id)];
     }
@@ -674,9 +686,6 @@ async function syncThreadMessageToSession(
       starter_included: starter !== null,
     });
   } else {
-    if (shouldIncludeContext && isInlineReply) {
-      context = [serializedMessage];
-    }
     traceLog(input.options, "discordbot_forward_context_skipped", trace, {
       message_count: 1,
     });
