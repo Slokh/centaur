@@ -1026,8 +1026,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "centaur-sandbox-core",
+ "centaur-session-core",
  "centaur-session-sqlx",
  "centaur-telemetry",
+ "serde_json",
  "sqlx",
  "thiserror 2.0.20",
  "tokio",
@@ -1075,6 +1077,7 @@ dependencies = [
  "dashmap",
  "futures-util",
  "hex",
+ "hmac 0.13.0",
  "reqwest",
  "serde",
  "serde_json",

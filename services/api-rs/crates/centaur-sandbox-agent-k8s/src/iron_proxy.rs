@@ -73,8 +73,24 @@ const PG_CLIENT_PASSWORD_ENV: &str = "IRON_PROXY_PG_CLIENT_PASSWORD";
 // apply latency (the pre-barrier behavior).
 const PROXY_ACK_TIMEOUT: Duration = Duration::from_secs(10);
 const PROXY_ACK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const PROXY_ACK_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 const PROXY_ACK_PROBE_WINDOW: Duration = Duration::from_secs(2);
 const PROXY_REASSIGN_FALLBACK_DELAY: Duration = Duration::from_secs(6);
+
+#[derive(Clone, Copy)]
+struct ProxyAckTimings {
+    ack_timeout: Duration,
+    probe_window: Duration,
+    poll_interval: Duration,
+    sync_interval: Duration,
+}
+
+const PROXY_ACK_TIMINGS: ProxyAckTimings = ProxyAckTimings {
+    ack_timeout: PROXY_ACK_TIMEOUT,
+    probe_window: PROXY_ACK_PROBE_WINDOW,
+    poll_interval: PROXY_ACK_POLL_INTERVAL,
+    sync_interval: PROXY_ACK_SYNC_INTERVAL,
+};
 
 #[derive(Clone, Debug)]
 pub struct IronProxyConfig {
@@ -387,7 +403,10 @@ impl AgentSandboxBackend {
                     &sync,
                     &self.config.node_selector,
                     &self.config.tolerations,
-                    self.config.runtime_class_name.as_deref(),
+                    PodClassNames {
+                        runtime: self.config.runtime_class_name.as_deref(),
+                        priority: self.config.priority_class_name.as_deref(),
+                    },
                 ),
             )
             .await
@@ -873,9 +892,7 @@ impl AgentSandboxBackend {
             &endpoint,
             principal_id,
             config_hash,
-            PROXY_ACK_TIMEOUT,
-            PROXY_ACK_PROBE_WINDOW,
-            PROXY_ACK_POLL_INTERVAL,
+            PROXY_ACK_TIMINGS,
         )
         .await)
     }
@@ -1017,10 +1034,20 @@ impl AgentSandboxBackend {
                     )));
                 }
                 Ok(pod) if Instant::now() >= deadline => {
+                    let reasons = pod_not_ready_reasons(&pod);
+                    tracing::warn!(
+                        proxy_pod = %resolved.proxy_pod_name,
+                        phase = ?pod.status.as_ref().and_then(|status| status.phase.as_deref()),
+                        reasons = %reasons,
+                        "iron-proxy pod did not become ready before timeout"
+                    );
                     return Err(SandboxError::NotReady(format!(
-                        "iron-proxy pod {} did not become running before timeout; latest phase: {:?}",
+                        "iron-proxy pod {} did not become running before timeout; latest phase: {:?}; reasons: {}",
                         resolved.proxy_pod_name,
-                        pod.status.and_then(|status| status.phase)
+                        pod.status
+                            .as_ref()
+                            .and_then(|status| status.phase.as_deref()),
+                        reasons,
                     )));
                 }
                 Ok(_) => sleep(Duration::from_millis(500)).await,
@@ -1082,26 +1109,27 @@ async fn wait_for_proxy_ack(
     endpoint: &ProxyManagementEndpoint,
     principal_id: &str,
     config_hash: Option<&str>,
-    ack_timeout: Duration,
-    probe_window: Duration,
-    poll_interval: Duration,
+    timings: ProxyAckTimings,
 ) -> ProxyAck {
     let started = Instant::now();
-    let mut poked = false;
+    let mut last_sync_poke = None;
     let mut management_confirmed = false;
     loop {
         // Poke an immediate out-of-band sync so the barrier does not ride the
-        // proxy's 5s poll cadence; retried until it lands (the status poll
-        // below still converges without it, just slower).
-        if !poked {
-            poked = matches!(
-                client
-                    .post(format!("{}/v1/sync", endpoint.base_url))
-                    .bearer_auth(&endpoint.api_key)
-                    .send()
-                    .await,
-                Ok(response) if response.status().is_success()
-            );
+        // proxy's 5s poll cadence. A successful 202 only means the request was
+        // accepted: it can race a sync already in flight and apply no newer
+        // state, so poke again at a bounded cadence until status confirms the
+        // assignment.
+        let elapsed = started.elapsed();
+        if last_sync_poke
+            .is_none_or(|last: Duration| elapsed.saturating_sub(last) >= timings.sync_interval)
+        {
+            let _ = client
+                .post(format!("{}/v1/sync", endpoint.base_url))
+                .bearer_auth(&endpoint.api_key)
+                .send()
+                .await;
+            last_sync_poke = Some(elapsed);
         }
         let status = client
             .get(format!("{}/v1/status", endpoint.base_url))
@@ -1124,13 +1152,13 @@ async fn wait_for_proxy_ack(
             }
         }
         let elapsed = started.elapsed();
-        if !management_confirmed && elapsed >= probe_window {
+        if !management_confirmed && elapsed >= timings.probe_window {
             return ProxyAck::ManagementUnavailable;
         }
-        if elapsed >= ack_timeout {
+        if elapsed >= timings.ack_timeout {
             return ProxyAck::TimedOut;
         }
-        sleep(poll_interval).await;
+        sleep(timings.poll_interval).await;
     }
 }
 
@@ -1225,6 +1253,12 @@ pub(crate) fn sandbox_ca_volume_json(iron_proxy: &IronProxyConfig) -> Value {
     })
 }
 
+#[derive(Default)]
+struct PodClassNames<'a> {
+    runtime: Option<&'a str>,
+    priority: Option<&'a str>,
+}
+
 fn build_iron_proxy_pod(
     id: &SandboxId,
     iron_proxy: &IronProxyConfig,
@@ -1232,7 +1266,7 @@ fn build_iron_proxy_pod(
     sync: &ProxySyncEnv,
     node_selector: &BTreeMap<String, String>,
     tolerations: &[k8s_openapi::api::core::v1::Toleration],
-    runtime_class_name: Option<&str>,
+    class_names: PodClassNames<'_>,
 ) -> Pod {
     let annotations = BTreeMap::from([
         (
@@ -1244,7 +1278,13 @@ fn build_iron_proxy_pod(
             resolved.principal_id.clone(),
         ),
     ]);
-    let runtime_class = runtime_class_name
+    let runtime_class = class_names
+        .runtime
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned);
+    let priority_class = class_names
+        .priority
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_owned);
@@ -1265,6 +1305,7 @@ fn build_iron_proxy_pod(
             node_selector: (!node_selector.is_empty()).then(|| node_selector.clone()),
             tolerations: (!tolerations.is_empty()).then(|| tolerations.to_vec()),
             runtime_class_name: runtime_class,
+            priority_class_name: priority_class,
             ..Default::default()
         }),
         ..Default::default()
@@ -1903,6 +1944,45 @@ fn pod_stopped(pod: &Pod) -> bool {
         })
 }
 
+/// Bounded Kubernetes reason codes that explain why a pod has not become
+/// ready. Reasons are safe to surface through the sandbox error boundary;
+/// condition messages can contain node names and cluster topology, so they
+/// remain in Kubernetes rather than being copied into member-facing errors.
+fn pod_not_ready_reasons(pod: &Pod) -> String {
+    let Some(status) = pod.status.as_ref() else {
+        return "status-unavailable".to_owned();
+    };
+    let mut reasons = BTreeSet::new();
+    for condition in status.conditions.iter().flatten() {
+        if condition.status != "True"
+            && let Some(reason) = condition.reason.as_deref().and_then(bounded_reason)
+        {
+            reasons.insert(reason.to_owned());
+        }
+    }
+    for container in status.container_statuses.iter().flatten() {
+        if let Some(reason) = container
+            .state
+            .as_ref()
+            .and_then(|state| state.waiting.as_ref())
+            .and_then(|waiting| waiting.reason.as_deref())
+            .and_then(bounded_reason)
+        {
+            reasons.insert(reason.to_owned());
+        }
+    }
+    if reasons.is_empty() {
+        "none-reported".to_owned()
+    } else {
+        reasons.into_iter().take(4).collect::<Vec<_>>().join(",")
+    }
+}
+
+fn bounded_reason(reason: &str) -> Option<&str> {
+    let reason = reason.trim();
+    (!reason.is_empty() && reason.len() <= 80 && reason.is_ascii()).then_some(reason)
+}
+
 fn sandbox_owner_reference(sandbox: &crate::crd::Sandbox) -> Option<Value> {
     let name = sandbox.metadata.name.as_ref()?;
     let uid = sandbox.metadata.uid.as_ref()?;
@@ -2346,7 +2426,7 @@ mod tests {
             &sync,
             &BTreeMap::new(),
             &[],
-            None,
+            PodClassNames::default(),
         );
 
         let resources = pod.spec.as_ref().unwrap().containers[0]
@@ -2387,7 +2467,7 @@ mod tests {
             &sync,
             &BTreeMap::new(),
             &[],
-            None,
+            PodClassNames::default(),
         );
 
         assert!(pod.spec.as_ref().unwrap().containers[0].resources.is_none());
@@ -2412,7 +2492,7 @@ mod tests {
             &sync,
             &BTreeMap::new(),
             &[],
-            None,
+            PodClassNames::default(),
         );
         assert_eq!(
             pod.metadata
@@ -2492,7 +2572,7 @@ mod tests {
             &sync,
             &BTreeMap::new(),
             &[],
-            None,
+            PodClassNames::default(),
         );
         let pod_labels = pod.metadata.labels.as_ref().unwrap();
         assert!(!pod_labels.contains_key(OBSERVABILITY_ENABLED_LABEL));
@@ -2555,7 +2635,10 @@ mod tests {
             &sync,
             &node_selector,
             &tolerations,
-            Some("gvisor"),
+            PodClassNames {
+                runtime: Some("gvisor"),
+                priority: Some("sandbox-low"),
+            },
         );
         let pod_spec = pod.spec.unwrap();
         assert_eq!(
@@ -2568,6 +2651,7 @@ mod tests {
         );
         assert_eq!(pod_spec.tolerations.as_ref().unwrap().len(), 1);
         assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("gvisor"));
+        assert_eq!(pod_spec.priority_class_name.as_deref(), Some("sandbox-low"));
     }
 
     #[test]
@@ -2588,12 +2672,13 @@ mod tests {
             &sync,
             &BTreeMap::new(),
             &[],
-            None,
+            PodClassNames::default(),
         );
         let pod_spec = pod.spec.unwrap();
         assert!(pod_spec.node_selector.is_none());
         assert!(pod_spec.tolerations.is_none());
         assert!(pod_spec.runtime_class_name.is_none());
+        assert!(pod_spec.priority_class_name.is_none());
     }
 
     #[test]
@@ -2931,6 +3016,46 @@ mod tests {
     }
 
     #[test]
+    fn pending_proxy_reasons_are_bounded_and_omit_condition_messages() {
+        use k8s_openapi::api::core::v1::{
+            ContainerState, ContainerStateWaiting, ContainerStatus, PodCondition, PodStatus,
+        };
+        let pod = Pod {
+            status: Some(PodStatus {
+                phase: Some("Pending".to_owned()),
+                conditions: Some(vec![PodCondition {
+                    type_: "PodScheduled".to_owned(),
+                    status: "False".to_owned(),
+                    reason: Some("Unschedulable".to_owned()),
+                    message: Some("0/3 nodes available: private-node-name".to_owned()),
+                    ..Default::default()
+                }]),
+                container_statuses: Some(vec![ContainerStatus {
+                    name: "iron-proxy".to_owned(),
+                    image: "proxy:test".to_owned(),
+                    image_id: String::new(),
+                    ready: false,
+                    restart_count: 0,
+                    state: Some(ContainerState {
+                        waiting: Some(ContainerStateWaiting {
+                            reason: Some("ImagePullBackOff".to_owned()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let reasons = pod_not_ready_reasons(&pod);
+        assert_eq!(reasons, "ImagePullBackOff,Unschedulable");
+        assert!(!reasons.contains("private-node-name"));
+    }
+
+    #[test]
     fn proxy_management_endpoint_read_back_off_pod_env() {
         let pod = running_proxy_pod(
             "10.1.2.3",
@@ -3058,16 +3183,19 @@ mod tests {
             &endpoint,
             "prin_claimed",
             None,
-            Duration::from_secs(5),
-            Duration::from_secs(5),
-            Duration::from_millis(10),
+            ProxyAckTimings {
+                ack_timeout: Duration::from_secs(5),
+                probe_window: Duration::from_secs(5),
+                poll_interval: Duration::from_millis(10),
+                sync_interval: Duration::from_millis(20),
+            },
         )
         .await;
 
         assert_eq!(ack, ProxyAck::Applied);
         assert!(
-            sync_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
-            "the barrier should poke an immediate out-of-band sync"
+            sync_calls.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the barrier should re-poke an accepted sync until status confirms it"
         );
         server.abort();
     }
@@ -3085,9 +3213,12 @@ mod tests {
             &endpoint,
             "prin_claimed",
             None,
-            Duration::from_millis(400),
-            Duration::from_millis(200),
-            Duration::from_millis(25),
+            ProxyAckTimings {
+                ack_timeout: Duration::from_millis(400),
+                probe_window: Duration::from_millis(200),
+                poll_interval: Duration::from_millis(25),
+                sync_interval: Duration::from_millis(50),
+            },
         )
         .await;
 
@@ -3108,9 +3239,12 @@ mod tests {
             &endpoint,
             "prin_claimed",
             Some("sha256:expected"),
-            Duration::from_millis(200),
-            Duration::from_millis(200),
-            Duration::from_millis(10),
+            ProxyAckTimings {
+                ack_timeout: Duration::from_millis(200),
+                probe_window: Duration::from_millis(200),
+                poll_interval: Duration::from_millis(10),
+                sync_interval: Duration::from_millis(25),
+            },
         )
         .await;
 
@@ -3135,9 +3269,12 @@ mod tests {
             &endpoint,
             "prin_claimed",
             None,
-            Duration::from_secs(2),
-            Duration::from_millis(300),
-            Duration::from_millis(50),
+            ProxyAckTimings {
+                ack_timeout: Duration::from_secs(2),
+                probe_window: Duration::from_millis(300),
+                poll_interval: Duration::from_millis(50),
+                sync_interval: Duration::from_millis(100),
+            },
         )
         .await;
 

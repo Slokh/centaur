@@ -380,6 +380,24 @@ mod tests {
             ),
             (
                 Request::builder()
+                    .uri("/api/session/slack%3AC123%3A123.456/scoped-context")
+                    .header(header::AUTHORIZATION, &authorized)
+                    .body(Body::empty())
+                    .unwrap(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/session/slack%3AC123%3A123.456/application/memory.search")
+                    .header(header::AUTHORIZATION, &authorized)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                Request::builder()
                     .method(Method::POST)
                     .uri("/api/session/discord%3A123%3A456")
                     .header(header::AUTHORIZATION, &authorized)
@@ -435,6 +453,23 @@ mod tests {
     #[tokio::test]
     async fn principal_jwt_is_capability_scoped_and_archive_exception_is_subject_scoped() {
         let principal = principal_token("prn_sandbox");
+        let application_response = build_router_with_app_state(AppState::unready(test_auth()))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/session/slack%3AC123%3A123.456/application/memory.search")
+                    .header(header::AUTHORIZATION, format!("Bearer {principal}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            application_response.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
         let write_response = build_router_with_app_state(AppState::unready(test_auth()))
             .oneshot(
                 Request::builder()
