@@ -123,7 +123,8 @@ fn validate_thread_key(value: &str) -> Result<(), ThreadKeyError> {
 /// context line the agent reads, and any caller that needs a posting destination
 /// share a single parser instead of each re-deriving the platform from the key
 /// shape.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "platform", rename_all = "snake_case")]
 pub enum ChatDestination {
     Slack {
         channel_id: String,
@@ -133,6 +134,10 @@ pub enum ChatDestination {
         guild_id: String,
         channel_id: String,
         thread_id: Option<String>,
+        /// Message to reply to when the conversation is rendered inline in a
+        /// channel instead of inside a Discord thread.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reply_to_message_id: Option<String>,
     },
     /// A Linear issue thread. The reply lands as a comment on the issue (nested
     /// under `comment_id` when the turn came in on a comment thread). Unlike
@@ -156,7 +161,8 @@ pub enum ChatDestination {
 }
 
 /// Whether a GitHub thread maps to an issue or a pull request.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum GithubThreadKind {
     Issue,
     Pr,
@@ -201,15 +207,21 @@ impl ChatDestination {
                 guild_id,
                 channel_id,
                 thread_id,
+                reply_to_message_id,
             } => {
                 let thread = thread_id
                     .as_deref()
                     .map(|id| format!(" · thread {id}"))
                     .unwrap_or_default();
+                let reply = reply_to_message_id
+                    .as_deref()
+                    .map(|id| format!(" · reply root {id}"))
+                    .unwrap_or_default();
                 format!(
-                    "[chat surface: Discord · channel {channel_id}{thread} (guild {guild_id}). \
+                    "[chat surface: Discord · channel {channel_id}{thread}{reply} (guild {guild_id}). \
                      Centaur delivers your reply to this thread automatically — do not repost it with the discord tool. \
-                     Send files here with `discord upload`.]"
+                     Send files here with `discord-upload FILE`. A local file is not visible in Discord: only claim it was attached or shown after `discord-upload` succeeds. \
+                     If generation succeeded but upload failed, reuse the same local file when retrying; do not regenerate unless the user asks for changes.]"
                 )
             }
             Self::Linear {
@@ -297,14 +309,39 @@ impl ThreadKey {
             let mut segments = rest.split(':').map(str::trim);
             let guild_id = segments.next().filter(|s| !s.is_empty())?;
             let channel_id = segments.next().filter(|s| !s.is_empty())?;
-            let thread_id = segments
+            let encoded_destination = segments
                 .next()
                 .filter(|s| !s.is_empty())
                 .map(ToOwned::to_owned);
+            if segments.next().is_some() {
+                return None;
+            }
+            let (thread_id, reply_to_message_id) = match encoded_destination {
+                Some(value) if value.starts_with("reply~") && value.len() > 6 => {
+                    (None, Some(value[6..].to_owned()))
+                }
+                value => (value, None),
+            };
             return Some(ChatDestination::Discord {
                 guild_id: guild_id.to_owned(),
                 channel_id: channel_id.to_owned(),
                 thread_id,
+                reply_to_message_id,
+            });
+        }
+        if let Some(rest) = key.strip_prefix("discord-reply:") {
+            let mut segments = rest.split(':').map(str::trim);
+            let guild_id = segments.next().filter(|s| !s.is_empty())?;
+            let channel_id = segments.next().filter(|s| !s.is_empty())?;
+            let reply_to_message_id = segments.next().filter(|s| !s.is_empty())?;
+            if segments.next().is_some() {
+                return None;
+            }
+            return Some(ChatDestination::Discord {
+                guild_id: guild_id.to_owned(),
+                channel_id: channel_id.to_owned(),
+                thread_id: None,
+                reply_to_message_id: Some(reply_to_message_id.to_owned()),
             });
         }
         if let Some(rest) = key.strip_prefix("linear:") {
@@ -444,6 +481,10 @@ impl Default for SandboxCapabilities {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Session {
     pub thread_key: ThreadKey,
+    /// Explicit physical delivery target persisted at session creation. When
+    /// absent, callers derive the legacy target from `thread_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_destination: Option<ChatDestination>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub sandbox_id: Option<String>,
@@ -469,6 +510,14 @@ pub struct Session {
     pub sandbox_last_active_at: Option<OffsetDateTime>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
+}
+
+impl Session {
+    pub fn resolved_chat_destination(&self) -> Option<ChatDestination> {
+        self.chat_destination
+            .clone()
+            .or_else(|| self.thread_key.chat_destination())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, AsRefStr, Display, EnumString)]
@@ -601,6 +650,7 @@ mod tests {
                 guild_id: "111".to_owned(),
                 channel_id: "222".to_owned(),
                 thread_id: Some("333".to_owned()),
+                reply_to_message_id: None,
             }
         );
         assert_eq!(with_thread.platform(), "discord");
@@ -616,6 +666,21 @@ mod tests {
                 guild_id: "111".to_owned(),
                 channel_id: "222".to_owned(),
                 thread_id: None,
+                reply_to_message_id: None,
+            }
+        );
+
+        let inline = ThreadKey::parse("discord:111:222:reply~444")
+            .unwrap()
+            .chat_destination()
+            .unwrap();
+        assert_eq!(
+            inline,
+            ChatDestination::Discord {
+                guild_id: "111".to_owned(),
+                channel_id: "222".to_owned(),
+                thread_id: None,
+                reply_to_message_id: Some("444".to_owned()),
             }
         );
     }
@@ -799,7 +864,9 @@ mod tests {
             .context_line();
         assert!(discord.contains("Discord"));
         assert!(discord.contains("222"));
-        assert!(discord.contains("discord upload"));
+        assert!(discord.contains("discord-upload FILE"));
+        assert!(discord.contains("only claim it was attached or shown after"));
+        assert!(discord.contains("reuse the same local file"));
 
         let linear = ThreadKey::parse("linear:ISSUE:c:CMT")
             .unwrap()
