@@ -1387,7 +1387,7 @@ impl PgSessionStore {
             set iron_control_principal = $2, updated_at = now()
             where thread_key = $1
               and (iron_control_principal is null or iron_control_principal = $2)
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, metadata, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -2189,6 +2189,35 @@ mod tests {
                 .expect("get session")
                 .proxy_labels,
             labels
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binding_principal_returns_complete_session_row() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:principal-binding-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({"source": "principal-binding-test"}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+
+        let session = store
+            .bind_iron_control_principal(&thread_key, "principal-test")
+            .await
+            .expect("bind principal");
+
+        assert_eq!(
+            session.iron_control_principal.as_deref(),
+            Some("principal-test")
         );
     }
 
