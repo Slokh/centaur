@@ -158,7 +158,6 @@ jobs:
           else
             services="$(jq -c --argjson all "$all" '[.[] as $item | $all[] | select(. == $item)] | unique' <<<"${CHANGED_SERVICES:-[]}")"
           fi
-          test "$(jq 'length' <<<"$services")" -gt 0
           if [ "$GITHUB_EVENT_NAME" = push ] && [ "$PUBLISH_ARM64" != false ]; then
             platforms='["linux/amd64","linux/arm64"]'
           else
@@ -186,9 +185,11 @@ jobs:
   # the digests to the merge job below which assembles the multi-arch manifest.
   # arm64 is built on pushes to main and release tags by default. Forks that
   # only deploy amd64 can set CENTAUR_PUBLISH_ARM64=false; PR and manual
-  # dispatch builds stay amd64-only to keep iteration fast.
+  # dispatch builds stay amd64-only to keep iteration fast. Fork PRs skip the
+  # hosted image builders so untrusted changes are never executed there.
   build:
     needs: select
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     runs-on: ${{ vars.CENTAUR_USE_GITHUB_BUILDERS == 'true' && 'ubuntu-latest' || (matrix.platform == 'linux/arm64' && 'depot-ubuntu-24.04-arm-16' || 'depot-ubuntu-24.04-16') }}
     strategy:
       fail-fast: false
@@ -285,7 +286,7 @@ jobs:
   merge:
     runs-on: ${{ vars.CENTAUR_USE_GITHUB_BUILDERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     needs: [select, build]
-    if: ${{ !github.event.pull_request.head.repo.fork }}
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     strategy:
       fail-fast: false
       matrix:
