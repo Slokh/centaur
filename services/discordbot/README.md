@@ -7,24 +7,25 @@ the Rust `api-rs` control plane is unchanged (`discord:…` thread keys flow thr
 
 ## Behavior
 
-- **`@`-mention in a channel** → the adapter creates a **public thread from that message**, the
-  bot streams the answer inside it, and the thread is renamed to the message text. The session is
-  keyed by the new thread (`discord:{guild}:{channel}:{threadId}`).
+- **`@`-mention in a channel** → the default `thread` mode creates a public thread. The
+  `inline_reply` mode replies in place and keys the logical session by its root message
+  (`discord:{guild}:{channel}:reply~{messageId}`).
 - **`@`-mention inside an existing thread** → the bot answers in that thread.
 - **Follow-ups inside an active thread** append to the same session without a re-mention.
-- **Append-only narration**: a run instantly reacts 👀 on the triggering message, then posts the
+- **Configurable progress**: a run instantly reacts 👀 on the triggering message. `narration` posts
+  concise activity blurbs; `reactions` posts no public status or reasoning. In narration mode the
   agent's reasoning blurbs as their own *italic* messages as each thought completes (commands/tools
-  are not rendered — they just end a thought). The **answer** streams into a separate message
-  created when the first answer text arrives, so it lands at the bottom of the thread even when
-  users chime in mid-run. On settle the 👀 flips to ✅ (or ❌); no bot message is ever edited or
-  deleted.
+  are not rendered — they just end a thought). The **answer** is buffered and posted as a separate
+  message only when complete, so Discord never shows a partially edited response. On settle the 👀
+  flips to ✅ (or ❌); no bot message is ever edited or deleted.
 
 ## Ingress model
 
 Discord delivers normal messages over a **Gateway WebSocket** (outbound), not HTTP webhooks. The
 bot opens a single long-lived Gateway connection in "direct mode" (`startGatewayListener` with a
 large duration; discord.js maintains the session with native RESUME). There is **no public
-ingress** — only a `GET /health` endpoint that reflects the Gateway connection state.
+ingress**. `GET /live` reflects the process; `GET /ready` (and compatibility
+`GET /health`) require durable state and an actually connected Gateway.
 
 > ⚠️ **Run exactly one replica.** Two pods on the same bot token open two Gateway sessions and
 > every message is handled twice. Deploy with `replicas: 1` + `strategy: Recreate`, never autoscale.
@@ -46,9 +47,10 @@ ingress** — only a `GET /health` endpoint that reflects the Gateway connection
 | `DISCORDBOT_TRIGGER_BOT_ALLOWLIST` | – | Comma/space-separated bot/webhook author IDs whose messages may enter sessions (e.g. a Sentry webhook). Empty (default) ⇒ all bot messages are ignored. Use the ID the message is authored as: the bot's user id, or the webhook id for webhook integrations. |
 | `DISCORDBOT_MAX_CONCURRENT_EXECUTIONS_PER_GUILD` | – | In-flight execution cap per guild (default 3). Over the cap, the triggering message gets a 🚦 reaction and is kept as context only. |
 | `DISCORDBOT_ACTIVE_EXECUTION_TTL_MS` | – | Staleness TTL for the per-thread active-execution flag (default 30 min) — unwedges threads after a crash mid-handoff. |
-| `DISCORDBOT_ANSWER_EDIT_INTERVAL_MS` | – | Edit cadence for the streamed answer message (default 1500 ms, clamped to ≥1500 to respect Discord rate limits). |
 | `DISCORD_MENTION_ROLE_IDS` | – | Role mentions that also trigger the bot. |
 | `DISCORDBOT_NAME_THREADS` | – | Set `false` to keep the adapter's generic thread names. |
+| `DISCORDBOT_CONVERSATION_MODE` | – | `thread` (default) or `inline_reply` for channel reply chains. |
+| `DISCORDBOT_PROGRESS_MODE` | – | `narration` (default) or `reactions` to suppress public progress text. |
 | `DISCORDBOT_USER_NAME` | – | Bot display name used for mention parsing/thread naming (default `centaur`; the chart sets it from `discordbot.userName`). |
 | `DISCORDBOT_STATE_KEY_PREFIX` | – | Prefix for rows in the Postgres thread-state store (default `centaur-discordbot`). |
 | `DISCORD_API_URL` | – | Override Discord API base. |
@@ -76,7 +78,7 @@ DM has no guild, so the fail-closed allowlist check rejects it.
 
 A throwaway spike confirmed the three things the static build couldn't prove: discord.js's Gateway
 runs under Bun, a Gateway `MESSAGE_CREATE` dispatches in-process to `chat.onNewMention`, and a
-channel mention auto-creates a thread that the bot streams into. An `@`-mention produced a threaded
+channel mention auto-creates a thread that the bot answers in. An `@`-mention produced a threaded
 reply end-to-end. The spike has served its purpose and been removed.
 
 ## Develop / test
@@ -89,12 +91,11 @@ bun run dev           # run the server locally (needs env above)
 
 ## Known limitations
 
-- The Gateway listener can't expose the precise close code on a fatal end; an unexpected
-  disconnect exits the process so Kubernetes restarts it (CrashLoopBackOff surfaces bad
-  token/intents). `/health` liveness is "listener still running", not a deep socket probe.
-- Concurrency is `'drop'`: the per-thread lock serializes handling so two near-simultaneous mentions
-  can't double-execute. The tradeoff is that a follow-up sent *while a stream is still running* is
-  dropped rather than appended mid-stream; send it again once the reply finishes.
+- The Gateway listener can't expose the precise close code on a fatal end. An
+  unexpected end or connection that stays stale exits the process so
+  Kubernetes replaces it.
+- Concurrency uses a bounded queue per logical conversation. Follow-ups that arrive during a run
+  are appended in order; overflowing or expired queue entries are surfaced to the member.
 - Thread renaming is best-effort, applies on the first execution, and only touches threads the
   bot created from a channel mention (`isThreadCreatedForMessage`); a mention inside a
   user-created thread never renames it (set `DISCORDBOT_NAME_THREADS=false` to disable renaming

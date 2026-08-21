@@ -12,12 +12,14 @@ import {
   type Adapter,
   type Logger,
   type Message as ChatMessage,
+  type MessageContext,
   type StateAdapter,
   type Thread,
 } from "chat";
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import pg from "pg";
 import {
+  discordTurnDeliveryKey,
   isAllowedDiscordGuild,
   isAllowedDiscordMessage,
   isGuildAllowlistEmpty,
@@ -25,7 +27,11 @@ import {
   resolveTriggerBotAllowlist,
 } from "./discord-allowlist";
 import { DiscordNarrator, reactToDiscordMessage } from "./discord-narrator";
-import { fetchThreadStarterMessage } from "./discord-starter";
+import {
+  fetchImmediateReplyContext,
+  fetchInlineReplyContext,
+  fetchThreadStarterMessage,
+} from "./discord-starter";
 import {
   deriveThreadName,
   fetchDiscordChannelName,
@@ -59,13 +65,14 @@ import type {
   TypingCapableAdapter,
 } from "./types";
 import {
-  AsyncTextQueue,
   elapsedMs,
   errorMessage,
   GuildExecutionLimiter,
   noopLogger,
   nowMs,
+  singleFlight,
   sliceSurrogateSafe,
+  suppressDiscordLinkEmbeds,
   takeDiscordMessageChunk,
   traceLog,
 } from "./utils";
@@ -95,7 +102,10 @@ const RENDER_RETRY_INITIAL_DELAY_MS = 250;
 const RENDER_RETRY_MAX_DELAY_MS = 5_000;
 // Discord caps message content at 2000 chars; leave headroom so the honest
 // "[truncated ...]" suffix lands instead of the adapter's silent "..." cut.
-const DISCORD_FALLBACK_TEXT_MAX_CHARS = 1_900;
+// Link suppression adds two characters per URL. Keeping the raw chunk at 1500
+// guarantees even URL-dense output remains below Discord's hard 2000-char cap
+// after every destination is wrapped in `<...>`.
+const DISCORD_FALLBACK_TEXT_MAX_CHARS = 1_500;
 const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250;
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000;
 // Discord delta (no slackbotv2 analog): `activeExecution` persisted before the
@@ -118,11 +128,9 @@ const RENDER_RETRY_MAX_ATTEMPTS = 10;
 const FORWARD_RETRY_DELAYS_MS = [1_000, 3_000];
 // Discord delta (no slackbotv2 analog): per-guild in-flight execution cap.
 const DEFAULT_MAX_CONCURRENT_EXECUTIONS_PER_GUILD = 3;
-// Discord delta: answer streaming across multiple messages (see
-// streamAnswerToThread). Edits to the in-progress message are throttled to
-// this cadence; everything past the full-message cap lands in one final
-// honestly-truncated message.
-const ANSWER_EDIT_INTERVAL_MS = 1_500;
+// Discord delta: final answers are buffered until the renderer completes,
+// then posted without edits. Everything past the full-message cap lands in
+// one final honestly-truncated message.
 const ANSWER_MESSAGE_MAX_CHARS = DISCORD_FALLBACK_TEXT_MAX_CHARS;
 const ANSWER_MAX_FULL_MESSAGES = 10;
 
@@ -171,6 +179,35 @@ export async function resolveDiscordConversationName(
   return name;
 }
 
+async function resolveVisibleChannelScope(
+  options: DiscordbotOptions,
+  message: DiscordbotApiMessage,
+  threadKey: string,
+  logger: Logger,
+): Promise<string[]> {
+  const { guildId, channelId, threadId } = parseDiscordThreadKey(threadKey);
+  const fallback = [channelId, threadId].filter(
+    (value): value is string => Boolean(value),
+  );
+  if (!guildId || !channelId || !options.resolveVisibleChannelIds) return fallback;
+  try {
+    return await options.resolveVisibleChannelIds({
+      currentChannelId: channelId,
+      ...(threadId ? { currentThreadId: threadId } : {}),
+      guildId,
+      userId: message.author.userId,
+    });
+  } catch (error) {
+    logger.warn("discordbot_visibility_scope_failed", {
+      channel_id: channelId,
+      error: errorMessage(error),
+      guild_id: guildId,
+      user_id: message.author.userId,
+    });
+    return fallback;
+  }
+}
+
 export function createDiscordbot(options: DiscordbotOptions): Discordbot {
   const userName = options.userName ?? "centaur";
   const logger = options.logger ?? noopLogger;
@@ -181,10 +218,19 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     });
   }
 
+  const state = options.state ?? createDefaultState(options, logger);
+  // All startup consumers share one retry loop. Without this single-flight
+  // gate, recovery tasks and Gateway initialization race independent
+  // state.connect() calls, and Chat.initialize() can terminate the process on
+  // the first ECONNREFUSED while Postgres is moving between nodes.
+  const ready = singleFlight(async () => {
+    await ensureStateConnected(state, options);
+  });
   const discord = createDiscordAdapter({
     apiUrl: options.discordApiUrl,
     applicationId: options.applicationId,
     botToken: options.botToken,
+    conversationMode: options.conversationMode,
     publicKey: options.publicKey,
     mentionRoleIds: options.mentionRoleIds,
     userName,
@@ -231,7 +277,6 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     // 503 once the connection has been down for >60s (see gateway.ts).
     onGatewayStatusChange: (connected) => setGatewayConnected(connected),
   });
-  const state = options.state ?? createDefaultState(options, logger);
   const chat = new Chat<{ discord: typeof discord }, DiscordbotThreadState>({
     userName,
     adapters: { discord },
@@ -248,7 +293,16 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     // double-execute. `'drop'` keeps the lock: a second message that lands while a handler holds the
     // thread lock is dropped rather than run in parallel. Same code path as before for the
     // no-contention case, so single-message streaming is unchanged.
-    concurrency: "drop",
+    concurrency: {
+      strategy: "queue",
+      maxQueueSize: 1_000,
+      onQueueFull: "drop-newest",
+      queueEntryTtlMs: 5 * 60 * 1_000,
+    },
+    // Queue entries must never cross logical Discord conversations. The
+    // adapter's channel scope would otherwise drain a message from one thread
+    // through another thread's handler.
+    lockScope: "thread",
     logger,
   });
 
@@ -259,43 +313,65 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
       DEFAULT_MAX_CONCURRENT_EXECUTIONS_PER_GUILD,
   );
 
-  chat.onNewMention(async (thread, message) => {
+  chat.onNewMention(async (thread, message, context) => {
     if (!isAllowedDiscordMessage(message, options, logger)) return;
     await thread.subscribe();
     await syncThreadMessageToSession(thread, message, {
       executionLimiter,
       mode: "execute",
       options,
+      precedingMessages: allowedQueuedMessages(context, options, logger),
       state,
     });
   });
 
-  chat.onSubscribedMessage(async (thread, message) => {
+  chat.onSubscribedMessage(async (thread, message, context) => {
     if (!isAllowedDiscordMessage(message, options, logger)) return;
     await syncThreadMessageToSession(thread, message, {
       executionLimiter,
       mode: message.isMention === true ? "execute" : "append",
       options,
+      precedingMessages: allowedQueuedMessages(context, options, logger),
       state,
     });
   });
 
   const app = new Hono();
-  app.get("/health", (c) => {
+  app.get("/live", (c) => c.json({ ok: true, service: "discordbot" }));
+  const readiness = async (c: Context) => {
     const gatewayActive = options.isGatewayActive
       ? options.isGatewayActive()
       : true;
+    const stateReady = await isStateHealthy(state);
+    const readyNow = gatewayActive && stateReady;
     return c.json(
-      { ok: gatewayActive, service: "discordbot", gateway: gatewayActive },
-      gatewayActive ? 200 : 503,
+      {
+        ok: readyNow,
+        service: "discordbot",
+        gateway: gatewayActive,
+        state: stateReady,
+      },
+      readyNow ? 200 : 503,
     );
-  });
+  };
+  app.get("/ready", readiness);
+  app.get("/health", readiness);
 
   if (options.recoverRenderObligationsOnStart !== false) {
-    scheduleRenderObligationRecovery(chat, state, options);
+    scheduleRenderObligationRecovery(chat, state, options, ready);
   }
 
-  return { app, chat, adapter: discord };
+  return { app, chat, adapter: discord, ready };
+}
+
+function allowedQueuedMessages(
+  context: MessageContext | undefined,
+  options: DiscordbotOptions,
+  logger: Logger,
+): ChatMessage[] {
+  return (context?.skipped ?? []).filter((message) =>
+    isAllowedDiscordMessage(message, options, logger),
+  );
 }
 
 function createDefaultState(
@@ -308,7 +384,11 @@ function createDefaultState(
   // while the pod's network is still being programmed at startup). With no
   // listener, node-postgres rethrows it as an uncaught exception and the process
   // crashes/spews. Logging and swallowing lets the pool reconnect on the next query.
-  const pool = new pg.Pool({ connectionString: options.postgresUrl });
+  const pool = new pg.Pool({
+    connectionString: options.postgresUrl,
+    connectionTimeoutMillis: 5_000,
+    query_timeout: 5_000,
+  });
   pool.on("error", (error) => {
     stateLogger.warn("postgres pool error", { error: errorMessage(error) });
   });
@@ -354,6 +434,15 @@ async function ensureStateConnected(
   }
 }
 
+async function isStateHealthy(state: StateAdapter): Promise<boolean> {
+  try {
+    await state.get("discordbot:health");
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Persists a Discord thread update into the session API. In execute mode the create/append/execute
  * handoff completes before the handler returns; SSE rendering continues in background.
@@ -365,6 +454,7 @@ async function syncThreadMessageToSession(
     executionLimiter: GuildExecutionLimiter;
     mode: DiscordbotMessageMode;
     options: DiscordbotOptions;
+    precedingMessages?: ChatMessage[];
     state: StateAdapter;
   },
 ): Promise<void> {
@@ -409,6 +499,9 @@ async function syncThreadMessageToSession(
     shouldStartExecution && state.historyForwarded !== true;
   const isDuplicateIncrementalMessage =
     messageIds.has(message.id) &&
+    !(input.precedingMessages ?? []).some(
+      (item) => !messageIds.has(item.id),
+    ) &&
     !shouldStartExecution &&
     !shouldIncludeContext;
   const trace: DiscordbotTrace = {
@@ -430,12 +523,33 @@ async function syncThreadMessageToSession(
 
   const serializeStartedAtMs = nowMs();
   const serializedMessage = await serializeMessage(message);
+  const serializedPrecedingMessages = (
+    await Promise.all((input.precedingMessages ?? []).map(serializeMessage))
+  ).filter((item) => !isContentlessApiMessage(item));
   traceLog(input.options, "discordbot_forward_message_serialized", trace, {
-    attachment_count: serializedMessage.attachments.length,
+    attachment_count:
+      serializedMessage.attachments.length +
+      serializedPrecedingMessages.reduce(
+        (count, item) => count + item.attachments.length,
+        0,
+      ),
+    queued_message_count: serializedPrecedingMessages.length,
     phase_ms: elapsedMs(serializeStartedAtMs),
   });
 
-  // Discord delta (no slackbotv2 analog): a sticker-only/forwarded/poll/system
+  const isInlineReply = Boolean(
+    parseDiscordThreadKey(thread.id).replyToMessageId,
+  );
+  if (shouldStartExecution && isInlineReply && !shouldIncludeContext) {
+    serializedMessage.replyContext = await fetchImmediateReplyContext(
+      input.options,
+      thread.id,
+      serializedMessage,
+      input.options.logger ?? noopLogger,
+    );
+  }
+
+  // Discord delta (no slackbotv2 analog): a sticker-only/poll/system
   // mention serializes to empty text with no attachments; executing it would
   // fabricate a synthetic "continue" turn. React ❓ and skip instead.
   if (shouldStartExecution && isContentlessApiMessage(serializedMessage)) {
@@ -454,7 +568,14 @@ async function syncThreadMessageToSession(
   if (shouldIncludeContext && !state.historyForwarded) {
     const contextStartedAtMs = nowMs();
     try {
-      context = await collectInitialContext(thread, message);
+      context = isInlineReply
+        ? await fetchInlineReplyContext(
+            input.options,
+            thread.id,
+            serializedMessage,
+            input.options.logger ?? noopLogger,
+          )
+        : await collectInitialContext(thread, message);
     } catch (error) {
       if (!isDiscordPermissionError(error)) throw error;
       // Discord delta (no slackbotv2 analog): a 403 here (missing Read Message
@@ -468,8 +589,11 @@ async function syncThreadMessageToSession(
         { error: errorMessage(error) },
       );
       await thread
-        .post(
-          "I can't read this channel's history — I'm missing permissions (Read Message History).",
+        .adapter.postMessage(
+          discordTurnDeliveryKey(thread.id, message.id),
+          {
+            raw: "I can't read this channel's history — I'm missing permissions (Read Message History).",
+          },
         )
         .catch(() => undefined);
       await reactToDiscordMessage(
@@ -483,11 +607,13 @@ async function syncThreadMessageToSession(
     // in the parent channel, so thread history alone misses it (Slack's
     // conversations.replies includes the parent). Prefer the fetched starter
     // over any thread-starter stub already in the history.
-    const starter = await fetchThreadStarterMessage(
-      input.options,
-      thread.id,
-      input.options.logger ?? noopLogger,
-    );
+    const starter = isInlineReply
+      ? null
+      : await fetchThreadStarterMessage(
+          input.options,
+          thread.id,
+          input.options.logger ?? noopLogger,
+        );
     if (starter) {
       context = [starter, ...context.filter((item) => item.id !== starter.id)];
     }
@@ -506,7 +632,10 @@ async function syncThreadMessageToSession(
   const renderLease: { release: (() => Promise<void>) | null } = {
     release: null,
   };
-  const candidateMessages = context ?? [serializedMessage];
+  const candidateMessages = context ?? [
+    ...serializedPrecedingMessages,
+    serializedMessage,
+  ];
   const messagesToAppend = candidateMessages.filter(
     (item) => !messageIds.has(item.id),
   );
@@ -517,8 +646,19 @@ async function syncThreadMessageToSession(
     thread.id,
     logger,
   );
+  const visibleChannelIds = shouldStartExecution
+    ? await resolveVisibleChannelScope(
+        input.options,
+        serializedMessage,
+        thread.id,
+        logger,
+      )
+    : undefined;
 
   const forwardInput: ForwardSessionInput = {
+    actorUserId: shouldStartExecution
+      ? serializedMessage.author.userId
+      : undefined,
     afterEventId: lastEventId,
     conversationName,
     executeMessage: shouldStartExecution ? serializedMessage : undefined,
@@ -529,6 +669,7 @@ async function syncThreadMessageToSession(
     openStream: false,
     threadId: thread.id,
     trace,
+    visibleChannelIds,
   };
 
   const commitMessagesAppended = async (): Promise<void> => {
@@ -703,6 +844,7 @@ function scheduleExecutionRender(
           isInitialExecution,
           trace,
           onExecutionStarted,
+          onSettled,
         );
         if (result === "complete") return;
         // Discord delta (no slackbotv2 analog): cap the retry loop — see
@@ -733,7 +875,7 @@ function scheduleExecutionRender(
           ).catch(() => undefined);
           return;
         }
-        const delayMs = renderRetryDelayMs(attempt);
+        const delayMs = renderRetryDelayMs(attempt, options);
         attempt += 1;
         traceLog(options, "discordbot_render_retry_scheduled", trace, {
           retry_delay_ms: delayMs,
@@ -812,6 +954,7 @@ async function renderExecutionAttempt(
   onExecutionStarted?: (
     execution: DiscordbotExecuteSessionResponse,
   ) => Promise<void>,
+  onExecutionSettled?: () => void,
 ): Promise<"complete" | "retry"> {
   let rendered = false;
   let retry = false;
@@ -850,6 +993,10 @@ async function renderExecutionAttempt(
       lastEventId: Math.max(latest.lastEventId ?? 0, getLastEventId()),
       ...(rendered ? { renderObligation: null } : {}),
     });
+    // The public reaction lifecycle and durable thread state now agree that
+    // this attempt is terminal. Release guild capacity before best-effort
+    // render-lease cleanup, which must not delay the next conversation.
+    if (!retry) onExecutionSettled?.();
     traceLog(options, "discordbot_render_finalized", trace, {
       obligation_cleared: rendered,
       retry_scheduled: retry,
@@ -862,18 +1009,22 @@ function scheduleRenderObligationRecovery(
   chat: Chat<Record<string, Adapter>, DiscordbotThreadState>,
   state: StateAdapter,
   options: DiscordbotOptions,
+  ready: () => Promise<void>,
 ): void {
-  backgroundWaitUntil(recoverRenderObligationsWithRetry(chat, state, options));
+  backgroundWaitUntil(
+    recoverRenderObligationsWithRetry(chat, state, options, ready),
+  );
 }
 
 async function recoverRenderObligationsWithRetry(
   chat: Chat<Record<string, Adapter>, DiscordbotThreadState>,
   state: StateAdapter,
   options: DiscordbotOptions,
+  ready: () => Promise<void>,
 ): Promise<void> {
   // Wait for Postgres before scanning for obligations. This is also what warms the
   // shared pool at startup, so transient connect failures don't wedge the bot.
-  await ensureStateConnected(state, options);
+  await ready();
   let attempt = 0;
   while (true) {
     try {
@@ -883,7 +1034,7 @@ async function recoverRenderObligationsWithRetry(
         options,
       );
       if (deferredCount === 0) return;
-      const delayMs = renderRetryDelayMs(attempt);
+      const delayMs = renderRetryDelayMs(attempt, options);
       attempt += 1;
       traceLog(
         options,
@@ -1167,6 +1318,15 @@ async function renderExecutionStream(
   trace?: DiscordbotTrace,
 ): Promise<void> {
   const logger = options.logger ?? noopLogger;
+  const responseFooter = (): string | undefined =>
+    buildDiscordResponseFooter({
+      elapsedMs:
+        trace && options.responseLatencyEnabled === true
+          ? Math.max(0, nowMs() - trace.startedAtMs)
+          : undefined,
+      isFirstAssistantMessage: isInitialExecution,
+      options,
+    });
   if (
     isInitialExecution &&
     options.nameThreads !== false &&
@@ -1194,7 +1354,9 @@ async function renderExecutionStream(
         thread,
         stream,
         options,
+        discordTurnDeliveryKey(thread.id, message.id),
         trace,
+        responseFooter,
       );
       await narrator.finish(sawError ? "failed" : "done");
     } catch (error) {
@@ -1208,14 +1370,21 @@ async function renderExecutionStream(
 
   // Append-only narration: an instant 👀 reaction on the triggering message,
   // then the agent's reasoning blurbs posted as their own subtext (-#)
-  // messages as each thought completes, then the answer streamed into a separate message
-  // created on first answer text. On settle the 👀 flips to ✅/❌. No bot
-  // message is ever edited or deleted, so messages keep their place in the
-  // timeline even when users chime in mid-run.
+  // messages as each thought completes, then the completed answer posted as
+  // a separate message. On settle the 👀 flips to ✅/❌. No bot message is
+  // ever edited or deleted, so messages keep their place in the timeline even
+  // when users chime in mid-run.
   const narrator = DiscordNarrator.start(thread, message, options, { logger });
   const stopTyping = startTypingKeepalive(thread, logger);
   try {
-    await renderSplitExecutionStreams(thread, stream, options, narrator);
+    await renderSplitExecutionStreams(
+      thread,
+      stream,
+      options,
+      narrator,
+      discordTurnDeliveryKey(thread.id, message.id),
+      responseFooter,
+    );
     await narrator.finish("done");
   } catch (error) {
     await narrator.finish(
@@ -1229,176 +1398,84 @@ async function renderExecutionStream(
 
 /**
  * Consumes the renderer's chunk stream, routing task updates to the narrator
- * (reasoning blurbs) and answer text to separately streamed messages. The
- * answer post is created lazily on the first visible answer chunk (which is
- * also what keeps the startingStreamNotification priming working: the
- * synthetic item only unblocks deltas, it never creates an empty message).
+ * (reasoning blurbs) while buffering answer deltas. The completed answer is
+ * posted only after the source stream settles successfully; the synthetic
+ * startingStreamNotification item only unblocks deltas and never creates an
+ * empty message.
  */
 async function renderSplitExecutionStreams(
   thread: Thread,
   stream: AsyncIterable<DiscordbotRendererSource>,
   options: DiscordbotOptions,
   narrator: DiscordNarrator,
+  deliveryThreadId: string,
+  responseFooter?: () => string | undefined,
 ): Promise<void> {
-  const answerText = new AsyncTextQueue();
-  let answerPost: Promise<unknown> | null = null;
-  let sourceFailed = false;
-  try {
-    for await (const chunk of harnessToChatSdkStream(
-      stream,
-      rendererOptions(options, narrator),
-    )) {
-      if (chunk.type === "markdown_text") {
-        if (!answerPost) {
-          // Discord delta: stream the answer ourselves across multiple
-          // ≤1900-char messages instead of the chat SDK's single-message
-          // post+edit fallback, which silently truncates at Discord's
-          // 2000-char cap with "...".
-          answerPost = streamAnswerToThread(thread, answerText, options);
-          // Swallow rejections until the finally below awaits the original
-          // promise; otherwise an early failure (deleted thread/403) becomes
-          // an unhandled rejection while this loop keeps consuming.
-          answerPost.catch(() => undefined);
-        }
-        answerText.push(chunk.text);
-        continue;
-      }
-      narrator.update(chunk);
+  let answerText = "";
+  for await (const chunk of harnessToChatSdkStream(
+    stream,
+    rendererOptions(options, narrator),
+  )) {
+    if (chunk.type === "markdown_text") {
+      answerText += chunk.text;
+      continue;
     }
-  } catch (error) {
-    sourceFailed = true;
-    throw error;
-  } finally {
-    answerText.end();
-    if (answerPost) {
-      // Settle the answer post either way, but when the source stream failed
-      // that error is the one worth propagating.
-      if (sourceFailed) await answerPost.catch(() => undefined);
-      else await answerPost;
-    }
+    narrator.update(chunk);
   }
+  await postBufferedAnswerToThread(
+    thread,
+    appendDiscordResponseFooter(answerText, responseFooter?.()),
+    deliveryThreadId,
+  );
 }
 
 /**
- * Discord delta (replaces the chat SDK's post+edit fallbackStream for the
- * answer): streams answer text into Discord across MULTIPLE messages, each
- * ≤ ANSWER_MESSAGE_MAX_CHARS, splitting at newline/whitespace boundaries
+ * Discord delta (replaces the chat SDK's post+edit fallbackStream): posts a
+ * completed answer across multiple messages when necessary, each no longer
+ * than ANSWER_MESSAGE_MAX_CHARS, splitting at newline/whitespace boundaries
  * (never through a surrogate pair; code fences are closed and re-opened when
- * a split inside one is unavoidable). The in-progress message is created on
- * the first visible text and edited at most once per ANSWER_EDIT_INTERVAL_MS.
- * Past ANSWER_MAX_FULL_MESSAGES the remainder collapses into one final
- * honestly-truncated message ("[truncated N chars ...]", never a silent
- * "..."). A failure of the final edit/post does not fail the run: it is
- * logged, the already-posted content stands, and a short note is appended
- * best-effort. Mid-stream post failures still propagate (the thread is gone).
+ * a split inside one is unavoidable). Past ANSWER_MAX_FULL_MESSAGES the
+ * remainder collapses into one final honestly-truncated message
+ * ("[truncated N chars ...]", never a silent "..."). Posting failures
+ * propagate so the run is not falsely marked successful.
  * Exported for tests only.
  */
-export async function streamAnswerToThread(
+export async function postBufferedAnswerToThread(
   thread: Thread,
-  source: AsyncIterable<string>,
-  options: DiscordbotOptions,
+  answer: string,
+  deliveryThreadId = thread.id,
 ): Promise<void> {
-  const logger = options.logger ?? noopLogger;
-  const editIntervalMs = Math.max(
-    options.answerEditIntervalMs ?? ANSWER_EDIT_INTERVAL_MS,
-    ANSWER_EDIT_INTERVAL_MS,
-  );
-  let pending = "";
-  let current: { id: string; threadId: string } | null = null;
-  let lastEditedContent = "";
-  let lastEditAtMs = 0;
+  let pending = answer;
   let postedCount = 0;
 
   const postNew = async (content: string): Promise<void> => {
     // `raw` skips the SDK's markdown round-trip: re-stringifying could change
     // the text length past Discord's 2000-char cap (re-triggering the
     // adapter's silent truncation) and Discord renders markdown natively.
-    const raw = await thread.adapter.postMessage(thread.id, { raw: content });
-    current = { id: raw.id, threadId: raw.threadId || thread.id };
-    lastEditedContent = content;
-    lastEditAtMs = nowMs();
+    const visibleContent = suppressDiscordLinkEmbeds(content);
+    await thread.adapter.postMessage(deliveryThreadId, {
+      raw: visibleContent,
+    });
     postedCount += 1;
   };
 
-  const editCurrent = async (content: string): Promise<void> => {
-    if (!current || content === lastEditedContent) return;
-    await thread.adapter.editMessage(current.threadId, current.id, {
-      raw: content,
-    });
-    lastEditedContent = content;
-  };
-
-  /** Freeze the in-progress message at `content` (or post it whole). */
-  const finalizeMessage = async (content: string): Promise<void> => {
-    if (current) {
-      await editCurrent(content);
-      current = null;
-      lastEditedContent = "";
-    } else if (content.trim()) {
-      await postNew(content);
-      current = null;
-      lastEditedContent = "";
-    }
-  };
-
   const overflowed = (): boolean => postedCount >= ANSWER_MAX_FULL_MESSAGES;
-  const pendingView = (): string =>
+  while (!overflowed()) {
+    const split = takeDiscordMessageChunk(pending, ANSWER_MESSAGE_MAX_CHARS);
+    if (!split) break;
+    await postNew(split.chunk);
+    pending = split.rest;
+  }
+  if (!pending.trim()) return;
+  await postNew(
     overflowed()
       ? truncateDiscordText(
           pending,
           ANSWER_MESSAGE_MAX_CHARS,
           "Discord final answer",
         )
-      : pending;
-
-  for await (const piece of source) {
-    pending += piece;
-    while (!overflowed()) {
-      const split = takeDiscordMessageChunk(pending, ANSWER_MESSAGE_MAX_CHARS);
-      if (!split) break;
-      await finalizeMessage(split.chunk);
-      pending = split.rest;
-    }
-    const view = pendingView();
-    if (!view.trim()) continue;
-    if (!current) {
-      await postNew(view);
-    } else if (nowMs() - lastEditAtMs >= editIntervalMs) {
-      lastEditAtMs = nowMs();
-      try {
-        await editCurrent(view);
-      } catch (error) {
-        // In-progress edits are cosmetic; the final flush retries the content.
-        logger.warn("discordbot_answer_edit_failed", {
-          error: errorMessage(error),
-        });
-      }
-    }
-  }
-
-  // Final flush. A failure here must not fail an otherwise-successful run.
-  try {
-    while (!overflowed()) {
-      const split = takeDiscordMessageChunk(pending, ANSWER_MESSAGE_MAX_CHARS);
-      if (!split) break;
-      await finalizeMessage(split.chunk);
-      pending = split.rest;
-    }
-    const view = pendingView();
-    if (view.trim()) await finalizeMessage(view);
-  } catch (error) {
-    logger.warn("discordbot_answer_finalize_failed", {
-      error: errorMessage(error),
-      pending_chars: pending.length,
-    });
-    try {
-      await thread.adapter.postMessage(thread.id, {
-        raw: "-# ⚠️ The end of this answer failed to post; the output above may be incomplete.",
-      });
-    } catch {
-      // Best-effort only — the run itself succeeded.
-    }
-  }
+      : pending,
+  );
 }
 
 async function renderRecoveredExecutionStream(
@@ -1418,7 +1495,9 @@ async function renderPlainTextExecutionStream(
   thread: Thread,
   stream: AsyncIterable<DiscordbotRendererSource>,
   options: DiscordbotOptions,
+  deliveryThreadId: string,
   trace?: DiscordbotTrace,
+  responseFooter?: () => string | undefined,
 ): Promise<boolean> {
   const logger = options.logger ?? noopLogger;
   const fallback = new DiscordRenderFallback();
@@ -1438,19 +1517,84 @@ async function renderPlainTextExecutionStream(
         sawError = true;
       }
     }
-    const text = truncateDiscordText(
-      fallback.text() || "Execution completed, but no final text was captured.",
-      DISCORD_FALLBACK_TEXT_MAX_CHARS,
-      "Discord final answer",
+    const text = suppressDiscordLinkEmbeds(
+      truncateDiscordText(
+        appendDiscordResponseFooter(
+          fallback.text() ||
+            "Execution completed, but no final text was captured.",
+          responseFooter?.(),
+        ),
+        DISCORD_FALLBACK_TEXT_MAX_CHARS,
+        "Discord final answer",
+      ),
     );
     traceLog(options, "discordbot_render_plain_text_final", trace, {
       chars: text.length,
     });
-    await thread.post(text);
+    await thread.adapter.postMessage(deliveryThreadId, { raw: text });
   } finally {
     stopTyping();
   }
   return sawError;
+}
+
+export function buildDiscordResponseFooter(input: {
+  elapsedMs?: number;
+  isFirstAssistantMessage: boolean;
+  options: Pick<
+    DiscordbotOptions,
+    | "responseLatencyEnabled"
+    | "responseMetadataHarness"
+    | "responseMetadataMode"
+    | "responseMetadataModel"
+    | "responseMetadataReasoning"
+  >;
+}): string | undefined {
+  const mode = input.options.responseMetadataMode ?? "first";
+  if (
+    mode === "never" ||
+    (mode === "first" && !input.isFirstAssistantMessage)
+  ) {
+    return undefined;
+  }
+  const segments: string[] = [];
+  const model = input.options.responseMetadataModel?.trim();
+  if (model) segments.push(model.toUpperCase());
+  const harness = titleCaseDisplay(input.options.responseMetadataHarness);
+  if (harness) segments.push(harness);
+  const reasoning = titleCaseDisplay(input.options.responseMetadataReasoning);
+  if (reasoning) segments.push(reasoning);
+  if (
+    input.options.responseLatencyEnabled === true &&
+    input.elapsedMs !== undefined
+  ) {
+    segments.push(formatResponseLatency(input.elapsedMs));
+  }
+  return segments.length > 0 ? `-# ${segments.join(" · ")}` : undefined;
+}
+
+function appendDiscordResponseFooter(answer: string, footer?: string): string {
+  if (!footer) return answer;
+  return `${answer.trimEnd()}\n\n${footer}`;
+}
+
+function titleCaseDisplay(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  if (!normalized) return undefined;
+  const key = normalized.toLowerCase();
+  if (key === "codex") return "Codex";
+  if (key === "nanocodex") return "Nanocodex";
+  if (key === "claudecode") return "Claude Code";
+  return key
+    .split(/[\s_-]+/)
+    .filter(Boolean)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+function formatResponseLatency(milliseconds: number): string {
+  if (milliseconds < 1_000) return `${Math.round(milliseconds)}ms`;
+  return `${(milliseconds / 1_000).toFixed(1)}s`;
 }
 
 class DiscordRenderFallback {
@@ -1640,10 +1784,20 @@ function rendererOptions(
   };
 }
 
-function renderRetryDelayMs(attempt: number): number {
+function renderRetryDelayMs(
+  attempt: number,
+  options: Pick<
+    DiscordbotOptions,
+    "renderRetryInitialDelayMs" | "renderRetryMaxDelayMs"
+  >,
+): number {
+  const initialDelayMs =
+    options.renderRetryInitialDelayMs ?? RENDER_RETRY_INITIAL_DELAY_MS;
+  const maxDelayMs =
+    options.renderRetryMaxDelayMs ?? RENDER_RETRY_MAX_DELAY_MS;
   return Math.min(
-    RENDER_RETRY_INITIAL_DELAY_MS * 2 ** attempt,
-    RENDER_RETRY_MAX_DELAY_MS,
+    initialDelayMs * 2 ** attempt,
+    maxDelayMs,
   );
 }
 

@@ -704,6 +704,15 @@ discordbot:
   mentionRoleIds: ""
   # Rename auto-created threads to the triggering message; set false to keep generic names.
   nameThreads: true
+  # New channel mentions use native threads or inline reply chains.
+  conversationMode: thread
+  # Set reactions to suppress public status/reasoning text.
+  progressMode: narration
+  # Append model, harness, and reasoning to the first completed response,
+  # every response, or no responses. The footer is a Discord subtext line.
+  responseMetadataMode: first
+  # Add end-to-end turn latency to the same footer when it is rendered.
+  responseLatencyEnabled: false
   extraEnv: {}
   resources: {}
 

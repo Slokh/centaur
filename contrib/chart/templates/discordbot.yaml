@@ -23,6 +23,9 @@ spec:
       labels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 8 }}
     spec:
+      {{- with .Values.global.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       automountServiceAccountToken: false
       # Allow the Gateway to drain and close cleanly on SIGTERM (protects the IDENTIFY budget).
       terminationGracePeriodSeconds: 35
@@ -32,7 +35,7 @@ spec:
       {{- end }}
       containers:
         - name: discordbot
-          image: {{ printf "%s:%s" .Values.discordbot.image.repository .Values.discordbot.image.tag | quote }}
+          image: {{ include "centaur.imageRef" .Values.discordbot.image | quote }}
           imagePullPolicy: {{ .Values.discordbot.image.pullPolicy }}
           env:
             - name: PORT
@@ -68,6 +71,21 @@ spec:
               value: {{ .Values.discordbot.userName | quote }}
             - name: DISCORDBOT_GUILD_ALLOWLIST
               value: {{ .Values.discordbot.guildAllowlist | quote }}
+            - name: DISCORDBOT_CONVERSATION_MODE
+              value: {{ .Values.discordbot.conversationMode | quote }}
+            - name: DISCORDBOT_PROGRESS_MODE
+              value: {{ .Values.discordbot.progressMode | quote }}
+            - name: DISCORDBOT_RESPONSE_METADATA_MODE
+              value: {{ .Values.discordbot.responseMetadataMode | quote }}
+            - name: DISCORDBOT_RESPONSE_LATENCY_ENABLED
+              value: {{ .Values.discordbot.responseLatencyEnabled | quote }}
+{{- range $name := tuple "CODEX_MODEL" "CODEX_MODEL_REASONING_EFFORT" }}
+{{- if and (hasKey $.Values.sandbox.extraEnv $name) (not (hasKey $.Values.discordbot.extraEnv $name)) }}
+            # Mirror the harness default so Discord describes what sandboxes run.
+            - name: {{ $name }}
+              value: {{ index $.Values.sandbox.extraEnv $name | toString | quote }}
+{{- end }}
+{{- end }}
 {{- if .Values.discordbot.mentionRoleIds }}
             - name: DISCORD_MENTION_ROLE_IDS
               value: {{ .Values.discordbot.mentionRoleIds | quote }}
@@ -88,17 +106,17 @@ spec:
           # kill the pod mid-login (each restart burns the 1000/24h IDENTIFY budget).
           startupProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: 3001
             periodSeconds: 5
             failureThreshold: 24
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: 3001
           livenessProbe:
             httpGet:
-              path: /health
+              path: /live
               port: 3001
             periodSeconds: 15
           securityContext:
