@@ -537,6 +537,12 @@ apiRs:
     timeoutSeconds: 5
   terminationGracePeriodSeconds: 35
   extraEnv: {}
+  # Optional execution-bound gateway to one private application service.
+  applicationGateway:
+    enabled: false
+    url: ""
+    capabilities: ""
+    signingSecretKey: CENTAUR_APPLICATION_SIGNING_SECRET
   resources: {}
 
 # Chat SDK Slackbot v2. Forwards Slack events to the api-rs control plane

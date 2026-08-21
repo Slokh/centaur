@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io;
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command as ProcessCommand};
@@ -27,6 +28,7 @@ pub struct ThreadState {
     pub completed_turns: Vec<Turn>,
     pub process: Option<HarnessChild>,
     pub thread_started_sent: bool,
+    pub session_env: BTreeMap<String, String>,
 }
 
 pub struct HarnessChild {
@@ -101,6 +103,7 @@ pub trait HarnessServer {
             completed_turns: Vec::new(),
             process: None,
             thread_started_sent: false,
+            session_env: BTreeMap::new(),
         }
     }
 }

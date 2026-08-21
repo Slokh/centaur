@@ -86,11 +86,21 @@ def current_thread_key() -> str:
     except LookupError:
         thread_key = None
     if not thread_key:
+        thread_key = os.environ.get("CENTAUR_THREAD_KEY", "").strip() or None
+    if not thread_key:
         raise RuntimeError(
             "this operation must run inside a scoped thread: no thread_key "
-            "in the tool context."
+            "in the tool context or environment."
         )
     return thread_key
+
+
+def _require_api_server_enabled(operation: str) -> None:
+    if secret("CENTAUR_SANDBOX_API_SERVER_ENABLED", "true").strip().lower() == "false":
+        raise RuntimeError(
+            f"{operation} requires the API server sandbox capability, but it is disabled "
+            "for this principal."
+        )
 
 
 def current_session_context() -> dict[str, Any]:
@@ -104,6 +114,24 @@ def current_session_context() -> dict[str, Any]:
     base_url = secret("CENTAUR_API_URL", "http://api:8000").rstrip("/")
     request = urllib.request.Request(
         f"{base_url}/api/session/{quote(thread_key, safe='')}",
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read())
+
+
+def current_scoped_session_context() -> dict[str, Any]:
+    """Return API-owned context after verifying the session-bound gateway key.
+
+    Use this for mutations or transport delivery. Changing
+    ``CENTAUR_THREAD_KEY`` cannot authorize a different session because the
+    credential is derived from the original thread key by the API.
+    """
+    _require_api_server_enabled("current_scoped_session_context")
+    thread_key = current_thread_key()
+    base_url = secret("CENTAUR_API_URL", "http://api:8000").rstrip("/")
+    request = urllib.request.Request(
+        f"{base_url}/api/session/{quote(thread_key, safe='')}/scoped-context",
         method="GET",
     )
     with urllib.request.urlopen(request, timeout=30) as response:
@@ -125,9 +153,9 @@ def current_slack_thread() -> dict[str, str]:
 def current_discord_thread() -> dict[str, str]:
     """Return the current Discord destination.
 
-    ``{"guild_id": ..., "channel_id": ..., "thread_id": ...}`` (``thread_id`` is
-    omitted for a channel-root message). Raises if the current thread is not a
-    Discord thread.
+    ``{"guild_id": ..., "channel_id": ..., "thread_id": ...,
+    "reply_to_message_id": ...}`` (the thread and reply ids are omitted when
+    absent). Raises if the current thread is not a Discord thread.
     """
     context = current_session_context()
     discord = context.get("discord")
@@ -143,6 +171,29 @@ def current_discord_thread() -> dict[str, str]:
     }
     if discord.get("thread_id"):
         destination["thread_id"] = str(discord["thread_id"])
+    if discord.get("reply_to_message_id"):
+        destination["reply_to_message_id"] = str(discord["reply_to_message_id"])
+    return destination
+
+
+def current_scoped_discord_thread() -> dict[str, str]:
+    """Return the current Discord destination with session-bound authorization."""
+    context = current_scoped_session_context()
+    discord = context.get("discord")
+    if (
+        not isinstance(discord, dict)
+        or not discord.get("guild_id")
+        or not discord.get("channel_id")
+    ):
+        raise RuntimeError(f"current thread is not a Discord thread: {context.get('thread_key')!r}")
+    destination = {
+        "guild_id": str(discord["guild_id"]),
+        "channel_id": str(discord["channel_id"]),
+    }
+    if discord.get("thread_id"):
+        destination["thread_id"] = str(discord["thread_id"])
+    if discord.get("reply_to_message_id"):
+        destination["reply_to_message_id"] = str(discord["reply_to_message_id"])
     return destination
 
 
@@ -198,7 +249,8 @@ def current_chat_destination() -> dict[str, str | int]:
 
     Always includes ``platform`` (``"slack"`` / ``"discord"`` / ``"linear"`` /
     ``"github"``) plus that platform's destination ids (Slack:
-    ``channel_id``/``thread_ts``; Discord: ``guild_id``/``channel_id``/``thread_id``;
+    ``channel_id``/``thread_ts``; Discord:
+    ``guild_id``/``channel_id``/``thread_id``/``reply_to_message_id``;
     Linear: ``issue_id``/``comment_id``/``agent_session_id``; GitHub:
     ``owner``/``repo``/``number``/``kind``/``review_comment_id``). Prefer this
     over the platform-specific helpers when writing tooling that should work on

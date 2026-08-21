@@ -225,13 +225,13 @@
         "tolerations": { "type": "array" },
         "runtimeClassName": { "type": "string" },
         "reposPath": { "type": "string" },
-        "resources": { "type": "object" },
         "telemetry": {
           "type": "object",
           "properties": {
             "captureTranscripts": { "type": "boolean" }
           }
-        }
+        },
+        "resources": { "type": "object" }
       }
     },
     "repoCache": {
