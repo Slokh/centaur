@@ -3,6 +3,10 @@ fullnameOverride: ""
 
 global:
   imagePullSecrets: []
+  # Optional PriorityClass for chart-managed control-plane workloads. Keep this
+  # above sandbox.priorityClassName so essential services can preempt disposable
+  # agent capacity when a node is lost or the cluster is saturated.
+  priorityClassName: ""
 
 secretManager:
   envPrefix: ""
@@ -19,6 +23,7 @@ ironProxy:
   image:
     repository: centaur-iron-proxy
     tag: latest
+    digest: ""
     pullPolicy: Always
   service:
     proxyPort: 8080
@@ -79,6 +84,7 @@ toolServer:
   runnerImage:
     repository: ""
     tag: ""
+    digest: ""
     pullPolicy: ""
   # GitHub token for direct private-repo clones when repoCache.enabled=false.
   # With the default repo-cache path, configure repoCache.githubToken instead.
@@ -129,6 +135,7 @@ console:
   image:
     repository: centaur-console
     tag: latest
+    digest: ""
     # Default Always: the image is published under the mutable `latest` tag, so
     # IfNotPresent would pin pods to whatever digest a node already cached.
     pullPolicy: Always
@@ -287,10 +294,14 @@ codex:
   customProviders: {}
 
 sandbox:
+  # Optional lower-priority class applied to runtime-created sandbox and paired
+  # iron-proxy pods.
+  priorityClassName: ""
   controller: pod
   image:
     repository: centaur-agent
     tag: latest
+    digest: ""
     pullPolicy: Always
   # Node steering for sandbox pods **and** their paired iron-proxy pods. These
   # reach the pod through the control plane, not through this chart's templates:
@@ -328,6 +339,13 @@ sandbox:
   # their session's harness via container args; the sandbox image CMD only
   # matters for containers started outside api-rs.
   harnessEngine: codex
+  # Tool CLI names whose environments must be materialized before a sandbox is
+  # ready. Mounted/repo-cache tools are supported because prewarming runs after
+  # tool-shim installation. Use [] to disable. A configured tool that is
+  # missing, fails `--help`, or exceeds the timeout fails sandbox startup.
+  prewarmTools:
+    - application
+  prewarmTimeoutSeconds: 60
   # Copied into every sandbox pod. CLAUDE_MODEL / CODEX_MODEL set here are also
   # mirrored into slackbotv2 and the Console; CODEX_MODEL_REASONING_EFFORT is
   # mirrored into slackbotv2. This keeps Slack's model/thinking footer aligned
@@ -372,6 +390,7 @@ repoCache:
   image:
     repository: ""
     tag: ""
+    digest: ""
     pullPolicy: ""
   githubToken:
     # Optional for public repos; required for private repos.
@@ -413,6 +432,7 @@ apiRs:
   image:
     repository: centaur-api-rs
     tag: latest
+    digest: ""
     pullPolicy: Always
   port: 8080
   # Public/local MCP endpoint advertised through OAuth protected-resource
@@ -531,6 +551,13 @@ apiRs:
     timeoutSeconds: 5
   terminationGracePeriodSeconds: 35
   extraEnv: {}
+  # Optional execution-bound gateway to one private application service.
+  applicationGateway:
+    enabled: false
+    url: ""
+    capabilities: ""
+    signingSecretKey: CENTAUR_APPLICATION_SIGNING_SECRET
+    gatewayKeySecretKey: CENTAUR_APPLICATION_GATEWAY_KEY
   resources: {}
 
 # Chat SDK Slackbot v2. Forwards Slack events to the api-rs control plane
@@ -541,6 +568,7 @@ slackbotv2:
   image:
     repository: centaur-slackbotv2
     tag: latest
+    digest: ""
     pullPolicy: Always
   userName: centaur
   assistantStatus: ""
@@ -608,6 +636,7 @@ linearbot:
   image:
     repository: centaur-linearbot
     tag: latest
+    digest: ""
     pullPolicy: Always
   userName: centaur
   extraEnv: {}
@@ -626,6 +655,7 @@ githubbot:
   image:
     repository: centaur-githubbot
     tag: latest
+    digest: ""
     pullPolicy: Always
   userName: ""
   # v2 PR self-management (only acts on PRs assigned to the bot account).
@@ -665,6 +695,7 @@ discordbot:
   image:
     repository: centaur-discordbot
     tag: latest
+    digest: ""
     pullPolicy: Always
   userName: centaur
   # Comma/space-separated Discord guild IDs. The bot is INERT (ignores all messages) until set.
@@ -673,6 +704,36 @@ discordbot:
   mentionRoleIds: ""
   # Rename auto-created threads to the triggering message; set false to keep generic names.
   nameThreads: true
+  # New channel mentions use native threads or inline reply chains.
+  conversationMode: thread
+  # Set reactions to suppress public status/reasoning text.
+  progressMode: narration
+  # Append model, harness, and reasoning to the first completed response,
+  # every response, or no responses. The footer is a Discord subtext line.
+  responseMetadataMode: first
+  # Add end-to-end turn latency to the same footer when it is rendered.
+  responseLatencyEnabled: false
+  applicationIngestion:
+    enabled: false
+    url: ""
+    tokenSecretKey: DISCORDBOT_APPLICATION_INGESTION_TOKEN
+    # Run delivery recovery and Discord REST reconciliation outside the
+    # singleton Gateway process so background failures cannot disconnect chat.
+    worker:
+      enabled: true
+      recoveryIntervalMs: 1000
+      batchSize: 25
+      concurrency: 4
+      leaseMs: 300000
+      deliveryTimeoutMs: 15000
+      archiveBacklogHighWatermark: 10000
+      applicationEgressPorts:
+        - 443
+      resources: {}
+    archiveReconciliation:
+      enabled: true
+      intervalSeconds: 60
+      concurrency: 4
   extraEnv: {}
   resources: {}
 
@@ -685,6 +746,7 @@ teamsbot:
   image:
     repository: centaur-teamsbot
     tag: latest
+    digest: ""
     pullPolicy: Always
   allowedTeamIds: ""
   allowedChannelIds: ""
