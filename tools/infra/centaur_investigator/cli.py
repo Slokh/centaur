@@ -8,7 +8,6 @@ from typing import Any
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
-from rich.json import JSON
 from rich.table import Table
 
 from .client import CentaurInvestigatorClient
@@ -17,7 +16,7 @@ load_dotenv()
 
 app = typer.Typer(
     name="centaur-investigator",
-    help="Investigate Centaur threads and sessions from readonly Postgres.",
+    help="Investigate Centaur chat messages, threads, and sessions read-only.",
 )
 
 
@@ -49,7 +48,10 @@ console = Console()
 
 
 def _print_json(data: dict[str, Any]) -> None:
-    console.print(JSON(json.dumps(data, default=str)))
+    # Machine-readable output must not pass through Rich: its terminal-width
+    # wrapping can insert literal newlines inside JSON strings, making --json
+    # impossible to pipe into jq or another program.
+    print(json.dumps(data, ensure_ascii=False, default=str))
 
 
 def _require_ok(result: dict[str, Any]) -> None:
@@ -66,6 +68,25 @@ def _print_investigation(result: dict[str, Any]) -> None:
     )
     if parsed.get("permalink"):
         console.print(f"[dim]{parsed['permalink']}[/dim]")
+    discord = result.get("discord") or {}
+    target_message = discord.get("message") or {}
+    source_message = discord.get("source_message") or {}
+    if target_message:
+        author = target_message.get("author") or {}
+        console.print(
+            f"[bold]Message:[/] {target_message.get('id')} "
+            f"by {author.get('global_name') or author.get('username') or author.get('id')}"
+        )
+        if target_message.get("content") is not None:
+            console.print(str(target_message.get("content") or ""))
+    if source_message and source_message.get("id") != target_message.get("id"):
+        author = source_message.get("author") or {}
+        console.print(
+            f"[bold]Triggered by:[/] {source_message.get('id')} "
+            f"by {author.get('global_name') or author.get('username') or author.get('id')}"
+        )
+        if source_message.get("content") is not None:
+            console.print(str(source_message.get("content") or ""))
     console.print(analysis.get("summary") or "No summary.")
 
     warnings = analysis.get("warnings") or []
@@ -90,10 +111,30 @@ def _print_investigation(result: dict[str, Any]) -> None:
             )
         console.print(table)
 
+    timeline = result.get("timeline") or []
+    if timeline:
+        table = Table(title="Timeline")
+        table.add_column("Offset", justify="right", max_width=12)
+        table.add_column("Stage", style="cyan", max_width=40)
+        table.add_column("Source", max_width=20)
+        table.add_column("Details", max_width=72)
+        for row in timeline[:50]:
+            offset = row.get("offset_ms")
+            table.add_row(
+                "" if offset is None else f"{offset}ms",
+                str(row.get("stage") or ""),
+                str(row.get("source") or ""),
+                json.dumps(row.get("details") or {}, default=str, separators=(",", ":")),
+            )
+        console.print(table)
+
 
 @app.command("investigate")
 def investigate(
-    query: str = typer.Argument(..., help="Natural-language query, Slack link, or thread_key."),
+    query: str = typer.Argument(
+        ...,
+        help="Natural-language query, Discord/Slack link, or thread_key.",
+    ),
     limit: int = typer.Option(25, "--limit", "-n", help="Max rows per source."),
     observability: bool = typer.Option(
         True,
@@ -104,13 +145,47 @@ def investigate(
     logs_limit: int = typer.Option(100, "--logs-limit", help="Max log rows."),
     json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
 ) -> None:
-    """Investigate a Slack thread or Centaur thread key."""
+    """Investigate a Discord message, Slack thread, or Centaur thread key."""
     result = CentaurInvestigatorClient().investigate(
         query,
         limit=limit,
         include_observability=observability,
         window_hours=window_hours,
         logs_limit=logs_limit,
+    )
+    _require_ok(result)
+    if json_output:
+        _print_json(result)
+        return
+    _print_investigation(result)
+
+
+@app.command("discord-message")
+def discord_message(
+    reference: str = typer.Argument(..., help="Discord message permalink."),
+    limit: int = typer.Option(25, "--limit", "-n", help="Max rows per source."),
+    observability: bool = typer.Option(
+        True,
+        "--observability/--no-observability",
+        help="Query a redacted vlogs/vmetrics timeline when configured.",
+    ),
+    window_hours: int = typer.Option(24, "--window-hours", help="Observability lookback."),
+    logs_limit: int = typer.Option(100, "--logs-limit", help="Max sanitized log rows."),
+    include_content: bool = typer.Option(
+        True,
+        "--content/--no-content",
+        help="Include the linked and triggering Discord message text.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Resolve a Discord permalink and correlate its durable execution timeline."""
+    result = CentaurInvestigatorClient().investigate_discord_message(
+        reference,
+        limit=limit,
+        include_observability=observability,
+        window_hours=window_hours,
+        logs_limit=logs_limit,
+        include_content=include_content,
     )
     _require_ok(result)
     if json_output:
@@ -177,17 +252,23 @@ def session(
 
 @app.command("parse")
 def parse(
-    reference: str = typer.Argument(..., help="Slack link or thread_key."),
+    reference: str = typer.Argument(..., help="Discord/Slack link or thread_key."),
     json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
 ) -> None:
-    """Parse a Slack reference without querying Postgres."""
+    """Parse a Discord/Slack reference without querying external services."""
     result = CentaurInvestigatorClient().parse_thread_reference(reference)
     _require_ok(result)
     if json_output:
         _print_json(result)
         return
+    console.print(f"[bold]Source:[/] {result.get('source')}")
     console.print(f"[bold]Channel:[/] {result.get('channel_id')}")
-    console.print(f"[bold]Thread TS:[/] {result.get('thread_ts')}")
+    if result.get("guild_id"):
+        console.print(f"[bold]Guild:[/] {result.get('guild_id')}")
+    if result.get("message_id"):
+        console.print(f"[bold]Message:[/] {result.get('message_id')}")
+    if result.get("thread_ts"):
+        console.print(f"[bold]Thread TS:[/] {result.get('thread_ts')}")
     console.print("[bold]Candidates:[/]")
     for candidate in result.get("thread_key_candidates") or []:
         console.print(f"  {candidate}")
