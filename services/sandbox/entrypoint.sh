@@ -5,6 +5,14 @@ HOME_DIR="$(eval echo ~)"
 FIREWALL_HOSTNAME="${FIREWALL_HOST:-firewall}"
 STATE_DIR="${CENTAUR_STATE_DIR:-$HOME_DIR/state}"
 
+case "${CENTAUR_BASE_SKILLS_ENABLED:-true}" in
+    0|false|False|FALSE|no|No|NO|off|Off|OFF)
+        # Baked Centaur development skills are useful for general-purpose
+        # sandboxes, but product overlays can provide a smaller skill surface.
+        rm -rf "$HOME_DIR/.agents/skills" "$HOME_DIR/centaur-skills"
+        ;;
+esac
+
 append_tool_dirs() {
     if [ -z "${1:-}" ]; then
         return
@@ -422,6 +430,13 @@ mkdir -p "$HOME_DIR/uploads"
 WORKSPACE_DIR="$WORKSPACE_DIR" install-tool-shims --refresh-skills \
     || echo "warning: failed to reload Centaur skills" >&2
 
+# Materialize configured tool environments before this sandbox is advertised
+# as ready. Repo-cache-backed tools are mounted at runtime, so an image-build
+# warmup cannot cover the source paths agents actually invoke. Configured tools
+# are a readiness contract: fail startup on a missing, broken, or timed-out tool
+# instead of silently serving the first member request through a cold install.
+prewarm-tools
+
 # ── Background: refresh repo-cache-backed tools/skills in running sandboxes ───
 case "${CENTAUR_TOOLS_AUTO_RELOAD:-true}" in
     0|false|False|FALSE|no|No|NO|off|Off|OFF) _centaur_tools_auto_reload=0 ;;
@@ -442,6 +457,13 @@ unset _centaur_tools_auto_reload
 # Prompt overlays from mounted repos are appended when present.
 TARGET_PROMPT="$WORKSPACE_DIR/AGENTS.md"
 compose-system-prompt --home-dir "$HOME_DIR" --target-prompt "$TARGET_PROMPT"
+
+if [ "${CENTAUR_SYSTEM_PROMPT_MODE:-append}" = "replace" ]; then
+    # The baked prompt is a fallback for general Centaur sandboxes. Remove the
+    # ancestor copy after composing a replacement so harness discovery cannot
+    # load both the product prompt and the development fallback.
+    rm -f "$HOME_DIR/AGENTS.md"
+fi
 
 if [ "${CENTAUR_SANDBOX_OBSERVABILITY_ENABLED:-true}" = "false" ] && [ -f "$TARGET_PROMPT" ]; then
     cat >> "$TARGET_PROMPT" <<'EOF'

@@ -117,6 +117,9 @@
 {{- end -}}
 {{- end -}}
 {{- $apiRsEtlPassthroughNames = uniq $apiRsEtlPassthroughNames -}}
+{{- if .Values.apiRs.applicationGateway.enabled -}}
+{{- $apiRsEtlPassthroughNames = append $apiRsEtlPassthroughNames "CENTAUR_APPLICATION_GATEWAY_KEY" | uniq -}}
+{{- end -}}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -199,6 +202,9 @@ spec:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 8 }}
         centaur.ai/observability-enabled: "true"
     spec:
+      {{- with .Values.global.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       terminationGracePeriodSeconds: {{ .Values.apiRs.terminationGracePeriodSeconds }}
       automountServiceAccountToken: true
       serviceAccountName: {{ $apiRsName }}
@@ -208,7 +214,7 @@ spec:
       {{- end }}
       containers:
         - name: api-rs
-          image: {{ printf "%s:%s" .Values.apiRs.image.repository .Values.apiRs.image.tag | quote }}
+          image: {{ include "centaur.imageRef" .Values.apiRs.image | quote }}
           imagePullPolicy: {{ .Values.apiRs.image.pullPolicy }}
           env:
             - name: DATABASE_URL
@@ -346,7 +352,7 @@ spec:
             - name: SESSION_SANDBOX_K8S_NAMESPACE
               value: {{ .Release.Namespace | quote }}
             - name: SESSION_SANDBOX_IMAGE
-              value: {{ printf "%s:%s" .Values.sandbox.image.repository .Values.sandbox.image.tag | quote }}
+              value: {{ include "centaur.imageRef" .Values.sandbox.image | quote }}
             - name: SESSION_SANDBOX_IMAGE_PULL_POLICY
               value: {{ .Values.sandbox.image.pullPolicy | quote }}
 {{- if and .Values.sandbox.resources (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_RESOURCES")) }}
@@ -372,6 +378,10 @@ spec:
             - name: SESSION_SANDBOX_RUNTIME_CLASS_NAME
               value: {{ .Values.sandbox.runtimeClassName | quote }}
 {{- end }}
+{{- if and .Values.sandbox.priorityClassName (not (hasKey .Values.apiRs.extraEnv "SESSION_SANDBOX_PRIORITY_CLASS_NAME")) }}
+            - name: SESSION_SANDBOX_PRIORITY_CLASS_NAME
+              value: {{ .Values.sandbox.priorityClassName | quote }}
+{{- end }}
             # Sandboxes call back into this control plane via the in-cluster Service.
             - name: SESSION_SANDBOX_CENTAUR_API_URL
               value: {{ printf "http://%s:%v" $apiRsName .Values.apiRs.port | quote }}
@@ -384,7 +394,7 @@ spec:
 {{- end }}
 {{- end }}
             - name: KUBERNETES_IRON_PROXY_IMAGE
-              value: {{ printf "%s:%s" .Values.ironProxy.image.repository .Values.ironProxy.image.tag | quote }}
+              value: {{ include "centaur.imageRef" .Values.ironProxy.image | quote }}
             - name: KUBERNETES_IRON_PROXY_IMAGE_PULL_POLICY
               value: {{ .Values.ironProxy.image.pullPolicy | quote }}
             - name: KUBERNETES_IRON_PROXY_UPSTREAM_DENY_CIDRS
@@ -445,6 +455,9 @@ spec:
 {{- if and .Values.repoCache.enabled (gt (len $publicSkillDirs) 0) }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_PUBLIC_SKILL_DIRS" "value" (join ":" $publicSkillDirs)) }}
 {{- end }}
+{{- if .Values.overlay.systemPrompt }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_SYSTEM_PROMPT" "value" .Values.overlay.systemPrompt) }}
+{{- end }}
 {{- if not (hasKey .Values.sandbox.extraEnv "COMPANY_CONTEXT_EMBEDDINGS_ENABLED") }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_ENABLED" "value" ($companyContextEmbeddingsEnabled | toString)) }}
 {{- end }}
@@ -453,6 +466,12 @@ spec:
 {{- end }}
 {{- if .Values.codex.customProviders }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CODEX_CUSTOM_PROVIDERS" "value" (.Values.codex.customProviders | toJson)) }}
+{{- end }}
+{{- if not (hasKey .Values.sandbox.extraEnv "CENTAUR_TOOL_PREWARM") }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_TOOL_PREWARM" "value" (join "," .Values.sandbox.prewarmTools)) }}
+{{- end }}
+{{- if not (hasKey .Values.sandbox.extraEnv "CENTAUR_TOOL_PREWARM_TIMEOUT_SECONDS") }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_TOOL_PREWARM_TIMEOUT_SECONDS" "value" (.Values.sandbox.prewarmTimeoutSeconds | toString)) }}
 {{- end }}
 {{- range $k, $v := .Values.sandbox.extraEnv }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" $k "value" ($v | toString)) }}
@@ -517,7 +536,11 @@ spec:
 {{- end }}
 {{- end }}
             - name: KUBERNETES_TOOLS_RUNNER_IMAGE
-              value: {{ printf "%s:%s" (default .Values.sandbox.image.repository .Values.toolServer.runnerImage.repository) (default .Values.sandbox.image.tag .Values.toolServer.runnerImage.tag) | quote }}
+              value: {{ include "centaur.imageRef" (dict
+                "repository" (default .Values.sandbox.image.repository .Values.toolServer.runnerImage.repository)
+                "tag" (default .Values.sandbox.image.tag .Values.toolServer.runnerImage.tag)
+                "digest" (ternary .Values.toolServer.runnerImage.digest .Values.sandbox.image.digest (ne .Values.toolServer.runnerImage.repository ""))
+              ) | quote }}
             - name: KUBERNETES_TOOLS_RUNNER_IMAGE_PULL_POLICY
               value: {{ default .Values.sandbox.image.pullPolicy .Values.toolServer.runnerImage.pullPolicy | quote }}
 {{- if and .Values.toolServer.githubToken.existingSecretName (not $toolsUseRepoCache) }}
@@ -532,6 +555,22 @@ spec:
             - name: {{ $name }}
               value: {{ $value | quote }}
 {{- end }}
+{{- end }}
+{{- if .Values.apiRs.applicationGateway.enabled }}
+            - name: CENTAUR_APPLICATION_URL
+              value: {{ required "apiRs.applicationGateway.url is required" .Values.apiRs.applicationGateway.url | quote }}
+            - name: CENTAUR_APPLICATION_CAPABILITIES
+              value: {{ required "apiRs.applicationGateway.capabilities is required" .Values.apiRs.applicationGateway.capabilities | quote }}
+            - name: CENTAUR_APPLICATION_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%s%s" .Values.secretManager.envPrefix .Values.apiRs.applicationGateway.signingSecretKey }}
+            - name: CENTAUR_APPLICATION_GATEWAY_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%s%s" .Values.secretManager.envPrefix .Values.apiRs.applicationGateway.gatewayKeySecretKey }}
 {{- end }}
           envFrom:
             - secretRef:

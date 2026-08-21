@@ -325,6 +325,7 @@ export class CodexAppServerRendererEventMapper
     if (this.state.done) return []
     this.state.done = true
     const out: RendererEvent[] = []
+    const publicError = publicExecutionError(error)
     let hadOpenTask = false
     for (const [id, task] of this.state.taskByUseId) {
       if (task.status !== 'in_progress' && task.status !== 'pending') continue
@@ -336,12 +337,12 @@ export class CodexAppServerRendererEventMapper
         id: 'execution-error',
         title: 'Execution failed',
         status: 'error',
-        details: [section([text(error || 'Execution failed')])],
+        details: [section([text(publicError)])],
         output: []
       })
     }
     if (!this.state.answerText.trim()) {
-      this.state.harnessAnswerText += `Execution failed: ${error || 'Execution failed'}`
+      this.state.harnessAnswerText += `Execution failed: ${publicError}`
       recomposeBuffers(this.state)
     }
     this.emitActivitySummary(out, { final: true })
@@ -582,6 +583,30 @@ export class CodexAppServerRendererEventMapper
   private log(event: string, fields: Record<string, unknown>): void {
     this.logInfo?.(event, fields)
   }
+}
+
+function publicExecutionError(error: string): string {
+  const normalized = error.trim()
+  let validationMessage = normalized
+  try {
+    const parsed = JSON.parse(normalized)
+    if (isRecord(parsed) && typeof parsed.message === 'string') {
+      validationMessage = parsed.message.trim()
+    }
+  } catch {}
+  if (/^The requested model '[A-Za-z0-9._/-]+' does not exist\.?$/.test(validationMessage)) {
+    return validationMessage
+  }
+  if (/\b402\b|payment required|insufficient credits?|weekly limit|can only afford/i.test(normalized)) {
+    return 'The model provider rejected the request because the configured account does not have enough available credit. Please try again after the account is funded.'
+  }
+  if (/\b429\b|rate[ -]?limit/i.test(normalized)) {
+    return 'The model provider is temporarily rate-limiting requests. Please try again shortly.'
+  }
+  if (/\b5\d\d\b|bad gateway|service unavailable|reconnecting/i.test(normalized)) {
+    return 'The model provider is temporarily unavailable. Please try again.'
+  }
+  return 'The agent could not complete this request. Please try again.'
 }
 
 export function codexAppServerToRendererEvents(

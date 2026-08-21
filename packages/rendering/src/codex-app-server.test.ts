@@ -7,6 +7,47 @@ import {
 } from './codex-app-server'
 
 describe('CodexAppServerRendererEventMapper', () => {
+  it('keeps raw provider failures internal while rendering a safe actionable error', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const raw =
+      'unexpected status 402 Payment Required: requested 65536 tokens; manage key at https://provider.example/secret-key-id'
+
+    const events = mapper.process({
+      type: 'turn.failed',
+      error: { message: 'Reconnecting... 1/5', additionalDetails: raw }
+    })
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'renderer.done',
+        error: `Reconnecting... 1/5: ${raw}`,
+        answerMarkdown:
+          'Execution failed: The model provider rejected the request because the configured account does not have enough available credit. Please try again after the account is funded.'
+      })
+    )
+    const publicEvents = events.filter(event => event.type !== 'renderer.done')
+    expect(JSON.stringify(publicEvents)).not.toContain('provider.example')
+  })
+
+  it('preserves bounded model validation errors that are safe to act on', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+    const events = mapper.process({
+      type: 'turn.failed',
+      error: JSON.stringify({
+        type: 'invalid_request_error',
+        code: 'model_not_found',
+        message: "The requested model 'gpt-example' does not exist."
+      })
+    })
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'renderer.done',
+        answerMarkdown: "Execution failed: The requested model 'gpt-example' does not exist."
+      })
+    )
+  })
+
   it('maps final answer deltas to generic renderer message deltas after activity exists', () => {
     const mapper = new CodexAppServerRendererEventMapper()
 

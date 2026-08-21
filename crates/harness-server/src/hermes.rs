@@ -23,6 +23,7 @@
 //! `CODEX_CONTINUE_THREAD_ID`), and Centaur's `interrupt` maps to Hermes's
 //! `session.interrupt` — the turn ends Interrupted while the session lives on.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::process::{Child, ChildStdin, Command as ProcessCommand, Stdio};
@@ -33,7 +34,9 @@ use std::time::{Duration, Instant};
 use codex_app_server_protocol::UserInput;
 use serde_json::{Value, json};
 
-use crate::server::{BlocksCommand, BlocksState, parse_blocks_line_with_state, write_blocks_error};
+use crate::server::{
+    BlocksCommand, BlocksState, apply_session_env, parse_blocks_line_with_state, write_blocks_error,
+};
 use crate::traits::{
     NormalizedContent, NormalizedEvent, NormalizedTokenUsage, NormalizedToolResult,
 };
@@ -80,6 +83,7 @@ pub fn run_hermes_blocks_server() -> Result<()> {
     });
 
     let mut turn = 0u64;
+    let mut active_session_env = BTreeMap::new();
     while let Ok(input) = command_rx.recv() {
         let thread_id = hermes
             .as_ref()
@@ -93,19 +97,22 @@ pub fn run_hermes_blocks_server() -> Result<()> {
                 provider: _,
                 reasoning,
                 trace_context: _,
+                session_env,
             }) => {
                 turn += 1;
-                let result = ensure_child(&mut hermes, model).and_then(|child| {
-                    run_hermes_turn(
-                        child,
-                        &mut stdout,
-                        input,
-                        client_user_message_id,
-                        reasoning,
-                        turn,
-                        &interrupt_rx,
-                    )
-                });
+                let result = apply_session_env(&mut active_session_env, session_env)
+                    .and_then(|_| ensure_child(&mut hermes, model, &active_session_env))
+                    .and_then(|child| {
+                        run_hermes_turn(
+                            child,
+                            &mut stdout,
+                            input,
+                            client_user_message_id,
+                            reasoning,
+                            turn,
+                            &interrupt_rx,
+                        )
+                    });
                 if let Err(error) = result {
                     eprintln!("Hermes blocks turn failed: {error:#}");
                     write_blocks_error(&mut stdout, &thread_id, "turn", error.to_string())?;
@@ -133,12 +140,13 @@ pub fn run_hermes_blocks_server() -> Result<()> {
     Ok(())
 }
 
-fn ensure_child(
-    hermes: &mut Option<HermesChild>,
+fn ensure_child<'a>(
+    hermes: &'a mut Option<HermesChild>,
     model: Option<String>,
-) -> Result<&mut HermesChild> {
+    session_env: &BTreeMap<String, String>,
+) -> Result<&'a mut HermesChild> {
     if hermes.is_none() {
-        *hermes = Some(HermesChild::start(model)?);
+        *hermes = Some(HermesChild::start(model, session_env)?);
     }
     Ok(hermes.as_mut().expect("hermes started"))
 }
@@ -192,12 +200,13 @@ impl Drop for HermesChild {
 }
 
 impl HermesChild {
-    fn start(model: Option<String>) -> Result<Self> {
+    fn start(model: Option<String>, session_env: &BTreeMap<String, String>) -> Result<Self> {
         // The JSON-RPC gateway is a Python module, not a `hermes` subcommand;
         // HERMES_PYTHON points at the interpreter whose env has hermes-agent.
         let python = env::var("HERMES_PYTHON").unwrap_or_else(|_| "python3".to_string());
         let mut child = ProcessCommand::new(python)
             .args(["-m", "tui_gateway.entry"])
+            .envs(session_env)
             .env("HERMES_QUIET", "1")
             // Centaur owns approval policy at the sandbox boundary (isolated
             // sandbox, iron-proxy egress); inside it Hermes runs unattended.

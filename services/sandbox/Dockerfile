@@ -299,6 +299,7 @@ COPY --link --chmod=755 services/sandbox/centaur_tool_host.py /usr/local/bin/cen
 COPY --link --chmod=755 services/sandbox/compose_system_prompt.py /usr/local/bin/compose-system-prompt
 COPY --link --chmod=755 services/sandbox/repo_cache_sync.py /usr/local/bin/repo-cache-sync
 COPY --link --chmod=755 services/sandbox/repo_cache_watch.py /usr/local/bin/repo-cache-watch
+COPY --link --chmod=755 services/sandbox/prewarm_tools.py /usr/local/bin/prewarm-tools
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
 COPY --link --chown=1001:1001 crates/harness-server/ /opt/centaur/harness-server-src/
 

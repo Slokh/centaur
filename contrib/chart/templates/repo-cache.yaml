@@ -39,6 +39,7 @@
 {{- $repoCacheHasGithubToken := or .Values.repoCache.githubToken.existingSecretName .Values.repoCache.githubToken.token -}}
 {{- $repoCacheImageRepository := default .Values.sandbox.image.repository .Values.repoCache.image.repository -}}
 {{- $repoCacheImageTag := default .Values.sandbox.image.tag .Values.repoCache.image.tag -}}
+{{- $repoCacheImageDigest := default .Values.sandbox.image.digest .Values.repoCache.image.digest -}}
 {{- $repoCacheImagePullPolicy := default .Values.sandbox.image.pullPolicy .Values.repoCache.image.pullPolicy -}}
 {{- $repoCacheStorageType := include "centaur.repoCacheStorageType" . -}}
 {{- $repoCacheUsePvc := eq $repoCacheStorageType "persistentVolumeClaim" -}}
@@ -96,6 +97,9 @@ spec:
       labels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "repo-cache") | nindent 8 }}
     spec:
+      {{- with .Values.global.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       automountServiceAccountToken: false
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
@@ -115,7 +119,7 @@ spec:
 {{- end }}
       containers:
         - name: repo-cache
-          image: {{ printf "%s:%s" $repoCacheImageRepository $repoCacheImageTag | quote }}
+          image: {{ include "centaur.imageRef" (dict "repository" $repoCacheImageRepository "tag" $repoCacheImageTag "digest" $repoCacheImageDigest) | quote }}
           imagePullPolicy: {{ $repoCacheImagePullPolicy }}
           command:
             - /usr/local/bin/repo-cache-sync
