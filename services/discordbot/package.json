@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "bun --hot --watch src/server.ts",
     "start": "bun src/server.ts",
-    "test": "bun test test/chat-sdk-emulate.test.ts && bun test test/discord-allowlist.test.ts test/discord-narrator.test.ts test/discord-replay.test.ts test/discord-starter.test.ts test/discord-threading.test.ts test/discord-visibility.test.ts test/gateway.test.ts test/index.test.ts test/session-api.test.ts test/utils.test.ts",
+    "start:worker": "bun src/worker.ts",
+    "test": "bun test test/chat-sdk-emulate.test.ts && bun test test/discord-allowlist.test.ts test/discord-ingestion.test.ts test/discord-reconciliation.test.ts test/discord-narrator.test.ts test/discord-replay.test.ts test/discord-starter.test.ts test/discord-threading.test.ts test/discord-visibility.test.ts test/gateway.test.ts test/index.test.ts test/session-api.test.ts test/utils.test.ts",
     "check:types": "bun tsgo --project tsconfig.json --noEmit"
   },
   "dependencies": {

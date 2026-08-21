@@ -86,6 +86,17 @@ spec:
               value: {{ index $.Values.sandbox.extraEnv $name | toString | quote }}
 {{- end }}
 {{- end }}
+{{- if .Values.discordbot.applicationIngestion.enabled }}
+            - name: DISCORDBOT_APPLICATION_INGESTION_URL
+              value: {{ required "discordbot.applicationIngestion.url is required" .Values.discordbot.applicationIngestion.url | quote }}
+            - name: DISCORDBOT_APPLICATION_INGESTION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%s%s" .Values.secretManager.envPrefix .Values.discordbot.applicationIngestion.tokenSecretKey }}
+            - name: DISCORDBOT_APPLICATION_WORKER_ENABLED
+              value: {{ .Values.discordbot.applicationIngestion.worker.enabled | quote }}
+{{- end }}
 {{- if .Values.discordbot.mentionRoleIds }}
             - name: DISCORD_MENTION_ROLE_IDS
               value: {{ .Values.discordbot.mentionRoleIds | quote }}

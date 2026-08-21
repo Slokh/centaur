@@ -1,0 +1,125 @@
+{{- if and .Values.discordbot.enabled .Values.discordbot.applicationIngestion.enabled .Values.discordbot.applicationIngestion.worker.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "discordbot-ingestion-worker") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "discordbot-ingestion-worker") | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot-ingestion-worker") | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/infra-secrets: {{ include "centaur.infraSecretsChecksum" . }}
+      labels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot-ingestion-worker") | nindent 8 }}
+    spec:
+      {{- with .Values.global.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 35
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: discordbot-ingestion-worker
+          image: {{ include "centaur.imageRef" .Values.discordbot.image | quote }}
+          imagePullPolicy: {{ .Values.discordbot.image.pullPolicy }}
+          command: ["bun", "src/worker.ts"]
+          env:
+            - name: PORT
+              value: "3002"
+            - name: DISCORD_BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sDISCORD_BOT_TOKEN" .Values.secretManager.envPrefix }}
+            - name: DISCORD_PUBLIC_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sDISCORD_PUBLIC_KEY" .Values.secretManager.envPrefix }}
+            - name: DISCORD_APPLICATION_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sDISCORD_APPLICATION_ID" .Values.secretManager.envPrefix }}
+            - name: DISCORDBOT_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sDATABASE_URL" .Values.secretManager.envPrefix }}
+            - name: DISCORDBOT_GUILD_ALLOWLIST
+              value: {{ .Values.discordbot.guildAllowlist | quote }}
+            - name: DISCORDBOT_APPLICATION_INGESTION_URL
+              value: {{ required "discordbot.applicationIngestion.url is required" .Values.discordbot.applicationIngestion.url | quote }}
+            - name: DISCORDBOT_APPLICATION_INGESTION_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%s%s" .Values.secretManager.envPrefix .Values.discordbot.applicationIngestion.tokenSecretKey }}
+            - name: DISCORDBOT_APPLICATION_RECOVERY_INTERVAL_MS
+              value: {{ .Values.discordbot.applicationIngestion.worker.recoveryIntervalMs | quote }}
+            - name: DISCORDBOT_APPLICATION_RECOVERY_BATCH_SIZE
+              value: {{ .Values.discordbot.applicationIngestion.worker.batchSize | quote }}
+            - name: DISCORDBOT_APPLICATION_RECOVERY_CONCURRENCY
+              value: {{ .Values.discordbot.applicationIngestion.worker.concurrency | quote }}
+            - name: DISCORDBOT_APPLICATION_RECOVERY_LEASE_MS
+              value: {{ .Values.discordbot.applicationIngestion.worker.leaseMs | quote }}
+            - name: DISCORDBOT_APPLICATION_DELIVERY_TIMEOUT_MS
+              value: {{ .Values.discordbot.applicationIngestion.worker.deliveryTimeoutMs | quote }}
+            - name: DISCORDBOT_APPLICATION_ARCHIVE_BACKLOG_HIGH_WATERMARK
+              value: {{ .Values.discordbot.applicationIngestion.worker.archiveBacklogHighWatermark | quote }}
+            - name: DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_ENABLED
+              value: {{ .Values.discordbot.applicationIngestion.archiveReconciliation.enabled | quote }}
+            - name: DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_INTERVAL_SECONDS
+              value: {{ .Values.discordbot.applicationIngestion.archiveReconciliation.intervalSeconds | quote }}
+            - name: DISCORDBOT_APPLICATION_ARCHIVE_RECONCILIATION_CONCURRENCY
+              value: {{ .Values.discordbot.applicationIngestion.archiveReconciliation.concurrency | quote }}
+          ports:
+            - containerPort: 3002
+              name: http
+          startupProbe:
+            httpGet:
+              path: /ready
+              port: 3002
+            periodSeconds: 5
+            failureThreshold: 24
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 3002
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 3002
+            periodSeconds: 15
+          securityContext:
+{{ toYaml .Values.containerSecurityContext | nindent 12 }}
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+          resources:
+{{ toYaml .Values.discordbot.applicationIngestion.worker.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "discordbot-ingestion-worker") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "discordbot-ingestion-worker") | nindent 4 }}
+spec:
+  selector:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot-ingestion-worker") | nindent 4 }}
+  ports:
+    - name: http
+      port: 3002
+      targetPort: 3002
+{{- end }}

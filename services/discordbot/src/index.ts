@@ -28,6 +28,11 @@ import {
 } from "./discord-allowlist";
 import { DiscordNarrator, reactToDiscordMessage } from "./discord-narrator";
 import {
+  ingestDeletedDiscordMessage,
+  ingestObservedDiscordChannel,
+  ingestObservedDiscordMessage,
+} from "./discord-ingestion";
+import {
   fetchImmediateReplyContext,
   fetchInlineReplyContext,
   fetchThreadStarterMessage,
@@ -224,13 +229,43 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
   // state.connect() calls, and Chat.initialize() can terminate the process on
   // the first ECONNREFUSED while Postgres is moving between nodes.
   const ready = singleFlight(async () => {
-    await ensureStateConnected(state, options);
+    await Promise.all([
+      ensureStateConnected(state, options),
+      ensureApplicationOutboxConnected(options),
+    ]);
   });
   const discord = createDiscordAdapter({
     apiUrl: options.discordApiUrl,
     applicationId: options.applicationId,
     botToken: options.botToken,
     conversationMode: options.conversationMode,
+    onMessageObserved: async (message) => {
+      if (!isAllowedDiscordGuild(message.guildId, options)) return;
+      // Observation is a durable background concern, not part of Discord's
+      // acknowledgement path. Even the outbox's state writes may involve a
+      // remote database and must not delay mention routing, typing, or 👀.
+      observeApplicationIngestion(
+        ingestObservedDiscordMessage(options, message),
+        options,
+        "message",
+      );
+    },
+    onMessageDeleted: async (message) => {
+      if (!isAllowedDiscordGuild(message.guildId, options)) return;
+      observeApplicationIngestion(
+        ingestDeletedDiscordMessage(options, message),
+        options,
+        "message_delete",
+      );
+    },
+    onChannelObserved: async (channel) => {
+      if (!isAllowedDiscordGuild(channel.guildId, options)) return;
+      observeApplicationIngestion(
+        ingestObservedDiscordChannel(options, channel),
+        options,
+        "channel",
+      );
+    },
     publicKey: options.publicKey,
     mentionRoleIds: options.mentionRoleIds,
     userName,
@@ -342,7 +377,10 @@ export function createDiscordbot(options: DiscordbotOptions): Discordbot {
     const gatewayActive = options.isGatewayActive
       ? options.isGatewayActive()
       : true;
-    const stateReady = await isStateHealthy(state);
+    const stateReady = await isStateHealthy(
+      state,
+      options.applicationIngestionOutbox,
+    );
     const readyNow = gatewayActive && stateReady;
     return c.json(
       {
@@ -434,9 +472,44 @@ async function ensureStateConnected(
   }
 }
 
-async function isStateHealthy(state: StateAdapter): Promise<boolean> {
+async function ensureApplicationOutboxConnected(
+  options: DiscordbotOptions,
+): Promise<void> {
+  const outbox = options.applicationIngestionOutbox;
+  if (!outbox) return;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await outbox.connect();
+      if (attempt > 0) {
+        traceLog(options, "discordbot_application_outbox_connected", undefined, {
+          attempts: attempt + 1,
+        });
+      }
+      return;
+    } catch (error) {
+      const delayMs = Math.min(
+        POSTGRES_CONNECT_INITIAL_DELAY_MS * 2 ** attempt,
+        POSTGRES_CONNECT_MAX_DELAY_MS,
+      );
+      traceLog(options, "discordbot_application_outbox_connect_retry", undefined, {
+        attempt: attempt + 1,
+        delay_ms: delayMs,
+        error: errorMessage(error),
+      });
+      await sleep(delayMs);
+    }
+  }
+}
+
+async function isStateHealthy(
+  state: StateAdapter,
+  outbox: DiscordbotOptions["applicationIngestionOutbox"],
+): Promise<boolean> {
   try {
-    await state.get("discordbot:health");
+    await Promise.all([
+      state.get("discordbot:health"),
+      outbox?.healthCheck(),
+    ]);
     return true;
   } catch {
     return false;
@@ -1755,6 +1828,21 @@ function backgroundWaitUntil(promise: Promise<unknown>): void {
   // Discord ingress runs in a long-lived Gateway process (no per-request waitUntil);
   // background work just needs its rejections swallowed after they are traced.
   void promise.catch(() => undefined);
+}
+
+function observeApplicationIngestion(
+  promise: Promise<unknown>,
+  options: DiscordbotOptions,
+  observationType: string,
+): void {
+  backgroundWaitUntil(
+    promise.catch((error) => {
+      traceLog(options, "discordbot_application_ingestion_enqueue_failed", undefined, {
+        error: errorMessage(error),
+        observation_type: observationType,
+      });
+    }),
+  );
 }
 
 // Mirrors slackbotv2's rendererOptions: forwards the configured mapper and

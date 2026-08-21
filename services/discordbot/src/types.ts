@@ -2,6 +2,7 @@ import type { RustSessionStreamEvent } from "@centaur/harness-events";
 import type { CodexAppServerToChatStreamOptions } from "@centaur/rendering";
 import type { Attachment, Chat, Logger, StateAdapter } from "chat";
 import type { Hono } from "hono";
+import type { ApplicationIngestionOutbox } from "./application-ingestion-outbox";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
@@ -135,6 +136,18 @@ export type DiscordbotOptions = {
   activeExecutionTtlMs?: number;
   apiKey?: string;
   apiUrl: string;
+  /** Private application Discord ingestion endpoint; requires the token too. */
+  applicationIngestionUrl?: string;
+  applicationIngestionToken?: string;
+  applicationIngestionOutbox?: ApplicationIngestionOutbox;
+  applicationIngestionDeliveryTimeoutMs?: number;
+  applicationIngestionRecoveryBatchSize?: number;
+  applicationIngestionRecoveryConcurrency?: number;
+  applicationIngestionRecoveryLeaseMs?: number;
+  /** Periodically reconcile Discord REST history into application ingestion. */
+  applicationArchiveReconciliationEnabled?: boolean;
+  applicationArchiveReconciliationIntervalMs?: number;
+  applicationArchiveReconciliationConcurrency?: number;
   applicationId: string;
   botToken: string;
   /** Layout for new channel mentions. Existing Discord threads remain threads. */
