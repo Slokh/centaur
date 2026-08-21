@@ -203,6 +203,10 @@ jobs:
       - name: Test
         working-directory: services/api-rs
         env:
+          # The session runtime, warm-pool, and SQLx store suites deliberately
+          # skip when this is absent. CI starts Postgres above, so make those
+          # integration tests mandatory instead of reporting a partial pass.
+          SESSION_RUNTIME_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
           SESSION_SQLX_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
         run: cargo test --workspace
 
