@@ -536,6 +536,17 @@ spec:
               value: {{ $value | quote }}
 {{- end }}
 {{- end }}
+{{- if .Values.apiRs.applicationGateway.enabled }}
+            - name: CENTAUR_APPLICATION_URL
+              value: {{ required "apiRs.applicationGateway.url is required" .Values.apiRs.applicationGateway.url | quote }}
+            - name: CENTAUR_APPLICATION_CAPABILITIES
+              value: {{ required "apiRs.applicationGateway.capabilities is required" .Values.apiRs.applicationGateway.capabilities | quote }}
+            - name: CENTAUR_APPLICATION_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%s%s" .Values.secretManager.envPrefix .Values.apiRs.applicationGateway.signingSecretKey }}
+{{- end }}
           envFrom:
             - secretRef:
                 name: {{ include "centaur.secretEnvName" . }}

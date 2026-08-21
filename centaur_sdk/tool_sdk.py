@@ -8,6 +8,7 @@ import json
 import logging
 import mimetypes
 import os
+import urllib.error
 import urllib.request
 import uuid
 from contextvars import ContextVar
@@ -17,6 +18,9 @@ from typing import Any
 from urllib.parse import quote
 
 log = logging.getLogger(__name__)
+
+DEFAULT_APPLICATION_RESPONSE_BYTES = 1024 * 1024
+MAX_APPLICATION_ERROR_BYTES = 16 * 1024
 
 
 @dataclass
@@ -86,11 +90,21 @@ def current_thread_key() -> str:
     except LookupError:
         thread_key = None
     if not thread_key:
+        thread_key = os.environ.get("CENTAUR_THREAD_KEY", "").strip() or None
+    if not thread_key:
         raise RuntimeError(
             "this operation must run inside a scoped thread: no thread_key "
-            "in the tool context."
+            "in the tool context or environment."
         )
     return thread_key
+
+
+def _require_api_server_enabled(operation: str) -> None:
+    if secret("CENTAUR_SANDBOX_API_SERVER_ENABLED", "true").strip().lower() == "false":
+        raise RuntimeError(
+            f"{operation} requires the API server sandbox capability, but it is disabled "
+            "for this principal."
+        )
 
 
 def current_session_context() -> dict[str, Any]:
@@ -110,6 +124,86 @@ def current_session_context() -> dict[str, Any]:
         return json.loads(response.read())
 
 
+def current_scoped_session_context() -> dict[str, Any]:
+    """Return API-owned context after verifying exact session ownership.
+
+    Use this for mutations or transport delivery. Changing
+    ``CENTAUR_THREAD_KEY`` cannot authorize a different session because the
+    ownership is derived from the authenticated sandbox principal by the API.
+    """
+    _require_api_server_enabled("current_scoped_session_context")
+    thread_key = current_thread_key()
+    base_url = secret("CENTAUR_API_URL", "http://api:8000").rstrip("/")
+    request = urllib.request.Request(
+        f"{base_url}/api/session/{quote(thread_key, safe='')}/scoped-context",
+        method="GET",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read())
+
+
+def invoke_application_capability(
+    capability: str,
+    payload: dict[str, Any],
+    *,
+    timeout: float = 30,
+    max_response_bytes: int = DEFAULT_APPLICATION_RESPONSE_BYTES,
+) -> Any:
+    """Invoke an allowlisted capability for the active execution.
+
+    The control plane derives actor and destination authority from the active
+    execution; callers supply only a capability name and JSON object payload.
+    """
+    _require_api_server_enabled("invoke_application_capability")
+    normalized_capability = capability.strip()
+    if not normalized_capability:
+        raise ValueError("application capability cannot be empty")
+    if not isinstance(payload, dict):
+        raise TypeError("application capability payload must be a JSON object")
+    if max_response_bytes < 1:
+        raise ValueError("max_response_bytes must be positive")
+
+    thread_key = current_thread_key()
+    base_url = secret("CENTAUR_API_URL", "http://api:8000").rstrip("/")
+    request = urllib.request.Request(
+        f"{base_url}/api/session/{quote(thread_key, safe='')}/application/"
+        f"{quote(normalized_capability, safe='')}",
+        data=json.dumps(payload, separators=(",", ":")).encode(),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read(max_response_bytes + 1)
+    except urllib.error.HTTPError as error:
+        detail = error.read(MAX_APPLICATION_ERROR_BYTES + 1)
+        if len(detail) > MAX_APPLICATION_ERROR_BYTES:
+            detail = detail[:MAX_APPLICATION_ERROR_BYTES] + b"..."
+        message = detail.decode(errors="replace").strip()
+        suffix = f": {message}" if message else ""
+        raise RuntimeError(
+            f"application capability {normalized_capability!r} returned "
+            f"HTTP {error.code}{suffix}"
+        ) from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(
+            f"application capability {normalized_capability!r} request failed: "
+            f"{error.reason}"
+        ) from error
+
+    if len(raw) > max_response_bytes:
+        raise RuntimeError(
+            f"application capability {normalized_capability!r} response exceeded "
+            f"the {max_response_bytes}-byte client limit"
+        )
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            f"application capability {normalized_capability!r} returned invalid JSON"
+        ) from error
+
+
 def current_slack_thread() -> dict[str, str]:
     """Return ``{"channel_id": ..., "thread_ts": ...}`` for the current Slack thread."""
     context = current_session_context()
@@ -125,9 +219,9 @@ def current_slack_thread() -> dict[str, str]:
 def current_discord_thread() -> dict[str, str]:
     """Return the current Discord destination.
 
-    ``{"guild_id": ..., "channel_id": ..., "thread_id": ...}`` (``thread_id`` is
-    omitted for a channel-root message). Raises if the current thread is not a
-    Discord thread.
+    ``{"guild_id": ..., "channel_id": ..., "thread_id": ...,
+    "reply_to_message_id": ...}`` (the thread and reply ids are omitted when
+    absent). Raises if the current thread is not a Discord thread.
     """
     context = current_session_context()
     discord = context.get("discord")
@@ -143,6 +237,29 @@ def current_discord_thread() -> dict[str, str]:
     }
     if discord.get("thread_id"):
         destination["thread_id"] = str(discord["thread_id"])
+    if discord.get("reply_to_message_id"):
+        destination["reply_to_message_id"] = str(discord["reply_to_message_id"])
+    return destination
+
+
+def current_scoped_discord_thread() -> dict[str, str]:
+    """Return the current Discord destination with session-bound authorization."""
+    context = current_scoped_session_context()
+    discord = context.get("discord")
+    if (
+        not isinstance(discord, dict)
+        or not discord.get("guild_id")
+        or not discord.get("channel_id")
+    ):
+        raise RuntimeError(f"current thread is not a Discord thread: {context.get('thread_key')!r}")
+    destination = {
+        "guild_id": str(discord["guild_id"]),
+        "channel_id": str(discord["channel_id"]),
+    }
+    if discord.get("thread_id"):
+        destination["thread_id"] = str(discord["thread_id"])
+    if discord.get("reply_to_message_id"):
+        destination["reply_to_message_id"] = str(discord["reply_to_message_id"])
     return destination
 
 
@@ -198,7 +315,8 @@ def current_chat_destination() -> dict[str, str | int]:
 
     Always includes ``platform`` (``"slack"`` / ``"discord"`` / ``"linear"`` /
     ``"github"``) plus that platform's destination ids (Slack:
-    ``channel_id``/``thread_ts``; Discord: ``guild_id``/``channel_id``/``thread_id``;
+    ``channel_id``/``thread_ts``; Discord:
+    ``guild_id``/``channel_id``/``thread_id``/``reply_to_message_id``;
     Linear: ``issue_id``/``comment_id``/``agent_session_id``; GitHub:
     ``owner``/``repo``/``number``/``kind``/``review_comment_id``). Prefer this
     over the platform-specific helpers when writing tooling that should work on

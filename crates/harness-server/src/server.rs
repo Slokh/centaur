@@ -150,10 +150,12 @@ pub(crate) fn run_blocks_app_server<H: HarnessServer>(harness: &H) -> Result<()>
                 provider: _,
                 reasoning: _,
                 trace_context,
+                session_env,
             }) => {
                 if let Some(model) = model {
                     state.model = model;
                 }
+                apply_session_env(&mut state.session_env, session_env)?;
                 let result = run_blocks_turn(
                     harness,
                     &mut state,
@@ -270,6 +272,7 @@ fn run_blocks_turn<H: HarnessServer, W: Write>(
     result
 }
 
+#[allow(clippy::large_enum_variant)]
 enum BlocksReaderInput {
     Command(BlocksCommand),
     Error(String),
@@ -294,6 +297,7 @@ pub(crate) enum BlocksCommand {
         provider: Option<String>,
         reasoning: Option<String>,
         trace_context: TraceContext,
+        session_env: BTreeMap<String, String>,
     },
     Interrupt,
     AttachmentChunk,
@@ -336,6 +340,8 @@ struct BlocksLine {
     traceparent: Option<String>,
     #[serde(default)]
     trace_metadata: Option<Value>,
+    #[serde(default)]
+    session_env: BTreeMap<String, String>,
     #[serde(rename = "attachmentId", default)]
     attachment_id: Option<String>,
     #[serde(default)]
@@ -482,6 +488,7 @@ pub(crate) fn parse_blocks_line_with_state(
                     .map(|reasoning| reasoning.trim().to_owned())
                     .filter(|reasoning| !reasoning.is_empty()),
                 trace_context,
+                session_env: sanitized_session_env(parsed.session_env),
             })
         }
         "attachment.chunk" => {
@@ -857,6 +864,33 @@ fn clean_string(value: Option<&str>) -> Option<String> {
     non_empty(value).map(ToOwned::to_owned)
 }
 
+const SESSION_ENV_ALLOWLIST: [&str; 1] = ["CENTAUR_THREAD_KEY"];
+
+fn sanitized_session_env(values: BTreeMap<String, String>) -> BTreeMap<String, String> {
+    values
+        .into_iter()
+        .filter(|(name, value)| {
+            SESSION_ENV_ALLOWLIST.contains(&name.as_str()) && !value.trim().is_empty()
+        })
+        .collect()
+}
+
+pub(crate) fn apply_session_env(
+    current: &mut BTreeMap<String, String>,
+    incoming: BTreeMap<String, String>,
+) -> Result<()> {
+    if current.is_empty() {
+        *current = incoming;
+        return Ok(());
+    }
+    if incoming.is_empty() || *current == incoming {
+        return Ok(());
+    }
+    Err(HarnessServerError::InvalidBlocksInput {
+        message: "session environment cannot change after harness initialization".to_owned(),
+    })
+}
+
 fn handle_request<H: HarnessServer, W: Write>(
     harness: &H,
     request: JSONRPCRequest,
@@ -1057,6 +1091,7 @@ fn resumed_thread_state<H: HarnessServer>(
         completed_turns: Vec::new(),
         process: None,
         thread_started_sent: false,
+        session_env: BTreeMap::new(),
     })
 }
 
@@ -1454,6 +1489,7 @@ fn ensure_harness_process<H: HarnessServer>(harness: &H, state: &mut ThreadState
 
     let mut command = harness.command_for_turn(state);
     let mut child = command
+        .envs(&state.session_env)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1607,6 +1643,35 @@ mod tests {
         let same = downscale_oversized_image(&original);
 
         assert_eq!(same, original, "within-limit image is returned unchanged");
+    }
+
+    #[test]
+    fn parses_only_allowlisted_private_session_env() {
+        let line = r#"{"type":"user","text":"hi","session_env":{"CENTAUR_THREAD_KEY":"discord:G:C:M","CENTAUR_APPLICATION_GATEWAY_KEY":"attacker","PATH":"/attacker","EMPTY":""}}"#;
+        let BlocksCommand::User { session_env, .. } = parse_blocks_line(line).expect("parses")
+        else {
+            panic!("expected user command");
+        };
+
+        assert_eq!(session_env.len(), 1);
+        assert_eq!(
+            session_env.get("CENTAUR_THREAD_KEY").map(String::as_str),
+            Some("discord:G:C:M")
+        );
+        assert!(!session_env.contains_key("CENTAUR_APPLICATION_GATEWAY_KEY"));
+        assert!(!session_env.contains_key("PATH"));
+    }
+
+    #[test]
+    fn session_env_is_immutable_after_initialization() {
+        let mut current = BTreeMap::new();
+        let first = BTreeMap::from([("CENTAUR_THREAD_KEY".to_owned(), "discord:G:C:M".to_owned())]);
+        apply_session_env(&mut current, first.clone()).expect("first context applies");
+        apply_session_env(&mut current, first).expect("same context remains valid");
+
+        let changed =
+            BTreeMap::from([("CENTAUR_THREAD_KEY".to_owned(), "discord:G:C:N".to_owned())]);
+        assert!(apply_session_env(&mut current, changed).is_err());
     }
 
     #[test]

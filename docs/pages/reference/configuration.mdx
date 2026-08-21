@@ -15,6 +15,7 @@ Use these as the main extension points:
 | `secretManager.existingSecretName` | Required runtime secrets such as database, Slack, sandbox signing, and 1Password credentials. |
 | `api.extraEnv` | API feature flags, worker tuning, retention, observability, and deployment-specific overrides. |
 | `apiRs.extraEnv` | Rust API feature flags, telemetry exporter settings, and deployment-specific overrides. |
+| `apiRs.applicationGateway.*` | Optional execution-bound gateway to operator-owned application capabilities. |
 | `apiRs.metrics.*` | Prometheus/VictoriaMetrics scrape metadata for the Rust API `/metrics` endpoint. |
 | `console.sqlExporter.*` | SQL Exporter configuration and scrape metadata for Console database metrics. |
 | `slackbot.extraEnv` | Slackbot HTTP, Slack, feedback, and cross-org behavior. |
@@ -111,6 +112,8 @@ created. Changing a default does not rewrite existing principals.
 | `OTEL_TRACES_EXPORTER` | `apiRs.extraEnv`. | Set to `otlp` to force OTLP trace export, or `none`/`off` to disable it. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` | `apiRs.extraEnv`. | Enables OTLP trace export to Tempo, Jaeger, or another OTLP collector. |
 | `apiRs.workflowHostSandbox`, `WORKFLOW_HOST_SANDBOX` | Helm value, default `true`; override with `apiRs.extraEnv`. | Runs workflow hosts in Kubernetes sandboxes instead of the api-rs process. Required for workflow-scoped principals. |
+| `apiRs.applicationGateway.*`, `CENTAUR_APPLICATION_URL`, `CENTAUR_APPLICATION_CAPABILITIES`, `CENTAUR_APPLICATION_SIGNING_SECRET` | Helm values and `secretManager.existingSecretName`; disabled by default. | Exposes only the named operator-owned application capabilities to the sandbox that owns the active execution. |
+| `CENTAUR_APPLICATION_AUTHORITY_MAX_AGE_SECONDS` | `apiRs.extraEnv`; default `900`. | Maximum age of the trusted member invocation accepted for a mutating application capability. |
 | `apiRs.metrics.scrapeAnnotations` | Helm value, default `true`. | Adds Prometheus scrape annotations to the API-RS Pod template and Service. |
 | `apiRs.metrics.path` | Helm value, default `/metrics`. | Metrics scrape path for annotation-based discovery. |
 | `apiRs.metrics.annotations` | Helm value. | Additional scrape annotations for Prometheus-compatible collectors. |

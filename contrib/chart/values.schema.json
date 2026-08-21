@@ -333,6 +333,15 @@
         "sandboxHotIdleGraceSecs": { "type": "integer", "minimum": 0 },
         "workflowHostSandbox": { "type": "boolean" },
         "workflowHostResources": { "type": "object" },
+        "applicationGateway": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "url": { "type": "string" },
+            "capabilities": { "type": "string" },
+            "signingSecretKey": { "type": "string", "minLength": 1 }
+          }
+        },
         "etl": {
           "type": "object",
           "properties": {
