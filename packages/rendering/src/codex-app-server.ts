@@ -107,7 +107,7 @@ export class CodexAppServerRendererEventMapper
     if (this.state.done) return []
 
     const rustMapped = rustSessionEventToServerNotification(source)
-    if (rustMapped?.kind === 'failed') return this.fail(rustMapped.error)
+    if (rustMapped?.kind === 'failed') return this.fail(rustMapped.error, rustMapped.source)
     if (rustMapped?.kind === 'completed') return this.complete(rustMapped.resultText)
     if (rustMapped?.kind === 'status')
       return [{ type: 'renderer.status', status: rustMapped.status }]
@@ -321,11 +321,11 @@ export class CodexAppServerRendererEventMapper
     return out
   }
 
-  private fail(error: string): RendererEvent[] {
+  private fail(error: string, source: 'provider' | 'control_plane' = 'provider'): RendererEvent[] {
     if (this.state.done) return []
     this.state.done = true
     const out: RendererEvent[] = []
-    const publicError = publicExecutionError(error)
+    const publicError = publicExecutionError(error, source)
     let hadOpenTask = false
     for (const [id, task] of this.state.taskByUseId) {
       if (task.status !== 'in_progress' && task.status !== 'pending') continue
@@ -585,7 +585,13 @@ export class CodexAppServerRendererEventMapper
   }
 }
 
-function publicExecutionError(error: string): string {
+function publicExecutionError(
+  error: string,
+  source: 'provider' | 'control_plane' = 'provider'
+): string {
+  if (source === 'control_plane') {
+    return 'The agent execution service could not complete this request. Please try again.'
+  }
   const normalized = error.trim()
   let validationMessage = normalized
   try {
@@ -656,7 +662,7 @@ async function* renderChatSdkChunks(
 
 export type RustSessionMappingResult =
   | { kind: 'notification'; notification: ServerNotification }
-  | { kind: 'failed'; error: string }
+  | { kind: 'failed'; error: string; source: 'control_plane' }
   | { kind: 'completed'; resultText?: string }
   | { kind: 'status'; status: string }
   | null
@@ -698,7 +704,11 @@ export function rustSessionEventToServerNotification(source: unknown): RustSessi
     eventKind === 'session.stdout_pump_failed'
   ) {
     const data = isRecord(source.data) ? source.data : source
-    return { kind: 'failed', error: String(data.error ?? 'Execution failed') }
+    return {
+      kind: 'failed',
+      error: String(data.error ?? 'Execution failed'),
+      source: 'control_plane'
+    }
   }
 
   if (eventKind === 'session.execution_cancelled') {

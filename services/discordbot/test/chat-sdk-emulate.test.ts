@@ -1165,7 +1165,7 @@ describe("discordbot", () => {
     const posts = botPostsIn(threadId);
     expect(posts).toHaveLength(1);
     expect(posts[0]).toContain(
-      "Execution failed: The agent could not complete this request. Please try again.",
+      "Execution failed: The agent execution service could not complete this request. Please try again.",
     );
     expect(posts[0]).not.toContain("Streaming retries exhausted");
 

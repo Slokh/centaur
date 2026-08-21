@@ -7,6 +7,27 @@ import {
 } from './codex-app-server'
 
 describe('CodexAppServerRendererEventMapper', () => {
+  it('distinguishes Centaur execution failures from model-provider failures', () => {
+    const events = codexAppServerToRendererEvents([
+      {
+        eventKind: 'session.stream_error',
+        data: { error: 'Centaur API error: 500 internal database failure' }
+      }
+    ])
+
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: 'renderer.done',
+        error: 'Centaur API error: 500 internal database failure',
+        answerMarkdown:
+          'Execution failed: The agent execution service could not complete this request. Please try again.'
+      })
+    )
+    expect(JSON.stringify(events.filter(event => event.type !== 'renderer.done'))).not.toContain(
+      'internal database failure'
+    )
+  })
+
   it('keeps raw provider failures internal while rendering a safe actionable error', () => {
     const mapper = new CodexAppServerRendererEventMapper()
     const raw =
