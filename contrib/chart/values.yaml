@@ -700,6 +700,27 @@ discordbot:
   responseMetadataMode: never
   # Add end-to-end turn latency to the same footer when it is rendered.
   responseLatencyEnabled: false
+  eventSink:
+    enabled: false
+    url: ""
+    tokenSecretKey: DISCORDBOT_EVENT_SINK_TOKEN
+    # Run delivery recovery and Discord REST reconciliation outside the
+    # singleton Gateway process so background failures cannot disconnect chat.
+    worker:
+      enabled: true
+      recoveryIntervalMs: 1000
+      batchSize: 25
+      concurrency: 4
+      leaseMs: 300000
+      deliveryTimeoutMs: 15000
+      archiveBacklogHighWatermark: 10000
+      egressPorts:
+        - 443
+      resources: {}
+    archiveReconciliation:
+      enabled: false
+      intervalSeconds: 60
+      concurrency: 4
   extraEnv: {}
   resources: {}
 

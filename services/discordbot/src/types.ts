@@ -2,6 +2,7 @@ import type { RustSessionStreamEvent } from "@centaur/harness-events";
 import type { CodexAppServerToChatStreamOptions } from "@centaur/rendering";
 import type { Attachment, Chat, Logger, StateAdapter } from "chat";
 import type { Hono } from "hono";
+import type { DiscordEventSinkOutbox } from "./discord-event-sink-outbox";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
@@ -135,6 +136,18 @@ export type DiscordbotOptions = {
   activeExecutionTtlMs?: number;
   apiKey?: string;
   apiUrl: string;
+  /** Optional private Discord event sink; requires the token too. */
+  eventSinkUrl?: string;
+  eventSinkToken?: string;
+  eventSinkOutbox?: DiscordEventSinkOutbox;
+  eventSinkDeliveryTimeoutMs?: number;
+  eventSinkRecoveryBatchSize?: number;
+  eventSinkRecoveryConcurrency?: number;
+  eventSinkRecoveryLeaseMs?: number;
+  /** Periodically reconcile Discord REST history into Discord event sink. */
+  applicationArchiveReconciliationEnabled?: boolean;
+  applicationArchiveReconciliationIntervalMs?: number;
+  applicationArchiveReconciliationConcurrency?: number;
   applicationId: string;
   botToken: string;
   /** Layout for new channel mentions. Existing Discord threads remain threads. */

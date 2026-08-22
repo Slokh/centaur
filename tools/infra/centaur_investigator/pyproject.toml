@@ -1,6 +1,6 @@
 [project]
 name = "centaur_investigator"
-description = "Investigate Centaur Slack threads and sessions with readonly Postgres access"
+description = "Investigate Centaur chat messages and sessions through read-only sources"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
@@ -26,4 +26,6 @@ build-backend = "hatchling.build"
 
 [tool.centaur]
 module = "client.py"
-hosts = []
+secrets = [
+    {type = "http", name = "DISCORD_BOT_TOKEN", mode = "inject", inject_header = "Authorization", inject_formatter = "Bot {{ .Value }}", hosts = ["discord.com"]},
+]

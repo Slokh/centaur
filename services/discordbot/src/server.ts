@@ -1,6 +1,9 @@
 import { createGatewayController } from "./gateway";
 import { createDiscordbot, type DiscordbotOptions } from "./index";
 import { resolveDiscordVisibleChannelIds } from "./discord-visibility";
+import { PostgresDiscordEventSinkOutbox } from "./discord-event-sink-outbox";
+import { errorMessage } from "./utils";
+import pg from "pg";
 
 const port = numberEnv("PORT", 3001);
 const apiUrl = stringEnv("CENTAUR_API_URL", "http://127.0.0.1:8080");
@@ -31,10 +34,55 @@ if (!postgresUrl) {
   );
 }
 
+const eventSinkUrl = optionalEnv(
+  "DISCORDBOT_EVENT_SINK_URL",
+);
+const eventSinkToken = optionalEnv(
+  "DISCORDBOT_EVENT_SINK_TOKEN",
+);
+const applicationWorkerEnabled =
+  optionalEnv("DISCORDBOT_EVENT_SINK_WORKER_ENABLED") === "true";
+const eventSinkPool =
+  applicationWorkerEnabled &&
+  eventSinkUrl &&
+  eventSinkToken
+    ? new pg.Pool({
+        connectionString: postgresUrl,
+        connectionTimeoutMillis: 5_000,
+        max: 2,
+        query_timeout: 5_000,
+      })
+    : undefined;
+eventSinkPool?.on("error", (error) => {
+  log("warn", "discordbot_application_outbox_pool_error", {
+    error: errorMessage(error),
+  });
+});
+const eventSinkOutbox =
+  eventSinkPool
+    ? new PostgresDiscordEventSinkOutbox({
+        keyPrefix: optionalEnv("DISCORDBOT_STATE_KEY_PREFIX"),
+        pool: eventSinkPool,
+      })
+    : undefined;
+
 const options: DiscordbotOptions = {
   activeExecutionTtlMs: optionalNumberEnv("DISCORDBOT_ACTIVE_EXECUTION_TTL_MS"),
   apiUrl,
   apiKey: optionalEnv("DISCORDBOT_API_KEY"),
+  eventSinkUrl,
+  eventSinkToken,
+  eventSinkOutbox,
+  applicationArchiveReconciliationEnabled:
+    optionalEnv("DISCORDBOT_EVENT_SINK_ARCHIVE_RECONCILIATION_ENABLED") ===
+    "true",
+  applicationArchiveReconciliationIntervalMs:
+    optionalSecondsEnv(
+      "DISCORDBOT_EVENT_SINK_ARCHIVE_RECONCILIATION_INTERVAL_SECONDS",
+    ),
+  applicationArchiveReconciliationConcurrency: optionalNumberEnv(
+    "DISCORDBOT_EVENT_SINK_ARCHIVE_RECONCILIATION_CONCURRENCY",
+  ),
   applicationId,
   botToken,
   conversationMode:
@@ -89,6 +137,7 @@ const shutdown = async (signal: string): Promise<void> => {
   log("info", "discordbot_shutdown_started", { signal });
   await gateway.shutdown();
   await chat.shutdown().catch(() => undefined);
+  await eventSinkOutbox?.disconnect().catch(() => undefined);
   server.stop();
   log("info", "discordbot_shutdown_complete", { signal });
   process.exit(0);
@@ -141,6 +190,11 @@ function optionalNumberEnv(name: string): number | undefined {
     throw new Error(`${name} must be a positive integer`);
   }
   return parsed;
+}
+
+function optionalSecondsEnv(name: string): number | undefined {
+  const seconds = optionalNumberEnv(name);
+  return seconds === undefined ? undefined : seconds * 1_000;
 }
 
 function responseMetadataModeEnv(name: string): "first" | "always" | "never" {

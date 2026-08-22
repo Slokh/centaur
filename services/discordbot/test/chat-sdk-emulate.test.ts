@@ -280,6 +280,47 @@ describe("discordbot", () => {
     );
   });
 
+  it("does not wait for application outbox writes before handling a mention", async () => {
+    const state = createMemoryState();
+    await state.connect();
+    const originalSet = state.set.bind(state);
+    let releaseOutbox: (() => void) | undefined;
+    const outboxBlocked = new Promise<void>((resolve) => {
+      releaseOutbox = resolve;
+    });
+    state.set = async (key, value, ttlMs) => {
+      if (key.startsWith("discordbot:application-ingestion:event:")) {
+        await outboxBlocked;
+      }
+      return originalSet(key, value, ttlMs);
+    };
+    bot = createTestBot({
+      eventSinkToken: "ingestion-token",
+      eventSinkUrl: "http://application.invalid/v1/discord/events",
+      state,
+    });
+
+    const threadId = discordApi.nextId();
+    discordApi.seedThreadChannel(threadId, CHANNEL_ID);
+    try {
+      const dispatch = dispatchMessage({
+        channelId: threadId,
+        content: `<@${APP_ID}> acknowledge before archival`,
+        mention: true,
+        thread: { id: threadId, parentId: CHANNEL_ID },
+      });
+      await expect(
+        Promise.race([
+          dispatch.then(() => "returned"),
+          Bun.sleep(100).then(() => "blocked"),
+        ]),
+      ).resolves.toBe("returned");
+      await waitFor(() => codexApi.executes.length === 1, 3_000);
+    } finally {
+      releaseOutbox?.();
+    }
+  });
+
   it("syncs thread context, forwards subscribed messages, and renders execute streams append-only", async () => {
     const state = createMemoryState();
     await state.connect();

@@ -482,6 +482,28 @@
           "enum": ["first", "always", "never"]
         },
         "responseLatencyEnabled": { "type": "boolean" },
+        "eventSink": {
+          "type": "object",
+          "properties": {
+            "worker": {
+              "type": "object",
+              "properties": {
+                "enabled": { "type": "boolean" },
+                "recoveryIntervalMs": { "type": "integer", "minimum": 1 },
+                "batchSize": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                "concurrency": { "type": "integer", "minimum": 1 },
+                "leaseMs": { "type": "integer", "minimum": 1000 },
+                "deliveryTimeoutMs": { "type": "integer", "minimum": 1 },
+                "archiveBacklogHighWatermark": { "type": "integer", "minimum": 1 },
+                "egressPorts": {
+                  "type": "array",
+                  "items": { "type": "integer", "minimum": 1, "maximum": 65535 }
+                },
+                "resources": { "type": "object" }
+              }
+            }
+          }
+        },
         "extraEnv": {
           "type": "object",
           "additionalProperties": { "type": "string" }
