@@ -30,7 +30,7 @@ spec:
       {{- end }}
       containers:
         - name: discordbot-event-sink-worker
-          image: {{ printf "%s:%s" .Values.discordbot.image.repository .Values.discordbot.image.tag | quote }}
+          image: {{ include "centaur.imageRef" .Values.discordbot.image | quote }}
           imagePullPolicy: {{ .Values.discordbot.image.pullPolicy }}
           command: ["bun", "src/worker.ts"]
           env:
