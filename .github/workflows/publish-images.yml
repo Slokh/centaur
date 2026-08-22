@@ -19,6 +19,20 @@ on:
       - .agents/skills/**
   pull_request:
   workflow_dispatch:
+    inputs:
+      services:
+        description: Comma-separated services to publish, or all
+        required: false
+        default: all
+        type: string
+      rust_profile:
+        description: Rust build profile for manually published images
+        required: false
+        default: debug
+        type: choice
+        options:
+          - debug
+          - release
 
 concurrency:
   group: publish-images-${{ github.ref }}
@@ -31,73 +45,156 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAMESPACE: paradigmxyz/centaur
-  IMAGE_SOURCE: https://github.com/paradigmxyz/centaur
+  # Forks can publish the same standard image set under their own namespace
+  # without rewriting this workflow. The upstream repository keeps its
+  # existing namespace when the variable is unset.
+  IMAGE_NAMESPACE: ${{ vars.CENTAUR_IMAGE_NAMESPACE || 'paradigmxyz/centaur' }}
+  IMAGE_SOURCE: ${{ github.server_url }}/${{ github.repository }}
   # Main/tags keep optimized release images. PRs and manual branch publishes
   # use debug builds so staging/dev iteration does not spend minutes optimizing
   # Rust binaries that are immediately replaced by the next test build.
-  RUST_BUILD_PROFILE: ${{ (github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && 'debug' || 'release' }}
+  RUST_BUILD_PROFILE: ${{ github.event_name == 'workflow_dispatch' && inputs.rust_profile || (github.event_name == 'pull_request' && 'debug' || 'release') }}
 
 jobs:
+  select:
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.services.outputs.services }}
+      platforms: ${{ steps.services.outputs.platforms }}
+      builds: ${{ steps.services.outputs.builds }}
+      images: ${{ steps.services.outputs.images }}
+    steps:
+      - name: Checkout for change detection
+        if: github.event_name != 'workflow_dispatch'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect affected images
+        if: github.event_name != 'workflow_dispatch'
+        id: changes
+        uses: dorny/paths-filter@15192bc058cc28a13dbf6cde61f19e18988b7af6 # v3
+        with:
+          filters: |
+            all:
+              - '.github/workflows/publish-images.yml'
+              - 'scripts/bootstrap-k8s-secrets.sh'
+              - 'services/AGENTS.md'
+            api-rs:
+              - 'services/api-rs/**'
+              - 'services/workflow-python/**'
+              - 'centaur_sdk/**'
+              - 'tools/**'
+              - 'workflows/**'
+            slackbotv2:
+              - 'services/slackbotv2/**'
+              - 'packages/**'
+              - 'patches/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+            linearbot:
+              - 'services/linearbot/**'
+              - 'packages/**'
+              - 'patches/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+            discordbot:
+              - 'services/discordbot/**'
+              - 'packages/**'
+              - 'patches/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+            githubbot:
+              - 'services/githubbot/**'
+              - 'packages/**'
+              - 'patches/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+            teamsbot:
+              - 'services/teamsbot/**'
+              - 'packages/**'
+              - 'patches/**'
+              - 'package.json'
+              - 'pnpm-lock.yaml'
+              - 'pnpm-workspace.yaml'
+            agent:
+              - 'services/sandbox/**'
+              - 'services/workflow-python/**'
+              - 'crates/harness-server/**'
+              - 'harness/**'
+              - 'centaur_sdk/**'
+              - 'tools/**'
+              - '.agents/skills/**'
+            iron-proxy:
+              - 'services/iron-proxy/**'
+              - 'tools/**'
+            console:
+              - 'services/console/**'
+
+      - name: Select service and platform matrices
+        id: services
+        env:
+          CHANGED_SERVICES: ${{ steps.changes.outputs.changes }}
+          REQUESTED_SERVICES: ${{ inputs.services }}
+          PUBLISH_ARM64: ${{ vars.CENTAUR_PUBLISH_ARM64 }}
+        run: |
+          all='["api-rs","slackbotv2","linearbot","discordbot","githubbot","teamsbot","agent","iron-proxy","console"]'
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            requested="${REQUESTED_SERVICES:-all}"
+            if [ "$requested" = all ]; then
+              services="$all"
+            else
+              services="$(jq -cn --arg value "$requested" '$value | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0)) | unique')"
+              invalid="$(jq -cn --argjson all "$all" --argjson requested "$services" '$requested - $all')"
+              test "$invalid" = '[]'
+              test "$(jq 'length' <<<"$services")" -gt 0
+            fi
+          elif jq -e 'index("all")' <<<"${CHANGED_SERVICES:-[]}" >/dev/null; then
+            services="$all"
+          else
+            services="$(jq -c --argjson all "$all" '[.[] as $item | $all[] | select(. == $item)] | unique' <<<"${CHANGED_SERVICES:-[]}")"
+          fi
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$PUBLISH_ARM64" != false ]; then
+            platforms='["linux/amd64","linux/arm64"]'
+          else
+            platforms='["linux/amd64"]'
+          fi
+          definitions='[
+            {"service":"api-rs","image":"centaur-api-rs","context":".","dockerfile":"services/api-rs/Dockerfile","target":""},
+            {"service":"slackbotv2","image":"centaur-slackbotv2","context":".","dockerfile":"services/slackbotv2/Dockerfile","target":""},
+            {"service":"linearbot","image":"centaur-linearbot","context":".","dockerfile":"services/linearbot/Dockerfile","target":""},
+            {"service":"discordbot","image":"centaur-discordbot","context":".","dockerfile":"services/discordbot/Dockerfile","target":""},
+            {"service":"githubbot","image":"centaur-githubbot","context":".","dockerfile":"services/githubbot/Dockerfile","target":""},
+            {"service":"teamsbot","image":"centaur-teamsbot","context":".","dockerfile":"services/teamsbot/Dockerfile","target":""},
+            {"service":"agent","image":"centaur-agent","context":".","dockerfile":"services/sandbox/Dockerfile","target":"sandbox"},
+            {"service":"iron-proxy","image":"centaur-iron-proxy","context":".","dockerfile":"services/iron-proxy/Dockerfile","target":""},
+            {"service":"console","image":"centaur-console","context":"services/console","dockerfile":"services/console/Dockerfile","target":""}
+          ]'
+          images="$(jq -cn --argjson services "$services" --argjson definitions "$definitions" '[ $services[] as $service | $definitions[] | select(.service == $service) ]')"
+          builds="$(jq -cn --argjson images "$images" --argjson platforms "$platforms" '[ $images[] as $image | $platforms[] as $platform | $image + {platform: $platform} ]')"
+          echo "services=$services" >> "$GITHUB_OUTPUT"
+          echo "platforms=$platforms" >> "$GITHUB_OUTPUT"
+          echo "images=$images" >> "$GITHUB_OUTPUT"
+          echo "builds=$builds" >> "$GITHUB_OUTPUT"
+
   # Build each image with Depot's hosted builders, push by digest, and hand
   # the digests to the merge job below which assembles the multi-arch manifest.
-  # arm64 is only built on pushes to main and release tags — PR and manual
-  # dispatch builds stay amd64-only to keep iteration fast. Fork PRs skip both
-  # jobs so untrusted changes do not run on the hosted image builders.
+  # arm64 is built on pushes to main and release tags by default. Forks that
+  # only deploy amd64 can set CENTAUR_PUBLISH_ARM64=false; PR and manual
+  # dispatch builds stay amd64-only to keep iteration fast. Fork PRs skip the
+  # hosted image builders so untrusted changes are never executed there.
   build:
+    needs: select
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
-    runs-on: ${{ matrix.platform == 'linux/arm64' && 'depot-ubuntu-24.04-arm-16' || 'depot-ubuntu-24.04-16' }}
+    runs-on: ${{ vars.CENTAUR_USE_GITHUB_BUILDERS == 'true' && 'ubuntu-latest' || (matrix.platform == 'linux/arm64' && 'depot-ubuntu-24.04-arm-16' || 'depot-ubuntu-24.04-16') }}
     strategy:
       fail-fast: false
       matrix:
-        service: [api-rs, slackbotv2, linearbot, discordbot, githubbot, teamsbot, agent, iron-proxy, console]
-        platform: ${{ github.event_name == 'push' && fromJSON('["linux/amd64", "linux/arm64"]') || fromJSON('["linux/amd64"]') }}
-        include:
-          - service: api-rs
-            image: centaur-api-rs
-            context: .
-            dockerfile: services/api-rs/Dockerfile
-            target: ""
-          - service: slackbotv2
-            image: centaur-slackbotv2
-            context: .
-            dockerfile: services/slackbotv2/Dockerfile
-            target: ""
-          - service: linearbot
-            image: centaur-linearbot
-            context: .
-            dockerfile: services/linearbot/Dockerfile
-            target: ""
-          - service: discordbot
-            image: centaur-discordbot
-            context: .
-            dockerfile: services/discordbot/Dockerfile
-            target: ""
-          - service: githubbot
-            image: centaur-githubbot
-            context: .
-            dockerfile: services/githubbot/Dockerfile
-            target: ""
-          - service: teamsbot
-            image: centaur-teamsbot
-            context: .
-            dockerfile: services/teamsbot/Dockerfile
-            target: ""
-          - service: agent
-            image: centaur-agent
-            context: .
-            dockerfile: services/sandbox/Dockerfile
-            target: sandbox
-          - service: iron-proxy
-            image: centaur-iron-proxy
-            context: .
-            dockerfile: services/iron-proxy/Dockerfile
-            target: ""
-          - service: console
-            image: centaur-console
-            context: services/console
-            dockerfile: services/console/Dockerfile
-            target: ""
+        include: ${{ fromJSON(needs.select.outputs.builds) }}
 
     steps:
       - name: Checkout
@@ -111,7 +208,12 @@ jobs:
           echo "PLATFORM_SLUG=${platform//\//-}" >> "$GITHUB_ENV"
 
       - name: Set up Depot
+        if: vars.CENTAUR_USE_GITHUB_BUILDERS != 'true'
         uses: depot/setup-action@15c09a5f77a0840ad4bce955686522a257853461 # v1.7.1
+
+      - name: Set up Docker Buildx
+        if: vars.CENTAUR_USE_GITHUB_BUILDERS == 'true'
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
       - name: Log in to GHCR
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
@@ -133,6 +235,7 @@ jobs:
 
       - name: Build and push ${{ matrix.image }} (${{ matrix.platform }})
         id: build
+        if: vars.CENTAUR_USE_GITHUB_BUILDERS != 'true'
         uses: depot/build-push-action@98e78adca7817480b8185f474a400b451d74e287 # v1.18.0
         with:
           project: d8qqlh1bmq
@@ -148,11 +251,27 @@ jobs:
           build-args: |
             RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
 
+      - name: Build and push ${{ matrix.image }} (${{ matrix.platform }}) with BuildKit
+        id: build-github
+        if: vars.CENTAUR_USE_GITHUB_BUILDERS == 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }},push-by-digest=true,name-canonical=true,push=${{ !github.event.pull_request.head.repo.fork }}
+          build-args: |
+            RUST_BUILD_PROFILE=${{ env.RUST_BUILD_PROFILE }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:buildcache-${{ env.PLATFORM_SLUG }}
+          cache-to: ${{ github.event.pull_request.head.repo.fork && '' || format('type=registry,ref={0}/{1}/{2}:buildcache-{3},mode=max,image-manifest=true,oci-mediatypes=true', env.REGISTRY, env.IMAGE_NAMESPACE, matrix.image, env.PLATFORM_SLUG) }}
+
       - name: Export digest
         if: ${{ !github.event.pull_request.head.repo.fork }}
         run: |
           mkdir -p ${{ runner.temp }}/digests
-          digest="${{ steps.build.outputs.digest }}"
+          digest="${{ steps.build.outputs.digest || steps.build-github.outputs.digest }}"
           touch "${{ runner.temp }}/digests/${digest#sha256:}"
 
       - name: Upload digest
@@ -165,22 +284,13 @@ jobs:
           retention-days: 1
 
   merge:
-    runs-on: depot-ubuntu-24.04-16
-    needs: build
+    runs-on: ${{ vars.CENTAUR_USE_GITHUB_BUILDERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
+    needs: [select, build]
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - image: centaur-api-rs
-          - image: centaur-slackbotv2
-          - image: centaur-linearbot
-          - image: centaur-agent
-          - image: centaur-iron-proxy
-          - image: centaur-console
-          - image: centaur-discordbot
-          - image: centaur-githubbot
-          - image: centaur-teamsbot
+        include: ${{ fromJSON(needs.select.outputs.images) }}
 
     steps:
       - name: Download digests
