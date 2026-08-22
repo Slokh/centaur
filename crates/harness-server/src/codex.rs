@@ -13,7 +13,7 @@ use std::time::Duration;
 use codex_app_server_protocol::UserInput;
 use serde_json::{Value, json};
 
-use crate::otel::{self, TurnStatus as TelemetryTurnStatus, TurnTelemetry};
+use crate::otel::{TurnStatus as TelemetryTurnStatus, TurnTelemetry};
 use crate::server::{
     BlocksCommand, BlocksState, apply_session_env, parse_blocks_line_with_state,
     usage_span_input_value, write_blocks_error,
@@ -216,7 +216,6 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                 let result = (|| -> Result<()> {
                     apply_session_env(&mut active_session_env, session_env)?;
                     if codex.is_none() {
-                        otel::configure_codex_otel_for_startup(&trace_context)?;
                         let mut child = CodexJsonRpcChild::spawn(&active_session_env)?;
                         initialize_codex(
                             &mut child,
