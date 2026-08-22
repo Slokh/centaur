@@ -135,6 +135,7 @@ jobs:
 
       - name: Validate chart and image inheritance
         run: |
+          helm repo add onepassword https://1password.github.io/connect-helm-charts --force-update
           helm dependency build contrib/chart
           helm lint contrib/chart
           .github/scripts/test-chart-images.sh
