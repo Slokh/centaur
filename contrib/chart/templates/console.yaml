@@ -46,6 +46,9 @@ spec:
       labels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "console") | nindent 8 }}
     spec:
+      {{- with .Values.global.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       automountServiceAccountToken: false
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
@@ -97,7 +100,7 @@ spec:
               type: RuntimeDefault
       containers:
         - name: console
-          image: {{ printf "%s:%s" $console.image.repository $console.image.tag | quote }}
+          image: {{ include "centaur.imageRef" $console.image | quote }}
           imagePullPolicy: {{ $console.image.pullPolicy }}
           env:
             # Explicit secretKeyRefs only — never envFrom the shared Secret, or

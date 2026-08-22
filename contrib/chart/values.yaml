@@ -3,6 +3,10 @@ fullnameOverride: ""
 
 global:
   imagePullSecrets: []
+  # Optional PriorityClass for chart-managed control-plane workloads. Keep this
+  # above sandbox.priorityClassName so essential services can preempt disposable
+  # agent capacity when a node is lost or the cluster is saturated.
+  priorityClassName: ""
 
 secretManager:
   envPrefix: ""
@@ -19,6 +23,7 @@ ironProxy:
   image:
     repository: centaur-iron-proxy
     tag: latest
+    digest: ""
     pullPolicy: Always
   service:
     proxyPort: 8080
@@ -79,6 +84,7 @@ toolServer:
   runnerImage:
     repository: ""
     tag: ""
+    digest: ""
     pullPolicy: ""
   # GitHub token for direct private-repo clones when repoCache.enabled=false.
   # With the default repo-cache path, configure repoCache.githubToken instead.
@@ -129,6 +135,7 @@ console:
   image:
     repository: centaur-console
     tag: latest
+    digest: ""
     # Default Always: the image is published under the mutable `latest` tag, so
     # IfNotPresent would pin pods to whatever digest a node already cached.
     pullPolicy: Always
@@ -287,10 +294,14 @@ codex:
   customProviders: {}
 
 sandbox:
+  # Optional lower-priority class applied to runtime-created sandbox and paired
+  # iron-proxy pods.
+  priorityClassName: ""
   controller: pod
   image:
     repository: centaur-agent
     tag: latest
+    digest: ""
     pullPolicy: Always
   # Node steering for sandbox pods **and** their paired iron-proxy pods. These
   # reach the pod through the control plane, not through this chart's templates:
@@ -384,6 +395,7 @@ repoCache:
   image:
     repository: ""
     tag: ""
+    digest: ""
     pullPolicy: ""
   githubToken:
     # Optional for public repos; required for private repos.
@@ -425,6 +437,7 @@ apiRs:
   image:
     repository: centaur-api-rs
     tag: latest
+    digest: ""
     pullPolicy: Always
   port: 8080
   # Public/local MCP endpoint advertised through OAuth protected-resource
@@ -559,6 +572,7 @@ slackbotv2:
   image:
     repository: centaur-slackbotv2
     tag: latest
+    digest: ""
     pullPolicy: Always
   userName: centaur
   assistantStatus: ""
@@ -626,6 +640,7 @@ linearbot:
   image:
     repository: centaur-linearbot
     tag: latest
+    digest: ""
     pullPolicy: Always
   userName: centaur
   extraEnv: {}
@@ -644,6 +659,7 @@ githubbot:
   image:
     repository: centaur-githubbot
     tag: latest
+    digest: ""
     pullPolicy: Always
   userName: ""
   # v2 PR self-management (only acts on PRs assigned to the bot account).
@@ -683,6 +699,7 @@ discordbot:
   image:
     repository: centaur-discordbot
     tag: latest
+    digest: ""
     pullPolicy: Always
   userName: centaur
   # Comma/space-separated Discord guild IDs. The bot is INERT (ignores all messages) until set.
@@ -733,6 +750,7 @@ teamsbot:
   image:
     repository: centaur-teamsbot
     tag: latest
+    digest: ""
     pullPolicy: Always
   allowedTeamIds: ""
   allowedChannelIds: ""

@@ -52,6 +52,9 @@ spec:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "console-sql-exporter") | nindent 8 }}
         centaur.ai/metrics: console-sql-exporter
     spec:
+      {{- with .Values.global.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       automountServiceAccountToken: false
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:

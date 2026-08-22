@@ -45,6 +45,9 @@ spec:
       labels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "githubbot") | nindent 8 }}
     spec:
+      {{- with .Values.global.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       # Give in-flight agent turns time to finish on a rollout; the bot drains
       # background work for GITHUBBOT_SHUTDOWN_DRAIN_MS (set below from this) on
       # SIGTERM so a deploy doesn't drop a running CI fix / review / issue turn.
@@ -56,7 +59,7 @@ spec:
       {{- end }}
       containers:
         - name: githubbot
-          image: {{ printf "%s:%s" .Values.githubbot.image.repository .Values.githubbot.image.tag | quote }}
+          image: {{ include "centaur.imageRef" .Values.githubbot.image | quote }}
           imagePullPolicy: {{ .Values.githubbot.image.pullPolicy }}
           env:
             - name: PORT

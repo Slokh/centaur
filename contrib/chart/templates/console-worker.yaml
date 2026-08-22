@@ -34,6 +34,9 @@ spec:
       labels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "console-worker") | nindent 8 }}
     spec:
+      {{- with .Values.global.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       automountServiceAccountToken: false
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
@@ -70,7 +73,7 @@ spec:
               type: RuntimeDefault
       containers:
         - name: console-worker
-          image: {{ printf "%s:%s" $console.image.repository $console.image.tag | quote }}
+          image: {{ include "centaur.imageRef" $console.image | quote }}
           imagePullPolicy: {{ $console.image.pullPolicy }}
           # Solid Queue supervisor. Claims and runs jobs from the
           # <primary>_queue database; serves no HTTP.

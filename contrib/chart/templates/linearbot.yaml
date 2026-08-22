@@ -18,6 +18,9 @@ spec:
       labels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "linearbot") | nindent 8 }}
     spec:
+      {{- with .Values.global.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       automountServiceAccountToken: false
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
@@ -25,7 +28,7 @@ spec:
       {{- end }}
       containers:
         - name: linearbot
-          image: {{ printf "%s:%s" .Values.linearbot.image.repository .Values.linearbot.image.tag | quote }}
+          image: {{ include "centaur.imageRef" .Values.linearbot.image | quote }}
           imagePullPolicy: {{ .Values.linearbot.image.pullPolicy }}
           env:
             - name: PORT
