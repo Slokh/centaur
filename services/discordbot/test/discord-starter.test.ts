@@ -1,10 +1,15 @@
 import { describe, expect, it } from "bun:test";
 import type { Logger } from "chat";
 import {
+  fetchImmediateReplyContext,
   fetchThreadStarterMessage,
   withDiscordEmbedText,
 } from "../src/discord-starter";
-import type { DiscordbotFetch, DiscordbotOptions } from "../src/types";
+import type {
+  DiscordbotApiMessage,
+  DiscordbotFetch,
+  DiscordbotOptions,
+} from "../src/types";
 
 const silentLogger: Logger = {
   debug: () => undefined,
@@ -168,12 +173,118 @@ describe("fetchThreadStarterMessage", () => {
   });
 });
 
+describe("fetchImmediateReplyContext", () => {
+  it("flattens the embedded forwarded snapshot targeted by the current turn", async () => {
+    let fetched = false;
+    const current: DiscordbotApiMessage = {
+      attachments: [],
+      author: {
+        fullName: "Alice",
+        isBot: false,
+        isMe: false,
+        userId: "U1",
+        userName: "alice",
+      },
+      id: "M2",
+      isMention: false,
+      raw: {
+        channel_id: "C1",
+        message_reference: { message_id: "M1" },
+        referenced_message: {
+          id: "M1",
+          channel_id: "C1",
+          content: "",
+          timestamp: "2026-08-19T00:00:00.000Z",
+          author: { id: "bot-user", username: "bot", bot: true },
+          attachments: [],
+          embeds: [],
+          message_snapshots: [
+            {
+              message: {
+                content: "Which mission first landed humans on the Moon?",
+                embeds: [],
+              },
+            },
+          ],
+        },
+      },
+      text: "Apollo 11",
+      threadId: "discord:G1:C1:reply~ROOT",
+      timestamp: "2026-08-19T00:00:01.000Z",
+    };
+
+    const context = await fetchImmediateReplyContext(
+      options((async () => {
+        fetched = true;
+        return new Response("not used", { status: 500 });
+      }) as DiscordbotFetch),
+      current.threadId,
+      current,
+      silentLogger,
+    );
+
+    expect(fetched).toBe(false);
+    expect(context).toEqual(
+      expect.objectContaining({
+        id: "M1",
+        text: "[forwarded message] Which mission first landed humans on the Moon?",
+      }),
+    );
+  });
+
+  it("does not fetch a cross-channel reply source", async () => {
+    let fetched = false;
+    const current: DiscordbotApiMessage = {
+      attachments: [],
+      author: {
+        fullName: "Alice",
+        isBot: false,
+        isMe: false,
+        userId: "U1",
+        userName: "alice",
+      },
+      id: "M2",
+      isMention: false,
+      raw: {
+        channel_id: "C1",
+        message_reference: { channel_id: "C2", message_id: "M1" },
+      },
+      text: "Apollo 11",
+      threadId: "discord:G1:C1:reply~ROOT",
+      timestamp: "2026-08-19T00:00:01.000Z",
+    };
+
+    const context = await fetchImmediateReplyContext(
+      options((async () => {
+        fetched = true;
+        return new Response("not used", { status: 500 });
+      }) as DiscordbotFetch),
+      current.threadId,
+      current,
+      silentLogger,
+    );
+
+    expect(context).toBeUndefined();
+    expect(fetched).toBe(false);
+  });
+});
+
 describe("withDiscordEmbedText", () => {
   it("appends embed text after existing content", () => {
     const text = withDiscordEmbedText("heads up", {
       embeds: [{ title: "Alert", description: "something broke" }],
     });
     expect(text).toBe("heads up\n\n[embed] Alert\nsomething broke");
+  });
+
+  it("flattens forwarded message snapshots", () => {
+    expect(
+      withDiscordEmbedText("", {
+        message_snapshots: [
+          { message: { content: "Original answer", embeds: [] } },
+        ],
+      }),
+    ).toBe("[forwarded message] Original answer");
   });
 
   it("returns the text unchanged without embeds", () => {
