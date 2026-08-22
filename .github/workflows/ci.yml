@@ -135,13 +135,14 @@ jobs:
 
       - name: Validate chart and image inheritance
         run: |
+          helm repo add onepassword https://1password.github.io/connect-helm-charts --force-update
           helm dependency build contrib/chart
           helm lint contrib/chart
           .github/scripts/test-chart-images.sh
 
   migration-order:
     name: Migration order
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CENTAUR_USE_GITHUB_BUILDERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.migration_order == 'true'
     steps:
@@ -155,7 +156,7 @@ jobs:
 
   harness-server-checks:
     name: Harness server fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CENTAUR_USE_GITHUB_BUILDERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.harness_server_checks == 'true'
     steps:
@@ -186,7 +187,7 @@ jobs:
 
   rust-api:
     name: Rust API fmt, clippy, and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CENTAUR_USE_GITHUB_BUILDERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.rust_api == 'true'
     steps:
@@ -403,7 +404,7 @@ jobs:
 
   slackbotv2-tests:
     name: Slackbot v2 tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CENTAUR_USE_GITHUB_BUILDERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.slackbotv2_tests == 'true'
     steps:
@@ -461,7 +462,7 @@ jobs:
 
   discordbot-checks:
     name: Discordbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CENTAUR_USE_GITHUB_BUILDERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.discordbot_checks == 'true'
     steps:
@@ -495,7 +496,7 @@ jobs:
 
   githubbot-checks:
     name: Githubbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CENTAUR_USE_GITHUB_BUILDERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.githubbot_checks == 'true'
     steps:
@@ -529,7 +530,7 @@ jobs:
 
   teamsbot-checks:
     name: Teamsbot typecheck and tests
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CENTAUR_USE_GITHUB_BUILDERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
     needs: ci_changes
     if: needs.ci_changes.outputs.teamsbot_checks == 'true'
     steps:
