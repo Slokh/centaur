@@ -3,6 +3,9 @@ name: Console Gem Audit
 on:
   push:
     branches: [ main ]
+    paths:
+      - services/console/**
+      - .github/workflows/console-gem-audit.yml
 
 permissions:
   contents: read
@@ -13,7 +16,7 @@ defaults:
 
 jobs:
   scan_gems:
-    runs-on: depot-ubuntu-24.04-16
+    runs-on: ${{ vars.CENTAUR_USE_GITHUB_BUILDERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-16' }}
 
     steps:
       - name: Checkout code
