@@ -9,10 +9,37 @@ export function parseDiscordThreadKey(threadKey: string): {
   guildId?: string;
   channelId?: string;
   threadId?: string;
+  replyToMessageId?: string;
 } {
   const parts = threadKey.split(":");
   if (parts[0] !== "discord") return {};
-  return { guildId: parts[1], channelId: parts[2], threadId: parts[3] };
+  const encodedDestination = parts[3];
+  return {
+    guildId: parts[1],
+    channelId: parts[2],
+    threadId: encodedDestination?.startsWith("reply~")
+      ? undefined
+      : encodedDestination,
+    replyToMessageId: encodedDestination?.startsWith("reply~")
+      ? encodedDestination.slice(6)
+      : undefined,
+  };
+}
+
+/**
+ * Keep an inline reply chain's logical root while directing one outbound
+ * message at the user message that triggered the current turn. The patched
+ * Discord adapter understands the private `~to~` suffix; this key is for
+ * delivery only and must never be used as session or state identity.
+ */
+export function discordTurnDeliveryKey(
+  threadKey: string,
+  triggerMessageId: string,
+): string {
+  const { guildId, channelId, replyToMessageId } =
+    parseDiscordThreadKey(threadKey);
+  if (!guildId || !channelId || !replyToMessageId) return threadKey;
+  return `discord:${guildId}:${channelId}:reply~${replyToMessageId}~to~${triggerMessageId}`;
 }
 
 /**

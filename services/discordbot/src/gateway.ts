@@ -17,13 +17,16 @@ const LONG_RUNNING_MS = 2_147_483_647;
 
 // Discord delta (no slackbotv2 analog): discord.js can sit in a RESUME loop
 // for a long time without the listener promise settling, so `/health` also
-// needs to reflect transient connection state. The adapter does not expose a
-// status callback yet (see the TODO(wire) note at the adapter construction
-// site); once wired, `setGatewayConnected` flips this timestamp and
-// `isActive()` goes false after the gateway has been down for >60s.
+// needs to reflect transient connection state. The patched adapter's status
+// callback drives this timestamp, and `isActive()` goes false after the
+// gateway has been down for >60s.
 const GATEWAY_DISCONNECT_STALE_MS = 60_000;
+const GATEWAY_STARTUP_GRACE_MS = 120_000;
+const GATEWAY_WATCHDOG_INTERVAL_MS = 15_000;
 
 let gatewayDisconnectedAtMs: number | null = null;
+let gatewayConnected = false;
+let gatewayHasConnected = false;
 
 /** Records a Gateway connect/disconnect transition (timestamp-based). */
 export function setGatewayConnected(
@@ -31,9 +34,12 @@ export function setGatewayConnected(
   atEpochMs = Date.now(),
 ): void {
   if (connected) {
+    gatewayConnected = true;
+    gatewayHasConnected = true;
     gatewayDisconnectedAtMs = null;
     return;
   }
+  gatewayConnected = false;
   // Keep the FIRST disconnect timestamp so repeated disconnect signals
   // don't push the staleness window forward.
   gatewayDisconnectedAtMs ??= atEpochMs;
@@ -41,15 +47,20 @@ export function setGatewayConnected(
 
 /** True until the gateway has been disconnected for more than the stale window. */
 export function isGatewayConnectionFresh(nowEpochMs = Date.now()): boolean {
-  return (
-    gatewayDisconnectedAtMs === null ||
-    nowEpochMs - gatewayDisconnectedAtMs <= GATEWAY_DISCONNECT_STALE_MS
-  );
+  if (gatewayConnected) return true;
+  return gatewayDisconnectedAtMs !== null &&
+    nowEpochMs - gatewayDisconnectedAtMs <= GATEWAY_DISCONNECT_STALE_MS;
+}
+
+export function isGatewayConnected(): boolean {
+  return gatewayConnected;
 }
 
 export type GatewayController = {
   /** True once the listener has started and the connection has not ended. */
   isActive(): boolean;
+  /** Run the stale-connection watchdog immediately. Exposed for deterministic tests. */
+  checkHealth(nowEpochMs?: number): void;
   /** Initialize the chat instance and open the single long-lived Gateway connection. */
   start(chat: Chat, adapter: GatewayCapableAdapter): Promise<void>;
   /** Stop accepting Gateway work and wait for the connection to close. */
@@ -71,9 +82,28 @@ export function createGatewayController(
   let active = false;
   let shuttingDown = false;
   let monitor: Promise<void> | undefined;
+  let startedAtMs = 0;
+  let fatalTriggered = false;
+  let watchdog: ReturnType<typeof setInterval> | undefined;
+
+  const triggerFatal = (event: string): void => {
+    if (fatalTriggered || shuttingDown) return;
+    fatalTriggered = true;
+    logger.error(event);
+    onFatalEnd();
+  };
+
+  const checkHealth = (nowEpochMs = Date.now()): void => {
+    if (!active || shuttingDown || isGatewayConnectionFresh(nowEpochMs)) return;
+    if (!gatewayHasConnected && nowEpochMs - startedAtMs <= GATEWAY_STARTUP_GRACE_MS) {
+      return;
+    }
+    triggerFatal("discordbot_gateway_stale");
+  };
 
   return {
-    isActive: () => active && isGatewayConnectionFresh(),
+    isActive: () => active && isGatewayConnected(),
+    checkHealth,
 
     async start(chat, adapter) {
       // Adapters initialize lazily (normally on the first webhook). Direct-mode Gateway
@@ -92,7 +122,10 @@ export function createGatewayController(
         undefined,
       );
       active = true;
+      startedAtMs = Date.now();
       logger.info("discordbot_gateway_started");
+      watchdog = setInterval(checkHealth, GATEWAY_WATCHDOG_INTERVAL_MS);
+      watchdog.unref();
 
       monitor = Promise.all(tracked)
         .then(() => undefined)
@@ -104,13 +137,13 @@ export function createGatewayController(
           }
           // A single long-lived connection ended on its own — almost always a fatal error
           // (invalid token / disallowed intents). Exit so k8s restarts with backoff.
-          logger.error("discordbot_gateway_ended_unexpectedly");
-          onFatalEnd();
+          triggerFatal("discordbot_gateway_ended_unexpectedly");
         });
     },
 
     async shutdown() {
       shuttingDown = true;
+      if (watchdog) clearInterval(watchdog);
       abort.abort();
       if (monitor) await monitor;
     },

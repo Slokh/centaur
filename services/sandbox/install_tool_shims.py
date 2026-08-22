@@ -345,14 +345,29 @@ def _first_base_centaur_skills(home_dir: Path) -> Path | None:
     return None
 
 
+def _base_skills_enabled() -> bool:
+    return os.environ.get(
+        "CENTAUR_BASE_SKILLS_ENABLED", "true"
+    ).strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
 def _skill_sources() -> list[Path]:
     home_dir = _home_dir()
-    sources = [
-        home_dir / ".agents" / "skills",
-        home_dir / "centaur-skills",
-    ]
-    if base_skills := _first_base_centaur_skills(home_dir):
-        sources.append(base_skills)
+    sources: list[Path] = []
+    if _base_skills_enabled():
+        sources.extend(
+            [
+                home_dir / ".agents" / "skills",
+                home_dir / "centaur-skills",
+            ]
+        )
+        if base_skills := _first_base_centaur_skills(home_dir):
+            sources.append(base_skills)
     sources.append(home_dir / "centaur-overlay-skills")
 
     overlay_dir = os.environ.get("CENTAUR_OVERLAY_DIR")

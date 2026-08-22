@@ -22,9 +22,10 @@ Key modules are `src/gateway.ts`, `src/discord-allowlist.ts`,
 - A channel mention creates or selects the correct thread; a mention or
   follow-up inside a thread must retain one stable session key. Preserve loop
   guards and per-thread concurrency control.
-- Respect Discord rate and content limits. Keep narration append-only and
-  throttle answer edits; a rendering refactor must not reorder the final answer
-  above later reasoning or user messages.
+- Respect Discord rate and content limits. Keep narration append-only, buffer
+  final-answer deltas until completion, and split only when the completed
+  answer exceeds Discord's message limit; a rendering refactor must not reorder
+  the final answer above later reasoning or user messages.
 - Gateway reconnect/resume and redelivered messages must not create duplicate
   executions. Test deduplication separately from thread creation.
 

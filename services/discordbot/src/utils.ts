@@ -17,6 +17,27 @@ export function elapsedMs(startedAtMs: number): number {
   return Math.max(0, Math.round(nowMs() - startedAtMs));
 }
 
+/** Release an HTTP response body when the caller does not consume it. */
+export async function discardResponseBody(response: Response): Promise<void> {
+  try {
+    await response.body?.cancel();
+  } catch {
+    // Disposal is best-effort and must not replace the request's real result.
+  }
+}
+
+/** Coalesces overlapping calls onto one in-flight operation. */
+export function singleFlight<T>(operation: () => Promise<T>): () => Promise<T> {
+  let active: Promise<T> | undefined;
+  return () => {
+    if (active) return active;
+    active = operation().finally(() => {
+      active = undefined;
+    });
+    return active;
+  };
+}
+
 export function traceLog(
   options: DiscordbotOptions,
   event: string,
@@ -72,9 +93,78 @@ export function sliceSurrogateSafe(value: string, maxUnits: number): string {
   return value.slice(0, end);
 }
 
+/**
+ * Wrap HTTP(S) destinations in Discord's angle-bracket autolink syntax so the
+ * client does not expand them into rich embeds. Existing autolinks and URLs in
+ * inline/fenced code are preserved. The transform is idempotent and also works
+ * for Markdown destinations (`[label](https://example.com)` becomes
+ * `[label](<https://example.com>)`).
+ */
+export function suppressDiscordLinkEmbeds(content: string): string {
+  let output = "";
+  let cursor = 0;
+  let codeDelimiterLength = 0;
+
+  while (cursor < content.length) {
+    if (content[cursor] === "`") {
+      let runEnd = cursor + 1;
+      while (content[runEnd] === "`") runEnd += 1;
+      const runLength = runEnd - cursor;
+      if (codeDelimiterLength === 0) codeDelimiterLength = runLength;
+      else if (runLength === codeDelimiterLength) codeDelimiterLength = 0;
+      output += content.slice(cursor, runEnd);
+      cursor = runEnd;
+      continue;
+    }
+
+    if (
+      codeDelimiterLength === 0 &&
+      (content.startsWith("http://", cursor) ||
+        content.startsWith("https://", cursor)) &&
+      content[cursor - 1] !== "<"
+    ) {
+      let urlEnd = cursor;
+      while (
+        urlEnd < content.length &&
+        !/[\s<`]/.test(content[urlEnd] ?? "")
+      ) {
+        urlEnd += 1;
+      }
+      const { suffix, url } = trimUrlPunctuation(
+        content.slice(cursor, urlEnd),
+      );
+      output += `<${url}>${suffix}`;
+      cursor = urlEnd;
+      continue;
+    }
+
+    output += content[cursor];
+    cursor += 1;
+  }
+
+  return output;
+}
+
+function trimUrlPunctuation(candidate: string): { url: string; suffix: string } {
+  let url = candidate;
+  let suffix = "";
+  while (url.length) {
+    const last = url.at(-1) ?? "";
+    const counterpart =
+      last === ")" ? "(" : last === "]" ? "[" : last === "}" ? "{" : "";
+    const isUnmatchedCloser = Boolean(
+      counterpart && url.split(last).length > url.split(counterpart).length,
+    );
+    if (!/[.,;:!?]/.test(last) && !isUnmatchedCloser) break;
+    suffix = `${last}${suffix}`;
+    url = url.slice(0, -1);
+  }
+  return { url, suffix };
+}
+
 // Discord delta (no slackbotv2 analog): Slack accepts ~40k-char messages, but
 // Discord caps content at 2000 chars and the chat adapter silently truncates
-// with "...". The answer streamer splits long answers across multiple
+// with "...". Buffered answer delivery splits long answers across multiple
 // messages with these helpers instead.
 
 export type DiscordChunkSplit = {
@@ -226,43 +316,5 @@ export class GuildExecutionLimiter {
 
   inFlight(guildId: string): number {
     return this.counts.get(guildId) ?? 0;
-  }
-}
-
-/**
- * Single-consumer async queue bridging a producer loop to an AsyncIterable
- * consumer (e.g. the chat SDK's streaming post). push() never blocks; end()
- * lets the consumer drain the remaining items and finish.
- */
-export class AsyncTextQueue implements AsyncIterable<string> {
-  private readonly values: string[] = [];
-  private done = false;
-  private wake: (() => void) | null = null;
-
-  push(value: string): void {
-    this.values.push(value);
-    this.wake?.();
-  }
-
-  end(): void {
-    this.done = true;
-    this.wake?.();
-  }
-
-  async *[Symbol.asyncIterator](): AsyncIterator<string> {
-    while (true) {
-      const value = this.values.shift();
-      if (value !== undefined) {
-        yield value;
-        continue;
-      }
-      if (this.done) return;
-      await new Promise<void>((resolve) => {
-        this.wake = () => {
-          this.wake = null;
-          resolve();
-        };
-      });
-    }
   }
 }

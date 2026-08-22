@@ -445,6 +445,9 @@ spec:
 {{- if and .Values.repoCache.enabled (gt (len $publicSkillDirs) 0) }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_PUBLIC_SKILL_DIRS" "value" (join ":" $publicSkillDirs)) }}
 {{- end }}
+{{- if .Values.overlay.systemPrompt }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_SYSTEM_PROMPT" "value" .Values.overlay.systemPrompt) }}
+{{- end }}
 {{- if not (hasKey .Values.sandbox.extraEnv "COMPANY_CONTEXT_EMBEDDINGS_ENABLED") }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "COMPANY_CONTEXT_EMBEDDINGS_ENABLED" "value" ($companyContextEmbeddingsEnabled | toString)) }}
 {{- end }}
@@ -456,6 +459,12 @@ spec:
 {{- end }}
 {{- if not (hasKey .Values.sandbox.extraEnv "CENTAUR_TELEMETRY_CAPTURE_TRANSCRIPTS") }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_TELEMETRY_CAPTURE_TRANSCRIPTS" "value" (.Values.sandbox.telemetry.captureTranscripts | toString)) }}
+{{- end }}
+{{- if not (hasKey .Values.sandbox.extraEnv "CENTAUR_TOOL_PREWARM") }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_TOOL_PREWARM" "value" (join "," .Values.sandbox.prewarmTools)) }}
+{{- end }}
+{{- if not (hasKey .Values.sandbox.extraEnv "CENTAUR_TOOL_PREWARM_TIMEOUT_SECONDS") }}
+{{- $sandboxEnvList = append $sandboxEnvList (dict "name" "CENTAUR_TOOL_PREWARM_TIMEOUT_SECONDS" "value" (.Values.sandbox.prewarmTimeoutSeconds | toString)) }}
 {{- end }}
 {{- range $k, $v := .Values.sandbox.extraEnv }}
 {{- $sandboxEnvList = append $sandboxEnvList (dict "name" $k "value" ($v | toString)) }}

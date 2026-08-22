@@ -17,7 +17,7 @@ load_dotenv()
 
 app = typer.Typer(
     name="company_context",
-    help="Search or run scoped SQL over company history, Slack DMs, Google Docs, and Granola notes.",
+    help="Search scoped company history and execution-bound application context sources.",
 )
 
 
@@ -120,7 +120,7 @@ def search(
     source: str | None = typer.Option(
         None,
         "--source",
-        help="Filter by source. Use 'docs' for Google Docs or 'granola' for Granola notes.",
+        help="Filter by source, including operator-configured application sources.",
     ),
     source_type: str | None = typer.Option(None, "--source-type", help="Filter by source type."),
     occurred_after: str | None = typer.Option(
@@ -165,6 +165,56 @@ def search(
     table.add_column("Preview", max_width=72)
     _add_result_rows(table, results)
     console.print(table)
+
+
+@app.command("recent")
+def recent(
+    source: str = typer.Option(..., "--source", help="Configured context source."),
+    limit: int = typer.Option(10, "--limit", "-n", help="Max recent documents."),
+    channel_id: str | None = typer.Option(
+        None, "--channel-id", help="Optional source channel filter."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Return recent documents from an execution-bound context source."""
+    result = CompanyContextClient().recent(
+        source=source, limit=limit, channel_id=channel_id
+    )
+    _require_ok(result)
+    _print_json(result)
+
+
+@app.command("attachments")
+def attachments(
+    query: str = typer.Argument(..., help="Attachment search query."),
+    source: str = typer.Option(..., "--source", help="Configured context source."),
+    limit: int = typer.Option(10, "--limit", "-n", help="Max attachments."),
+    json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Search attachment evidence across the member-visible source scope.
+
+    This command accepts QUERY, --source, and --limit. It has no --channel-id
+    option; include a channel name in QUERY when the source supports it.
+    """
+    result = CompanyContextClient().attachments(query, source=source, limit=limit)
+    _require_ok(result)
+    _print_json(result)
+
+
+@app.command("stats")
+def stats(
+    source: str = typer.Option(..., "--source", help="Configured context source."),
+    lookback_days: int = typer.Option(
+        30, "--lookback-days", help="Activity lookback in days."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Output raw JSON."),
+) -> None:
+    """Return activity statistics from an execution-bound context source."""
+    result = CompanyContextClient().stats(
+        source=source, lookback_days=lookback_days
+    )
+    _require_ok(result)
+    _print_json(result)
 
 
 @app.command("search-dm-conversations")
