@@ -35,7 +35,7 @@ spec:
       {{- end }}
       containers:
         - name: discordbot
-          image: {{ printf "%s:%s" .Values.discordbot.image.repository .Values.discordbot.image.tag | quote }}
+          image: {{ include "centaur.imageRef" .Values.discordbot.image | quote }}
           imagePullPolicy: {{ .Values.discordbot.image.pullPolicy }}
           env:
             - name: PORT

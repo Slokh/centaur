@@ -28,6 +28,9 @@ spec:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "slackbotv2") | nindent 8 }}
         centaur.ai/metrics: slackbotv2
     spec:
+      {{- with .Values.global.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       automountServiceAccountToken: false
       {{- with .Values.global.imagePullSecrets }}
       imagePullSecrets:
@@ -35,7 +38,7 @@ spec:
       {{- end }}
       containers:
         - name: slackbotv2
-          image: {{ printf "%s:%s" .Values.slackbotv2.image.repository .Values.slackbotv2.image.tag | quote }}
+          image: {{ include "centaur.imageRef" .Values.slackbotv2.image | quote }}
           imagePullPolicy: {{ .Values.slackbotv2.image.pullPolicy }}
           env:
             - name: PORT
