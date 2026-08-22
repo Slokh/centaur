@@ -1,4 +1,5 @@
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -6,6 +7,14 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from client import DiscordClient
+
+
+def test_manifest_formats_bot_authorization() -> None:
+    manifest = tomllib.loads((Path(__file__).resolve().parents[1] / "pyproject.toml").read_text())
+    [discord_token] = manifest["tool"]["centaur"]["secrets"]
+
+    assert discord_token["inject_header"] == "Authorization"
+    assert discord_token["inject_formatter"] == "Bot {{ .Value }}"
 
 
 class _FakeStream:

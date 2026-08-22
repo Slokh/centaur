@@ -33,6 +33,7 @@ function fakeAdapter(): {
     async startGatewayListener(options, _durationMs, abortSignal) {
       abortSignal?.addEventListener("abort", () => endListener());
       options.waitUntil(listenerPromise);
+      setGatewayConnected(true);
       return new Response("ok");
     },
   };
@@ -78,6 +79,22 @@ describe("createGatewayController", () => {
     await controller.start(fakeChat, adapter);
     endListener(); // connection dropped without a shutdown request
     await Bun.sleep(5);
+    expect(fatal).toBe(true);
+    expect(controller.isActive()).toBe(false);
+  });
+
+  it("terminates a listener whose Gateway connection stays stale", async () => {
+    let fatal = false;
+    const { adapter } = fakeAdapter();
+    const controller = createGatewayController({
+      logger: silentLogger,
+      onFatalEnd: () => {
+        fatal = true;
+      },
+    });
+    await controller.start(fakeChat, adapter);
+    setGatewayConnected(false, Date.now() - 120_000);
+    controller.checkHealth();
     expect(fatal).toBe(true);
     expect(controller.isActive()).toBe(false);
   });

@@ -231,6 +231,19 @@
           "properties": {
             "captureTranscripts": { "type": "boolean" }
           }
+        },
+        "prewarmTools": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]*$"
+          }
+        },
+        "prewarmTimeoutSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 600
         }
       }
     },
@@ -464,6 +477,28 @@
             }
           }
         },
+        "extraEnv": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "discordbot": {
+      "type": "object",
+      "properties": {
+        "conversationMode": {
+          "type": "string",
+          "enum": ["thread", "inline_reply"]
+        },
+        "progressMode": {
+          "type": "string",
+          "enum": ["narration", "reactions"]
+        },
+        "responseMetadataMode": {
+          "type": "string",
+          "enum": ["first", "always", "never"]
+        },
+        "responseLatencyEnabled": { "type": "boolean" },
         "extraEnv": {
           "type": "object",
           "additionalProperties": { "type": "string" }

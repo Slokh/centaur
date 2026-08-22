@@ -1,6 +1,7 @@
 import { describe, expect, it } from "bun:test";
 import type { Logger, Message } from "chat";
 import {
+  discordTurnDeliveryKey,
   isAllowedDiscordMessage,
   isAllowedTriggerBotMessage,
   isGuildAllowlistEmpty,
@@ -54,6 +55,7 @@ describe("parseDiscordThreadKey", () => {
       guildId: "G1",
       channelId: "C1",
       threadId: "T1",
+      replyToMessageId: undefined,
     });
   });
 
@@ -62,11 +64,35 @@ describe("parseDiscordThreadKey", () => {
       guildId: "G1",
       channelId: "C1",
       threadId: undefined,
+      replyToMessageId: undefined,
+    });
+  });
+
+  it("decodes an inline reply-chain root independently from a Discord thread", () => {
+    expect(parseDiscordThreadKey("discord:G1:C1:reply~M1")).toEqual({
+      guildId: "G1",
+      channelId: "C1",
+      threadId: undefined,
+      replyToMessageId: "M1",
     });
   });
 
   it("returns empty for non-discord keys", () => {
     expect(parseDiscordThreadKey("slack:C1:123")).toEqual({});
+  });
+});
+
+describe("discordTurnDeliveryKey", () => {
+  it("keeps the logical root and addresses the current inline-reply turn", () => {
+    expect(
+      discordTurnDeliveryKey("discord:G1:C1:reply~ROOT", "CURRENT"),
+    ).toBe("discord:G1:C1:reply~ROOT~to~CURRENT");
+  });
+
+  it("leaves native Discord threads unchanged", () => {
+    expect(discordTurnDeliveryKey("discord:G1:C1:T1", "CURRENT")).toBe(
+      "discord:G1:C1:T1",
+    );
   });
 });
 

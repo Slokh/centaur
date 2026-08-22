@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import re
 import sys
 from pathlib import Path
@@ -175,6 +176,74 @@ def test_postgres_database_name_uses_default_for_blank_override(monkeypatch):
     monkeypatch.setenv("COMPANY_CONTEXT_POSTGRES_DATABASE", " ")
 
     assert company_context_client._postgres_database_name() == "ai_v2"
+
+
+def test_application_backed_source_search_uses_authenticated_session(monkeypatch):
+    monkeypatch.setenv(
+        "COMPANY_CONTEXT_APPLICATION_SOURCES",
+        json.dumps({"discord": {"search": "memory.search"}}),
+    )
+    calls = []
+
+    def invoke(capability, payload, **kwargs):
+        calls.append((capability, payload, kwargs))
+        return {
+            "ok": True,
+            "data": {
+                "mode": "keyword_temporal",
+                "matches": [{"message_id": "123", "content": "big walk"}],
+            },
+        }
+
+    monkeypatch.setattr(company_context_client, "invoke_application_capability", invoke)
+
+    result = CompanyContextClient().search("big walk", source="discord", limit=7)
+
+    assert result["status"] == "ok"
+    assert result["source"] == "discord"
+    assert result["search_mode"] == "keyword_temporal"
+    assert result["results"] == [{"message_id": "123", "content": "big walk"}]
+    assert calls == [
+        (
+            "memory.search",
+            {"query": "big walk", "limit": 7},
+            {"max_response_bytes": company_context_client.MAX_APPLICATION_SOURCE_RESPONSE_BYTES},
+        )
+    ]
+
+
+def test_application_backed_source_requires_configured_operation(monkeypatch):
+    monkeypatch.setenv(
+        "COMPANY_CONTEXT_APPLICATION_SOURCES",
+        json.dumps({"discord": {"search": "memory.search"}}),
+    )
+
+    result = CompanyContextClient().stats(source="discord")
+
+    assert result["status"] == "error"
+    assert "does not support operation 'stats'" in result["error"]
+
+
+def test_application_backed_source_rejects_oversized_agent_context(monkeypatch):
+    monkeypatch.setenv(
+        "COMPANY_CONTEXT_APPLICATION_SOURCES",
+        json.dumps({"discord": {"attachments": "memory.attachments"}}),
+    )
+    monkeypatch.setattr(
+        company_context_client,
+        "invoke_application_capability",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError(
+                "application-backed context response exceeded the 64 KiB "
+                "agent-context limit"
+            )
+        ),
+    )
+
+    result = CompanyContextClient().attachments("group picture", source="discord")
+
+    assert result["status"] == "error"
+    assert "64 KiB agent-context limit" in result["error"]
 
 
 @pytest.mark.parametrize("sql", ["", "   "])

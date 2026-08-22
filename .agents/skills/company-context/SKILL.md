@@ -5,7 +5,7 @@ description: "Use Centaur's indexed company context and scoped read-only SQL tog
 
 # Company Context
 
-Use `company_context` as the first retrieval step for internal historical context. Its `search` command queries indexed company memory across enabled sources such as Slack channels, Google Docs (`--source docs`), Google Calendar, Linear, and user-visible Granola notes (`--source granola`). It also has dedicated commands for user-visible Slack DMs and DM conversations. Always pair indexed results with the relevant direct source tools, then reconcile and collate both evidence sets before answering.
+Use `company_context` as the first retrieval step for internal historical context. Its `search` command queries indexed company memory across enabled sources such as Slack channels, Google Docs (`--source docs`), Google Calendar, Linear, and user-visible Granola notes (`--source granola`). Deployments may also configure execution-bound application sources such as Discord; these preserve the current turn's signed authority rather than relying on a shared sandbox identity. It also has dedicated commands for user-visible Slack DMs and DM conversations. Always pair indexed results with the relevant direct source tools when one is available, then reconcile and collate both evidence sets before answering.
 
 For aggregation, grouping, joins, or fields that the search surface does not expose, use the scoped read-only SQL command. Database grants and row-level security still apply, and output is capped:
 
@@ -21,6 +21,16 @@ Use one row-returning query. The command runs it inside a read-only transaction 
 
 ```bash
 company_context search "QUERY" --limit 10 --json
+```
+
+For an operator-configured application source, select it explicitly. Available
+operations depend on that source's configured adapter:
+
+```bash
+company_context search "QUERY" --source SOURCE --limit 10 --json
+company_context recent --source SOURCE --limit 50 --json
+company_context attachments "QUERY" --source SOURCE --limit 10 --json
+company_context stats --source SOURCE --lookback-days 30 --json
 ```
 
 For DM-specific questions, use the dedicated DM search surface:

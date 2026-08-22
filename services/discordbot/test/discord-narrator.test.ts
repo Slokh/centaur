@@ -186,9 +186,44 @@ describe("DiscordNarrator reactions", () => {
     const narrator = startNarrator(h);
     await expect(narrator.finish("done")).resolves.toBeUndefined();
   });
+
+  it("honors Discord's retry window after a reaction 429", async () => {
+    const h = harness();
+    let attempts = 0;
+    h.botOptions.fetch = async () => {
+      attempts += 1;
+      return attempts === 1
+        ? new Response(JSON.stringify({ retry_after: 0 }), {
+            status: 429,
+            headers: { "content-type": "application/json" },
+          })
+        : new Response(null, { status: 204 });
+    };
+    const narrator = startNarrator(h);
+    await narrator.finish("retrying");
+    expect(attempts).toBe(2);
+  });
 });
 
 describe("DiscordNarrator blurbs", () => {
+  it("never posts public progress in reaction-only mode", async () => {
+    const h = harness();
+    h.botOptions.progressMode = "reactions";
+    const narrator = startNarrator(h);
+    narrator.update(
+      task({
+        id: "reasoning-1",
+        title: "Thinking",
+        status: "complete",
+        details: "This internal progress must stay out of Discord",
+      }),
+    );
+    await narrator.finish("done");
+
+    expect(h.posts).toEqual([]);
+    expect(h.reactions.map((r) => reactionOf(r.url))).toContain(CHECK);
+  });
+
   it("coalesces reasoning deltas and posts one subtext blurb when the thought completes", async () => {
     const h = harness();
     const narrator = startNarrator(h);
@@ -256,6 +291,17 @@ describe("DiscordNarrator blurbs", () => {
 
     expect(h.posts).toEqual([
       "-# First line of thought\n\n-# Second line of thought",
+    ]);
+  });
+
+  it("suppresses embeds for links in progress narration", async () => {
+    const h = harness();
+    const narrator = startNarrator(h);
+    narrator.status("Reviewing https://example.com/deploy before continuing");
+    await narrator.finish("done");
+
+    expect(h.posts).toEqual([
+      "-# Reviewing <https://example.com/deploy> before continuing",
     ]);
   });
 

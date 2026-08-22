@@ -16,7 +16,7 @@ from urllib.parse import urlparse, urlunparse
 
 import asyncpg
 
-from centaur_sdk.tool_sdk import secret
+from centaur_sdk.tool_sdk import invoke_application_capability, secret
 
 DEFAULT_SEARCH_LIMIT = 10
 MAX_SEARCH_LIMIT = 50
@@ -55,6 +55,8 @@ METRICS_PUSH_TIMEOUT_SECONDS = 1.0
 LOOKUP_REQUEST_METRIC = "company_context_lookup_requests"
 LOOKUP_RESULT_METRIC = "company_context_lookup_results"
 LOOKUP_ZERO_RESULT_METRIC = "company_context_lookup_zero_results"
+APPLICATION_SOURCES_ENV = "COMPANY_CONTEXT_APPLICATION_SOURCES"
+MAX_APPLICATION_SOURCE_RESPONSE_BYTES = 64 * 1024
 
 _SEARCH_TERM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]*")
 _STOP_WORDS = {
@@ -115,6 +117,53 @@ def _scoped_database_url() -> str:
     if value == COMPANY_CONTEXT_DSN_ENV:
         return ""
     return value
+
+
+def _application_source_capability(source: str | None, operation: str) -> str | None:
+    """Resolve an operator-configured, execution-bound context source.
+
+    Application-backed sources let a deployment extend the standard
+    ``company_context`` interface without granting a shared sandbox database
+    principal the current user's private data scope. The Centaur application
+    gateway binds every request to the active execution and its trusted
+    invocation authority.
+    """
+    if not source:
+        return None
+    raw = os.getenv(APPLICATION_SOURCES_ENV, "").strip()  # noqa: TID251
+    if not raw:
+        return None
+    try:
+        configured = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{APPLICATION_SOURCES_ENV} is not valid JSON") from error
+    if not isinstance(configured, dict):
+        raise RuntimeError(f"{APPLICATION_SOURCES_ENV} must be a JSON object")
+    operations = configured.get(source)
+    if operations is None:
+        return None
+    if not isinstance(operations, dict):
+        raise RuntimeError(f"{APPLICATION_SOURCES_ENV}.{source} must be a JSON object")
+    capability = operations.get(operation)
+    if not isinstance(capability, str) or not capability.strip():
+        raise RuntimeError(
+            f"company-context source {source!r} does not support operation {operation!r}"
+        )
+    return capability.strip()
+
+
+def _call_application_source(capability: str, payload: dict[str, Any]) -> dict[str, Any]:
+    result = invoke_application_capability(
+        capability,
+        payload,
+        max_response_bytes=MAX_APPLICATION_SOURCE_RESPONSE_BYTES,
+    )
+    if not isinstance(result, dict) or result.get("ok") is not True:
+        raise RuntimeError("application-backed context returned an invalid capability response")
+    data = result.get("data")
+    if not isinstance(data, dict):
+        raise RuntimeError("application-backed context returned no data object")
+    return data
 
 
 def _database_url_with_name(value: str, database: str) -> str:
@@ -1465,6 +1514,29 @@ class CompanyContextClient:
         normalized_source = source.strip() if source else None
         normalized_source_type = source_type.strip() if source_type else None
         try:
+            application_capability = _application_source_capability(
+                normalized_source, "search"
+            )
+            if application_capability is not None:
+                data = _call_application_source(
+                    application_capability,
+                    {
+                        "query": normalized_query,
+                        "limit": _clamp(limit, minimum=1, maximum=MAX_SEARCH_LIMIT),
+                    },
+                )
+                matches = data.get("matches")
+                if not isinstance(matches, list):
+                    raise RuntimeError(
+                        "application-backed context search returned no matches list"
+                    )
+                return {
+                    "status": "ok",
+                    "source": normalized_source,
+                    "source_type": normalized_source_type,
+                    "search_mode": data.get("mode") or "application",
+                    "results": matches,
+                }
             parsed_occurred_after = _parse_datetime_filter(
                 occurred_after,
                 name="occurred_after",
@@ -1494,6 +1566,77 @@ class CompanyContextClient:
                 occurred_before=None,
                 results=[],
             )
+            return {"status": "error", "error": str(exc)}
+
+    def recent(
+        self,
+        *,
+        source: str,
+        limit: int = DEFAULT_SEARCH_LIMIT,
+        channel_id: str | None = None,
+    ) -> dict:
+        """Return recent documents from an execution-bound context source."""
+        normalized_source = source.strip()
+        try:
+            capability = _application_source_capability(normalized_source, "recent")
+            if capability is None:
+                raise RuntimeError(
+                    f"company-context source {normalized_source!r} has no recent adapter"
+                )
+            payload: dict[str, Any] = {
+                "limit": _clamp(limit, minimum=1, maximum=100)
+            }
+            if channel_id and channel_id.strip():
+                payload["channel_id"] = channel_id.strip()
+            data = _call_application_source(capability, payload)
+            return {"status": "ok", "source": normalized_source, **data}
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+
+    def attachments(
+        self,
+        query: str,
+        *,
+        source: str,
+        limit: int = DEFAULT_SEARCH_LIMIT,
+    ) -> dict:
+        """Search attachment evidence through an execution-bound context source."""
+        normalized_query = query.strip()
+        normalized_source = source.strip()
+        if not normalized_query:
+            return {"status": "error", "error": "query cannot be empty"}
+        try:
+            capability = _application_source_capability(normalized_source, "attachments")
+            if capability is None:
+                raise RuntimeError(
+                    f"company-context source {normalized_source!r} has no attachments adapter"
+                )
+            data = _call_application_source(
+                capability,
+                {
+                    "query": normalized_query,
+                    "limit": _clamp(limit, minimum=1, maximum=25),
+                },
+            )
+            return {"status": "ok", "source": normalized_source, **data}
+        except Exception as exc:
+            return {"status": "error", "error": str(exc)}
+
+    def stats(self, *, source: str, lookback_days: int = 30) -> dict:
+        """Return activity statistics from an execution-bound context source."""
+        normalized_source = source.strip()
+        try:
+            capability = _application_source_capability(normalized_source, "stats")
+            if capability is None:
+                raise RuntimeError(
+                    f"company-context source {normalized_source!r} has no stats adapter"
+                )
+            data = _call_application_source(
+                capability,
+                {"lookback_days": _clamp(lookback_days, minimum=1, maximum=365)},
+            )
+            return {"status": "ok", "source": normalized_source, **data}
+        except Exception as exc:
             return {"status": "error", "error": str(exc)}
 
     async def _search_dm_conversations_async(

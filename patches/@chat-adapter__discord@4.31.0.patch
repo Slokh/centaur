@@ -1,5 +1,5 @@
 diff --git a/dist/index.d.ts b/dist/index.d.ts
-index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..89426551a9454df7612f0867680e8abd9ad779fd 100644
+index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..86a4b55a181b68972618cf0d1fd23bc06d7ff329 100644
 --- a/dist/index.d.ts
 +++ b/dist/index.d.ts
 @@ -20,8 +20,8 @@ import { ButtonStyle, APIEmbed, ChannelType, APIMessage, InteractionType } from
@@ -13,7 +13,37 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..89426551a9454df7612f0867680e8abd
       */
      private convertMentionsToDiscord;
      /**
-@@ -61,6 +61,44 @@ interface DiscordAdapterConfig {
+@@ -47,6 +47,29 @@ declare class DiscordFormatConverter extends BaseFormatConverter {
+  * Discord adapter configuration.
+  */
+ interface DiscordAdapterConfig {
++    /** Conversation layout for new channel mentions. Defaults to native threads. */
++    conversationMode?: "thread" | "inline_reply";
++    /** Observe accepted Gateway messages before Chat subscription routing. */
++    onMessageObserved?: (message: {
++        guildId: string;
++        channelId: string;
++        threadId?: string;
++        messageId: string;
++        authorId: string;
++        authorName?: string;
++        displayName?: string;
++        authorIsBot?: boolean;
++        replyToMessageId?: string;
++        normalizedPayload?: unknown;
++        content: string;
++        createdAt: string;
++        editedAt?: string;
++        attachments: Array<{ id: string; filename: string; contentType?: string; size: number; url: string }>;
++    }) => void | Promise<void>;
++    /** Observe Gateway message deletions for external archive reconciliation. */
++    onMessageDeleted?: (message: { guildId: string; channelId: string; messageId: string; deletedAt: string }) => void | Promise<void>;
++    /** Observe Gateway channel create/update/delete events. */
++    onChannelObserved?: (channel: { guildId: string; channelId: string; name?: string; kind: string; parentId?: string; deleted: boolean }) => void | Promise<void>;
+     /** Override the Discord API base URL. Defaults to DISCORD_API_URL env var or "https://discord.com/api/v10". */
+     apiUrl?: string;
+     /** Discord application ID. Defaults to DISCORD_APPLICATION_ID env var. */
+@@ -61,6 +84,44 @@ interface DiscordAdapterConfig {
      publicKey?: string;
      /** Override bot username (optional) */
      userName?: string;
@@ -58,10 +88,21 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..89426551a9454df7612f0867680e8abd
  }
  /**
   * Discord thread ID components.
-@@ -363,6 +401,11 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
+@@ -73,6 +134,8 @@ interface DiscordThreadId {
+     guildId: string;
+     /** Thread ID (if message is in a thread) */
+     threadId?: string;
++    /** Root message for an inline reply-chain conversation. */
++    replyToMessageId?: string;
+ }
+ /**
+  * Per-request slash command context used while resolving deferred responses.
+@@ -363,6 +426,13 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
      protected readonly publicKey: string;
      protected readonly applicationId: string;
      protected readonly mentionRoleIds: string[];
++    protected readonly conversationMode: "thread" | "inline_reply";
++    protected readonly onMessageObserved?: DiscordAdapterConfig["onMessageObserved"];
 +    protected readonly shouldHandleMention?: DiscordAdapterConfig["shouldHandleMention"];
 +    protected readonly onMessageDropped?: DiscordAdapterConfig["onMessageDropped"];
 +    protected readonly shouldForwardBotMessage?: DiscordAdapterConfig["shouldForwardBotMessage"];
@@ -70,7 +111,7 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..89426551a9454df7612f0867680e8abd
      protected chat: ChatInstance | null;
      protected readonly logger: Logger;
      protected readonly formatConverter: DiscordFormatConverter;
-@@ -563,6 +606,23 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
+@@ -563,6 +633,23 @@ declare class DiscordAdapter implements Adapter<DiscordThreadId, unknown> {
       * Handle a message received via the Gateway WebSocket.
       */
      protected handleGatewayMessage(message: Message$1, isMentioned: boolean): Promise<void>;
@@ -95,7 +136,7 @@ index 0024735d2441f1d2e3c2d5ed659fa4c4265f3922..89426551a9454df7612f0867680e8abd
       * Handle a reaction received via the Gateway WebSocket.
       */
 diff --git a/dist/index.js b/dist/index.js
-index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4e5ff64c9 100644
+index e4f6fe07808ab3c9858fda724c36f7aef5084502..466b3633c844f76e7637f50e239ccfcc6c974534 100644
 --- a/dist/index.js
 +++ b/dist/index.js
 @@ -272,11 +272,11 @@ import {
@@ -122,10 +163,14 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4
      }
      if (isStrongNode(node)) {
        const content = getNodeChildren(node).map((child) => this.nodeToDiscordMarkdown(child)).join("");
-@@ -398,6 +398,11 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -398,11 +398,21 @@ var DiscordAdapter = class _DiscordAdapter {
    publicKey;
    applicationId;
    mentionRoleIds;
++  conversationMode;
++  onMessageObserved;
++  onMessageDeleted;
++  onChannelObserved;
 +  shouldHandleMention;
 +  onMessageDropped;
 +  shouldForwardBotMessage;
@@ -134,9 +179,20 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4
    chat = null;
    logger;
    formatConverter = new DiscordFormatConverter();
-@@ -432,6 +437,10 @@ var DiscordAdapter = class _DiscordAdapter {
+   requestContext = new AsyncLocalStorage();
+   threadParentCache = /* @__PURE__ */ new Map();
++  inlineReplyRootCache = /* @__PURE__ */ new Map();
+   static THREAD_PARENT_CACHE_TTL = 5 * 60 * 1e3;
+   constructor(config = {}) {
+     const botToken = config.botToken ?? process.env.DISCORD_BOT_TOKEN;
+@@ -431,7 +441,15 @@ var DiscordAdapter = class _DiscordAdapter {
+     this.publicKey = publicKey.trim().toLowerCase();
      this.applicationId = applicationId;
      this.mentionRoleIds = config.mentionRoleIds ?? (process.env.DISCORD_MENTION_ROLE_IDS ? process.env.DISCORD_MENTION_ROLE_IDS.split(",").map((id) => id.trim()) : []);
++    this.conversationMode = config.conversationMode ?? "thread";
++    this.onMessageObserved = config.onMessageObserved;
++    this.onMessageDeleted = config.onMessageDeleted;
++    this.onChannelObserved = config.onChannelObserved;
      this.botUserId = applicationId;
 +    this.shouldHandleMention = config.shouldHandleMention;
 +    this.onMessageDropped = config.onMessageDropped;
@@ -145,10 +201,19 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4
      this.logger = config.logger ?? new ConsoleLogger("info").child("discord");
      this.userName = config.userName ?? "bot";
      if (!HEX_64_PATTERN.test(this.publicKey)) {
-@@ -927,6 +936,19 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -896,6 +914,7 @@ var DiscordAdapter = class _DiscordAdapter {
+     const guildId = data.guild_id || "@me";
+     const channelId = data.channel_id;
+     let discordThreadId;
++    let replyToMessageId;
+     let parentChannelId = channelId;
+     if (data.thread) {
+       discordThreadId = data.thread.id;
+@@ -927,7 +946,47 @@ var DiscordAdapter = class _DiscordAdapter {
        (roleId) => this.mentionRoleIds.includes(roleId)
      );
      const isMentioned = isUserMentioned || isRoleMentioned;
+-    if (!discordThreadId && isMentioned) {
 +    if (isMentioned && this.shouldHandleMention && !this.shouldHandleMention({
 +      guildId,
 +      channelId,
@@ -162,10 +227,48 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4
 +      });
 +      return;
 +    }
-     if (!discordThreadId && isMentioned) {
++    if (this.onMessageObserved) {
++      await this.onMessageObserved({
++        guildId,
++        channelId: parentChannelId,
++        threadId: discordThreadId,
++        messageId: data.id,
++        authorId: data.author.id,
++        authorName: data.author.username,
++        displayName: data.member?.nick ?? data.author.global_name ?? void 0,
++        authorIsBot: data.author.bot === true,
++        replyToMessageId: data.message_reference?.message_id,
++        normalizedPayload: { embeds: data.embeds ?? [], poll: data.poll ?? null, stickers: data.sticker_items ?? [], messageType: data.type },
++        content: data.content,
++        createdAt: data.timestamp,
++        editedAt: data.edited_timestamp ?? void 0,
++        attachments: data.attachments.map((attachment) => ({
++          id: attachment.id,
++          filename: attachment.filename,
++          contentType: attachment.content_type ?? void 0,
++          size: attachment.size,
++          url: attachment.url
++        }))
++      }).catch((error) => this.logger.warn("Message observation failed", { error: String(error), messageId: data.id }));
++    }
++    if (!discordThreadId && this.conversationMode === "inline_reply") {
++      replyToMessageId = await this.resolveRawInlineReplyRoot(channelId, data, isMentioned);
++    }
++    if (!discordThreadId && isMentioned && this.conversationMode === "thread") {
        try {
          const newThread = await this.createDiscordThread(channelId, data.id);
-@@ -978,6 +1000,19 @@ var DiscordAdapter = class _DiscordAdapter {
+         discordThreadId = newThread.id;
+@@ -946,7 +1005,8 @@ var DiscordAdapter = class _DiscordAdapter {
+     const threadId = this.encodeThreadId({
+       guildId,
+       channelId: parentChannelId,
+-      threadId: discordThreadId
++      threadId: discordThreadId,
++      replyToMessageId
+     });
+     const chatMessage = new Message({
+       id: data.id,
+@@ -978,6 +1038,19 @@ var DiscordAdapter = class _DiscordAdapter {
      try {
        await this.chat.handleIncomingMessage(this, threadId, chatMessage);
      } catch (error) {
@@ -185,7 +288,13 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4
        this.logger.error("Error handling forwarded message", {
          error: String(error),
          messageId: data.id
-@@ -1063,7 +1098,9 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1058,12 +1131,20 @@ var DiscordAdapter = class _DiscordAdapter {
+    * Post a message to a Discord channel or thread.
+    */
+   async postMessage(threadId, message) {
+-    let { channelId, threadId: discordThreadId } = this.decodeThreadId(threadId);
++    let { channelId, threadId: discordThreadId, replyToMessageId, deliveryReplyToMessageId } = this.decodeThreadId(threadId);
+     const actualThreadId = threadId;
      if (discordThreadId) {
        channelId = discordThreadId;
      }
@@ -193,10 +302,26 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4
 +    const payload = {
 +      allowed_mentions: { parse: [] }
 +    };
++    if (deliveryReplyToMessageId ?? replyToMessageId) {
++      payload.message_reference = {
++        message_id: deliveryReplyToMessageId ?? replyToMessageId,
++        fail_if_not_exists: false
++      };
++    }
      const embeds = [];
      const components = [];
      const card = extractCard(message);
-@@ -1318,7 +1355,9 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1114,6 +1195,9 @@ var DiscordAdapter = class _DiscordAdapter {
+       payload
+     );
+     const result = await response.json();
++    if (replyToMessageId && result.id) {
++      this.rememberInlineReplyRoot([result.id], replyToMessageId);
++    }
+     this.logger.debug("Discord API: POST message response", {
+       messageId: result.id
+     });
+@@ -1318,7 +1402,9 @@ var DiscordAdapter = class _DiscordAdapter {
    async editMessage(threadId, messageId, message) {
      const { channelId, threadId: discordThreadId } = this.decodeThreadId(threadId);
      const targetChannelId = discordThreadId || channelId;
@@ -207,7 +332,111 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4
      const embeds = [];
      const components = [];
      const card = extractCard(message);
-@@ -1634,11 +1673,49 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1530,6 +1616,9 @@ var DiscordAdapter = class _DiscordAdapter {
+    * Encode platform data into a thread ID string.
+    */
+   encodeThreadId(platformData) {
++    if (platformData.replyToMessageId) {
++      return `discord:${platformData.guildId}:${platformData.channelId}:reply~${platformData.replyToMessageId}`;
++    }
+     const threadPart = platformData.threadId ? `:${platformData.threadId}` : "";
+     return `discord:${platformData.guildId}:${platformData.channelId}${threadPart}`;
+   }
+@@ -1544,12 +1633,92 @@ var DiscordAdapter = class _DiscordAdapter {
+         `Invalid Discord thread ID: ${threadId}`
+       );
+     }
++    const encodedDestination = parts[3];
++    const encodedReply = encodedDestination?.startsWith("reply~") ? encodedDestination.slice(6) : void 0;
++    const [replyToMessageId, deliveryReplyToMessageId] = encodedReply?.split("~to~") ?? [];
+     return {
+       guildId: parts[1],
+       channelId: parts[2],
+-      threadId: parts[3]
++      threadId: encodedDestination?.startsWith("reply~") ? void 0 : encodedDestination,
++      replyToMessageId,
++      deliveryReplyToMessageId
+     };
+   }
++  rememberInlineReplyRoot(messageIds, rootMessageId) {
++    if (this.inlineReplyRootCache.size > 1e4) {
++      this.inlineReplyRootCache.clear();
++    }
++    for (const messageId of messageIds) {
++      if (messageId) this.inlineReplyRootCache.set(messageId, rootMessageId);
++    }
++  }
++  async resolveRawInlineReplyRoot(channelId, data, isMentioned) {
++    if (!data.message_reference?.message_id) {
++      return isMentioned ? data.id : void 0;
++    }
++    const traversed = [data.id];
++    let current = data;
++    for (let depth = 0; depth < 32; depth += 1) {
++      const cached = this.inlineReplyRootCache.get(current.id);
++      if (cached) {
++        this.rememberInlineReplyRoot(traversed, cached);
++        return cached;
++      }
++      const referencedId = current.message_reference?.message_id;
++      if (!referencedId) {
++        this.rememberInlineReplyRoot(traversed, current.id);
++        return current.id;
++      }
++      const cachedReference = this.inlineReplyRootCache.get(referencedId);
++      if (cachedReference) {
++        this.rememberInlineReplyRoot(traversed, cachedReference);
++        return cachedReference;
++      }
++      traversed.push(referencedId);
++      if (current.referenced_message?.id === referencedId) {
++        current = current.referenced_message;
++        continue;
++      }
++      try {
++        const response = await this.discordFetch(`/channels/${channelId}/messages/${referencedId}`, "GET");
++        current = await response.json();
++      } catch {
++        return data.message_reference.message_id;
++      }
++    }
++    return data.message_reference.message_id;
++  }
++  async resolveGatewayInlineReplyRoot(message, isMentioned) {
++    if (!message.reference?.messageId) {
++      return isMentioned ? message.id : void 0;
++    }
++    const traversed = [message.id];
++    let current = message;
++    for (let depth = 0; depth < 32; depth += 1) {
++      const cached = this.inlineReplyRootCache.get(current.id);
++      if (cached) {
++        this.rememberInlineReplyRoot(traversed, cached);
++        return cached;
++      }
++      const referencedId = current.reference?.messageId;
++      if (!referencedId) {
++        this.rememberInlineReplyRoot(traversed, current.id);
++        return current.id;
++      }
++      const cachedReference = this.inlineReplyRootCache.get(referencedId);
++      if (cachedReference) {
++        this.rememberInlineReplyRoot(traversed, cachedReference);
++        return cachedReference;
++      }
++      traversed.push(referencedId);
++      try {
++        current = await current.fetchReference();
++      } catch {
++        return message.reference.messageId;
++      }
++    }
++    return message.reference.messageId;
++  }
+   /**
+    * Parse a Discord message into normalized format.
+    */
+@@ -1634,11 +1803,49 @@ var DiscordAdapter = class _DiscordAdapter {
      if (body) {
        headers["Content-Type"] = "application/json";
      }
@@ -258,7 +487,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4
      if (!response.ok) {
        const errorText = await response.text();
        this.logger.error("Discord API error", {
-@@ -1737,6 +1814,27 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1737,6 +1944,27 @@ var DiscordAdapter = class _DiscordAdapter {
          username: client.user?.username,
          id: client.user?.id
        });
@@ -286,7 +515,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4
      });
      client.on(Events.Error, (error) => {
        this.logger.error("Discord Gateway error", { error: String(error) });
-@@ -1774,6 +1872,7 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1774,6 +2002,7 @@ var DiscordAdapter = class _DiscordAdapter {
      } finally {
        isShuttingDown = true;
        client.destroy();
@@ -294,7 +523,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4
        this.logger.info("Discord Gateway listener stopped");
      }
    }
-@@ -1787,18 +1886,42 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1787,18 +2016,42 @@ var DiscordAdapter = class _DiscordAdapter {
          return;
        }
        if (message.author.bot) {
@@ -343,7 +572,102 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4
        this.logger.info("Discord Gateway message received", {
          channelId: message.channelId,
          guildId: message.guildId,
-@@ -1983,9 +2106,13 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1810,6 +2063,42 @@ var DiscordAdapter = class _DiscordAdapter {
+       });
+       await this.handleGatewayMessage(message, isMentioned);
+     });
++    client.on(Events.MessageUpdate, async (_oldMessage, message) => {
++      if (isShuttingDown() || !this.onMessageObserved || message.partial || !message.guildId) return;
++      const isInThread = message.channel.isThread();
++      await this.onMessageObserved({
++        guildId: message.guildId,
++        channelId: isInThread && message.channel.parentId ? message.channel.parentId : message.channelId,
++        threadId: isInThread ? message.channelId : void 0,
++        messageId: message.id,
++        authorId: message.author.id,
++        authorName: message.author.username,
++        displayName: message.member?.displayName,
++        authorIsBot: message.author.bot,
++        replyToMessageId: message.reference?.messageId,
++        normalizedPayload: { embeds: message.embeds.map((embed) => embed.toJSON()), poll: message.poll?.toJSON() ?? null, stickers: message.stickers.map((sticker) => sticker.toJSON()), messageType: message.type },
++        content: message.content,
++        createdAt: message.createdAt.toISOString(),
++        editedAt: message.editedAt?.toISOString(),
++        attachments: message.attachments.map((attachment) => ({
++          id: attachment.id, filename: attachment.name,
++          contentType: attachment.contentType ?? void 0, size: attachment.size, url: attachment.url
++        }))
++      }).catch((error) => this.logger.warn("Message update observation failed", { error: String(error), messageId: message.id }));
++    });
++    client.on(Events.MessageDelete, async (message) => {
++      if (isShuttingDown() || !this.onMessageDeleted || !message.guildId) return;
++      await this.onMessageDeleted({ guildId: message.guildId, channelId: message.channelId, messageId: message.id, deletedAt: (/* @__PURE__ */ new Date()).toISOString() })
++        .catch((error) => this.logger.warn("Message delete observation failed", { error: String(error), messageId: message.id }));
++    });
++    const observeChannel = async (channel, deleted) => {
++      if (isShuttingDown() || !this.onChannelObserved || !channel.guildId) return;
++      await this.onChannelObserved({ guildId: channel.guildId, channelId: channel.id, name: "name" in channel ? channel.name : void 0, kind: String(channel.type), parentId: "parentId" in channel ? channel.parentId ?? void 0 : void 0, deleted })
++        .catch((error) => this.logger.warn("Channel observation failed", { error: String(error), channelId: channel.id }));
++    };
++    client.on(Events.ChannelCreate, (channel) => observeChannel(channel, false));
++    client.on(Events.ChannelUpdate, (_oldChannel, channel) => observeChannel(channel, false));
++    client.on(Events.ChannelDelete, (channel) => observeChannel(channel, true));
+     client.on(Events.InteractionCreate, async (interaction) => {
+       if (isShuttingDown()) {
+         this.logger.debug("Ignoring interaction - Gateway is shutting down");
+@@ -1930,12 +2219,40 @@ var DiscordAdapter = class _DiscordAdapter {
+     const channelId = message.channelId;
+     const isInThread = message.channel.isThread();
+     let discordThreadId;
++    let replyToMessageId;
+     let parentChannelId = channelId;
+     if (isInThread && "parentId" in message.channel && message.channel.parentId) {
+       discordThreadId = channelId;
+       parentChannelId = message.channel.parentId;
+     }
+-    if (!discordThreadId && isMentioned) {
++    if (this.onMessageObserved) {
++      await this.onMessageObserved({
++        guildId,
++        channelId: parentChannelId,
++        threadId: discordThreadId,
++        messageId: message.id,
++        authorId: message.author.id,
++        authorName: message.author.username,
++        displayName: message.member?.displayName,
++        authorIsBot: message.author.bot,
++        replyToMessageId: message.reference?.messageId,
++        normalizedPayload: { embeds: message.embeds.map((embed) => embed.toJSON()), poll: message.poll?.toJSON() ?? null, stickers: message.stickers.map((sticker) => sticker.toJSON()), messageType: message.type },
++        content: message.content,
++        createdAt: message.createdAt.toISOString(),
++        editedAt: message.editedAt?.toISOString(),
++        attachments: message.attachments.map((attachment) => ({
++          id: attachment.id,
++          filename: attachment.name,
++          contentType: attachment.contentType ?? void 0,
++          size: attachment.size,
++          url: attachment.url
++        }))
++      }).catch((error) => this.logger.warn("Message observation failed", { error: String(error), messageId: message.id }));
++    }
++    if (!discordThreadId && this.conversationMode === "inline_reply") {
++      replyToMessageId = await this.resolveGatewayInlineReplyRoot(message, isMentioned);
++    }
++    if (!discordThreadId && isMentioned && this.conversationMode === "thread") {
+       try {
+         const newThread = await this.createDiscordThread(channelId, message.id);
+         discordThreadId = newThread.id;
+@@ -1954,7 +2271,8 @@ var DiscordAdapter = class _DiscordAdapter {
+     const threadId = this.encodeThreadId({
+       guildId,
+       channelId: parentChannelId,
+-      threadId: discordThreadId
++      threadId: discordThreadId,
++      replyToMessageId
+     });
+     const chatMessage = new Message({
+       id: message.id,
+@@ -1983,9 +2301,13 @@ var DiscordAdapter = class _DiscordAdapter {
        })),
        raw: {
          id: message.id,
@@ -357,7 +681,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4
          author: {
            id: message.author.id,
            username: message.author.username
-@@ -1998,6 +2125,19 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1998,6 +2320,19 @@ var DiscordAdapter = class _DiscordAdapter {
      try {
        await this.chat.handleIncomingMessage(this, threadId, chatMessage);
      } catch (error) {
@@ -377,7 +701,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4
        this.logger.error("Error handling Gateway message", {
          error: String(error),
          messageId: message.id
-@@ -2262,7 +2402,9 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2262,7 +2597,9 @@ var DiscordAdapter = class _DiscordAdapter {
          `Invalid Discord channel ID: ${channelId}`
        );
      }
@@ -388,7 +712,7 @@ index e4f6fe07808ab3c9858fda724c36f7aef5084502..28130060557c45fc699b6bad1bfc52a4
      const embeds = [];
      const components = [];
      const card = extractCard(message);
-@@ -2313,6 +2455,43 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -2313,6 +2650,43 @@ var DiscordAdapter = class _DiscordAdapter {
        raw: result
      };
    }

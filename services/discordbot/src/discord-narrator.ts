@@ -1,9 +1,17 @@
 import type { ChatSDKStreamChunk } from "@centaur/rendering";
 import type { Logger, Thread } from "chat";
-import { parseDiscordThreadKey } from "./discord-allowlist";
+import {
+  discordTurnDeliveryKey,
+  parseDiscordThreadKey,
+} from "./discord-allowlist";
 import { DEFAULT_DISCORD_API_URL } from "./discord-threading";
 import type { DiscordbotApiMessage, DiscordbotOptions } from "./types";
-import { errorMessage, nowMs, sliceSurrogateSafe } from "./utils";
+import {
+  errorMessage,
+  nowMs,
+  sliceSurrogateSafe,
+  suppressDiscordLinkEmbeds,
+} from "./utils";
 
 export type DiscordNarratorChunk = Exclude<
   ChatSDKStreamChunk,
@@ -18,8 +26,9 @@ const REACTION_WORKING = "👀";
 const REACTION_DONE = "✅";
 const REACTION_FAILED = "❌";
 
-// Discord caps message content at 2000 chars; headroom keeps every post safe.
-const NARRATOR_MESSAGE_MAX_CHARS = 1_900;
+// URL suppression adds two characters per destination. Keep enough raw-text
+// headroom that even URL-dense narration remains under Discord's 2000-char cap.
+const NARRATOR_MESSAGE_MAX_CHARS = 1_500;
 // A single blurb is truncated to this, and a thought still pending at this size
 // is flushed early so long reasoning doesn't sit invisible for the whole run.
 const NARRATOR_BLURB_MAX_CHARS = 600;
@@ -58,6 +67,7 @@ export class DiscordNarrator {
   private readonly maxPosts: number;
   private readonly reactionChannelId: string | undefined;
   private readonly reactionMessageId: string;
+  private readonly deliveryThreadId: string;
   // Current thought, keyed by chunk id: reasoning deltas have unique ids and
   // concatenate; a commentary item re-uses its id and replaces its body.
   private pendingParts = new Map<string, string>();
@@ -88,6 +98,7 @@ export class DiscordNarrator {
     this.reactionChannelId =
       message.id === threadId ? channelId : (threadId ?? channelId);
     this.reactionMessageId = message.id;
+    this.deliveryThreadId = discordTurnDeliveryKey(thread.id, message.id);
   }
 
   /** Adds the 👀 working reaction (best-effort) and returns the narrator. */
@@ -111,6 +122,7 @@ export class DiscordNarrator {
    */
   status(text: string): void {
     if (this.finished) return;
+    if (this.botOptions.progressMode === "reactions") return;
     const trimmed = text.trim();
     if (!trimmed || trimmed === this.lastStatus) return;
     this.lastStatus = trimmed;
@@ -123,6 +135,7 @@ export class DiscordNarrator {
     if (this.finished) return;
     if (chunk.type !== "task_update") return;
     if (chunk.status === "error") this.sawError = true;
+    if (this.botOptions.progressMode === "reactions") return;
     if (chunk.title === "Thinking") {
       if (chunk.details) this.pendingParts.set(chunk.id, chunk.details);
       if (
@@ -151,8 +164,10 @@ export class DiscordNarrator {
       clearTimeout(this.timer);
       this.timer = null;
     }
-    this.flushPendingText();
-    this.enqueueBlurbPost();
+    if (this.botOptions.progressMode !== "reactions") {
+      this.flushPendingText();
+      this.enqueueBlurbPost();
+    }
     const failed =
       outcome === "failed" || (outcome === "done" && this.sawError);
     if (outcome !== "retrying") {
@@ -208,14 +223,14 @@ export class DiscordNarrator {
     this.queuedBlurbs = [];
     this.postedCount += 1;
     this.lastPostAtMs = nowMs();
-    const content = clipMessage(
-      blurbs.map((blurb) => subtext(blurb)).join("\n\n"),
+    const content = suppressDiscordLinkEmbeds(
+      clipMessage(blurbs.map((blurb) => subtext(blurb)).join("\n\n")),
     );
     this.chain = this.chain.then(async () => {
       try {
         // `raw` skips the SDK's markdown round-trip, which would escape the
         // leading -# and break Discord's subtext rendering.
-        await this.thread.adapter.postMessage(this.thread.id, {
+        await this.thread.adapter.postMessage(this.deliveryThreadId, {
           raw: content,
         });
       } catch (error) {
@@ -285,13 +300,28 @@ async function discordReactionRequest(
     const apiBase = (
       botOptions.discordApiUrl ?? DEFAULT_DISCORD_API_URL
     ).replace(/\/$/, "");
-    const response = await fetchFn(
-      `${apiBase}/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`,
-      {
+    const url = `${apiBase}/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`;
+    let response = await fetchFn(url, {
+      method,
+      headers: { authorization: `Bot ${botOptions.botToken}` },
+    });
+    // Reactions share Discord's REST buckets with other bot activity. Honor
+    // Discord's retry window instead of dropping the status transition on the
+    // first 429. Keep the retry bounded because reactions are cosmetic.
+    for (let attempt = 1; response.status === 429 && attempt < 4; attempt += 1) {
+      const retryAfterMs = await discordRetryAfterMs(response);
+      logger.debug("discordbot_narrator_reaction_rate_limited", {
+        attempt,
+        emoji,
+        method,
+        retry_after_ms: retryAfterMs,
+      });
+      await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
+      response = await fetchFn(url, {
         method,
         headers: { authorization: `Bot ${botOptions.botToken}` },
-      },
-    );
+      });
+    }
     if (!response.ok) {
       logger.warn("discordbot_narrator_reaction_failed", {
         emoji,
@@ -306,6 +336,25 @@ async function discordReactionRequest(
       error: errorMessage(error),
     });
   }
+}
+
+async function discordRetryAfterMs(response: Response): Promise<number> {
+  try {
+    const payload = (await response.clone().json()) as { retry_after?: unknown };
+    if (
+      typeof payload.retry_after === "number" &&
+      Number.isFinite(payload.retry_after) &&
+      payload.retry_after >= 0
+    ) {
+      return Math.max(25, Math.ceil(payload.retry_after * 1_000));
+    }
+  } catch {
+    // Fall through to the standard header/default delay.
+  }
+  const headerSeconds = Number(response.headers.get("retry-after"));
+  return Number.isFinite(headerSeconds) && headerSeconds >= 0
+    ? Math.max(25, Math.ceil(headerSeconds * 1_000))
+    : 1_000;
 }
 
 /** Discord subtext is a per-line prefix, so every non-empty line needs it. */
