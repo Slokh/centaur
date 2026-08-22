@@ -10,9 +10,9 @@
 // - No assistant status/title: a 👀 reaction on the triggering message via raw
 //   REST (PUT .../reactions/...) settles to ✅ / ❌ instead.
 // - Reasoning blurbs post as separate `-# ` subtext messages (append-only).
-// - The final answer streams into separate lazily-created message(s), split
-//   across multiple messages at ≤1900 chars.
-// - concurrency: "drop"; no webhook ingress route on the Hono app.
+// - The final answer is buffered, then posted in separate message(s), split
+//   across multiple messages at ≤1500 chars.
+// - concurrency: bounded queue; no webhook ingress route on the Hono app.
 // - Render-obligation state lives under `discordbot:render:*` keys.
 // - Threads are renamed only when the bot itself created them.
 import {
@@ -60,18 +60,267 @@ beforeAll(async () => {
   codexApi = await startMockCodexApi();
 });
 
-beforeEach(() => {
+beforeEach(async () => {
+  await bot?.chat.shutdown().catch(() => undefined);
   discordApi.reset();
-  codexApi.reset();
+  await codexApi.reset();
   bot = createTestBot();
 });
 
 afterAll(async () => {
+  await bot?.chat.shutdown().catch(() => undefined);
   await codexApi?.close();
   await discordApi?.close();
 });
 
 describe("discordbot", () => {
+  it("shares one retrying state-readiness gate across startup consumers", async () => {
+    const state = createMemoryState();
+    const connect = state.connect.bind(state);
+    let attempts = 0;
+    state.connect = async () => {
+      attempts += 1;
+      if (attempts < 3) throw new Error("database is moving nodes");
+      await connect();
+    };
+    bot = createTestBot({ state });
+
+    await Promise.all([bot.ready(), bot.ready(), bot.ready()]);
+
+    expect(attempts).toBe(3);
+  });
+
+  it("keeps implicit reply pings in one inline-reply session", async () => {
+    bot = createTestBot({ conversationMode: "inline_reply" });
+
+    const rootId = await dispatchMessage({
+      channelId: CHANNEL_ID,
+      content: `<@${APP_ID}> what day is it`,
+      mention: true,
+    });
+    await waitForSettle(CHANNEL_ID, rootId);
+
+    const firstAnswer = discordApi
+      .messagesIn(CHANNEL_ID)
+      .find(
+        (message) =>
+          message.author.bot === true &&
+          message.message_reference?.message_id === rootId,
+      );
+    expect(firstAnswer).toBeDefined();
+
+    const followUpId = await dispatchMessage({
+      channelId: CHANNEL_ID,
+      content: "in Japan",
+      // Discord includes the replied-to bot in mentions even when the user did
+      // not explicitly type @bot. The reply reference must win over that
+      // implicit mention when selecting the conversation root.
+      mention: true,
+      replyToMessageId: firstAnswer!.id,
+    });
+    await waitForSettle(CHANNEL_ID, followUpId);
+
+    const secondAnswer = [...discordApi.messagesIn(CHANNEL_ID)]
+      .reverse()
+      .find(
+        (message) =>
+          message.author.bot === true &&
+          message.message_reference?.message_id === followUpId,
+    );
+    expect(secondAnswer).toBeDefined();
+
+    // Simulate a Gateway restart losing the adapter's fast reply-root cache.
+    // The bounded Discord reference walk must still recover the original
+    // logical root while the next answer targets the immediate user message.
+    (
+      bot.adapter as unknown as {
+        inlineReplyRootCache: Map<string, string>;
+      }
+    ).inlineReplyRootCache.clear();
+
+    const secondFollowUpId = await dispatchMessage({
+      channelId: CHANNEL_ID,
+      content: "and tomorrow?",
+      mention: true,
+      replyToMessageId: secondAnswer!.id,
+    });
+    await waitForSettle(CHANNEL_ID, secondFollowUpId);
+
+    const thirdAnswer = [...discordApi.messagesIn(CHANNEL_ID)]
+      .reverse()
+      .find(
+        (message) =>
+          message.author.bot === true &&
+          message.message_reference?.message_id === secondFollowUpId,
+      );
+    expect(thirdAnswer).toBeDefined();
+
+    const rootKey = `discord:${GUILD_ID}:${CHANNEL_ID}:reply~${rootId}`;
+    expect(codexApi.creates.map((create) => create.threadKey)).toEqual([
+      rootKey,
+      rootKey,
+      rootKey,
+    ]);
+    expect(codexApi.appends).toHaveLength(3);
+    expect(codexApi.executes).toHaveLength(3);
+    expect(sessionMessageTexts(codexApi.appends[1]!.body.messages)).toEqual([
+      "in Japan",
+    ]);
+    expect(sessionMessageTexts(codexApi.appends[2]!.body.messages)).toEqual([
+      "and tomorrow?",
+    ]);
+  });
+
+  it("hydrates a new inline session from a forwarded reply chain", async () => {
+    bot = createTestBot({ conversationMode: "inline_reply" });
+
+    const forwarded = discordApi.seedRawMessage(CHANNEL_ID, {
+      author: {
+        bot: false,
+        global_name: "Test User",
+        id: USER_ID,
+        username: "tester",
+      },
+      content: "",
+      messageSnapshots: [
+        {
+          message: {
+            content: "Welcome to Rabbithole. Question one is about Apollo 11.",
+            embeds: [],
+          },
+        },
+      ],
+      referenceChannelId: "399999999999999999",
+      replyToMessageId: "388888888888888888",
+    });
+    const answer = discordApi.seedRawMessage(CHANNEL_ID, {
+      author: {
+        bot: false,
+        global_name: "Test User",
+        id: USER_ID,
+        username: "tester",
+      },
+      content: "Apollo 11",
+      replyToMessageId: forwarded.id,
+    });
+
+    const triggerId = await dispatchMessage({
+      channelId: CHANNEL_ID,
+      content: `<@${APP_ID}> was this game actually created?`,
+      mention: true,
+      replyToMessageId: answer.id,
+    });
+    await waitForSettle(CHANNEL_ID, triggerId);
+
+    expect(codexApi.appends).toHaveLength(1);
+    expect(sessionMessageTexts(codexApi.appends[0]!.body.messages)).toEqual([
+      "[forwarded message] Welcome to Rabbithole. Question one is about Apollo 11.",
+      "Apollo 11",
+      `<@${APP_ID}> was this game actually created?`,
+    ]);
+  });
+
+  it("injects the immediate reply target when reusing an inline session", async () => {
+    bot = createTestBot({ conversationMode: "inline_reply" });
+
+    const rootId = await dispatchMessage({
+      channelId: CHANNEL_ID,
+      content: `<@${APP_ID}> start a game`,
+      mention: true,
+    });
+    await waitForSettle(CHANNEL_ID, rootId);
+
+    const forwardedQuestion = discordApi.seedRawMessage(CHANNEL_ID, {
+      author: {
+        bot: true,
+        global_name: "Rabbithole",
+        id: APP_ID,
+        username: "rabbithole",
+      },
+      content: "",
+      messageSnapshots: [
+        {
+          message: {
+            content: "Which mission first landed humans on the Moon?",
+            embeds: [],
+          },
+        },
+      ],
+      replyToMessageId: rootId,
+    });
+    const answerId = await dispatchMessage({
+      channelId: CHANNEL_ID,
+      content: "Apollo 11",
+      mention: true,
+      replyToMessageId: forwardedQuestion.id,
+    });
+    await waitForSettle(CHANNEL_ID, answerId);
+
+    expect(codexApi.appends).toHaveLength(2);
+    expect(codexApi.executes).toHaveLength(2);
+    expect(codexApi.appends[1]?.threadKey).toBe(
+      `discord:${GUILD_ID}:${CHANNEL_ID}:reply~${rootId}`,
+    );
+    const parts = codexApi.appends[1]!.body.messages[0]!.parts;
+    const replyContext = parts.find(
+      (part) =>
+        isRecord(part) &&
+        typeof part.text === "string" &&
+        part.text.startsWith("# Discord Replied-To Context\n"),
+    );
+    expect(replyContext).toBeDefined();
+    expect(JSON.stringify(replyContext)).toContain(
+      "Which mission first landed humans on the Moon?",
+    );
+    expect(sessionMessageTexts(codexApi.appends[1]!.body.messages)).toEqual([
+      "Apollo 11",
+    ]);
+    expect(JSON.stringify(codexApi.executes[1]!.body.input_lines)).toContain(
+      "Which mission first landed humans on the Moon?",
+    );
+  });
+
+  it("does not wait for application outbox writes before handling a mention", async () => {
+    const state = createMemoryState();
+    await state.connect();
+    const originalSet = state.set.bind(state);
+    let releaseOutbox: (() => void) | undefined;
+    const outboxBlocked = new Promise<void>((resolve) => {
+      releaseOutbox = resolve;
+    });
+    state.set = async (key, value, ttlMs) => {
+      if (key.startsWith("discordbot:application-ingestion:event:")) {
+        await outboxBlocked;
+      }
+      return originalSet(key, value, ttlMs);
+    };
+    bot = createTestBot({
+      eventSinkToken: "ingestion-token",
+      eventSinkUrl: "http://application.invalid/v1/discord/events",
+      state,
+    });
+
+    const threadId = discordApi.nextId();
+    discordApi.seedThreadChannel(threadId, CHANNEL_ID);
+    try {
+      const dispatch = dispatchMessage({
+        channelId: threadId,
+        content: `<@${APP_ID}> acknowledge before archival`,
+        mention: true,
+        thread: { id: threadId, parentId: CHANNEL_ID },
+      });
+      await expect(
+        Promise.race([
+          dispatch.then(() => "returned"),
+          Bun.sleep(100).then(() => "blocked"),
+        ]),
+      ).resolves.toBe("returned");
+      await waitFor(() => codexApi.executes.length === 1, 3_000);
+    } finally {
+      releaseOutbox?.();
+    }
+  });
+
   it("syncs thread context, forwards subscribed messages, and renders execute streams append-only", async () => {
     const state = createMemoryState();
     await state.connect();
@@ -282,7 +531,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     await dispatchMessage({
       channelId: threadId,
@@ -317,7 +566,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     const secondMentionId = await dispatchMessage({
       channelId: threadId,
@@ -336,7 +585,7 @@ describe("discordbot", () => {
 
     codexApi.emitOutputLines(key, sampleCodexOutputLines("First run done."));
     await waitForSettle(threadId, firstMentionId);
-  });
+  }, 15_000);
 
   // Regression (a) — upstream 4c7ee514.
   it("ignores non-JSON sandbox bootstrap output lines instead of ending the stream", async () => {
@@ -352,7 +601,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     codexApi.emitOutputLine(
       key,
@@ -372,7 +621,7 @@ describe("discordbot", () => {
     expect(hasReaction(threadId, mentionId, "PUT", "❌")).toBe(false);
   });
 
-  it("renders raw turn.failed session output as visible final text and settles ❌", async () => {
+  it("renders a sanitized turn.failed message and settles ❌", async () => {
     codexApi.autoRespond = false;
 
     const threadId = discordApi.nextId();
@@ -385,7 +634,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     codexApi.emitOutputLine(
       key,
@@ -412,9 +661,10 @@ describe("discordbot", () => {
 
     await waitForSettle(threadId, mentionId, "❌");
     expect(answerPostsIn(threadId).join("\n")).toContain(
-      "Execution failed: Reconnecting... 2/5: unexpected status 502 Bad Gateway",
+      "Execution failed: The model provider is temporarily unavailable. Please try again.",
     );
-  });
+    expect(answerPostsIn(threadId).join("\n")).not.toContain("502 Bad Gateway");
+  }, 15_000);
 
   it("renders successful completions with no final answer as visible text", async () => {
     codexApi.autoRespond = false;
@@ -429,7 +679,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     codexApi.emitOutputLine(
       key,
@@ -453,7 +703,7 @@ describe("discordbot", () => {
     expect(answerPostsIn(threadId).join("\n")).toContain(
       "Execution completed, but no final text was captured.",
     );
-  });
+  }, 15_000);
 
   it("renders api-rs completion result text when no final answer delta streamed", async () => {
     codexApi.autoRespond = false;
@@ -468,7 +718,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     codexApi.emitSessionEvent(key, "session.execution_completed", {
       execution_id: "exe-terminal-result",
@@ -497,7 +747,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     codexApi.emitOutputLine(
       key,
@@ -517,6 +767,18 @@ describe("discordbot", () => {
         type: "item.agentMessage.delta",
         itemId: "answer-1",
         delta: "DUPLICATE_DELIVERY_GUARD_OK",
+      }),
+    );
+    codexApi.emitOutputLine(
+      key,
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          id: "answer-1",
+          type: "agentMessage",
+          text: "DUPLICATE_DELIVERY_GUARD_OK",
+          phase: "final_answer",
+        },
       }),
     );
     codexApi.emitSessionEvent(key, "session.execution_completed", {
@@ -590,7 +852,7 @@ describe("discordbot", () => {
       thread: { id: threadId, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(key));
 
     const fenceLines = Array.from(
       { length: 120 },
@@ -618,9 +880,11 @@ describe("discordbot", () => {
     expect(combined).not.toContain("[truncated");
   });
 
-  // Regression (f) — a failing final edit must not fail the run.
-  it("keeps a successful run ✅ when the final answer edit fails", async () => {
+  // Regression (f) — answer deltas stay private until completion and Discord
+  // never receives an answer-message edit.
+  it("buffers answer deltas and posts the completed answer without edits", async () => {
     codexApi.autoRespond = false;
+    // Keep the fake edit endpoint hostile so any regression is unmistakable.
     discordApi.setFailMessageEdits(true);
 
     const threadId = discordApi.nextId();
@@ -655,12 +919,10 @@ describe("discordbot", () => {
         delta: "partial answer ",
       }),
     );
-    // Wait for the first message post so the tail must land as an edit —
-    // emitting both deltas back to back can coalesce into the initial post,
-    // which would never exercise the failing-edit path under test.
-    await waitFor(() =>
+    await sleep(50);
+    expect(
       botPostsIn(threadId).some((content) => content.includes("partial answer")),
-    );
+    ).toBe(false);
     codexApi.emitOutputLine(
       key,
       JSON.stringify({
@@ -679,14 +941,14 @@ describe("discordbot", () => {
 
     await waitForSettle(threadId, mentionId);
     const posts = botPostsIn(threadId);
-    expect(posts.some((content) => content.includes("partial answer"))).toBe(
-      true,
-    );
+    expect(posts.filter((content) => content.includes("partial answer"))).toEqual([
+      "partial answer with a tail",
+    ]);
     expect(
-      posts.some((content) =>
-        content.includes("The end of this answer failed to post"),
+      discordApi.calls.some(
+        (call) => call.method === "PATCH" && call.path.includes("/messages/"),
       ),
-    ).toBe(true);
+    ).toBe(false);
     expect(hasReaction(threadId, mentionId, "PUT", "❌")).toBe(false);
   });
 
@@ -770,7 +1032,7 @@ describe("discordbot", () => {
     expect(answers.join("\n")).toContain("Done with status.");
     expect(answers.join("\n")).not.toContain(firstSummary);
     expect(hasReaction(threadId, mentionId, "PUT", "✅")).toBe(true);
-  });
+  }, 15_000);
 
   // Regression (g) — transient create/append failure is retried in place.
   it("retries a transient createSession failure and succeeds without user-visible error", async () => {
@@ -902,7 +1164,10 @@ describe("discordbot", () => {
     // No duplicate posting across the retries; one final failure message.
     const posts = botPostsIn(threadId);
     expect(posts).toHaveLength(1);
-    expect(posts[0]).toContain("Streaming retries exhausted");
+    expect(posts[0]).toContain(
+      "Execution failed: The agent could not complete this request. Please try again.",
+    );
+    expect(posts[0]).not.toContain("Streaming retries exhausted");
 
     const threadState = await state.get<Record<string, unknown>>(
       `thread-state:${key}`,
@@ -1009,7 +1274,7 @@ describe("discordbot", () => {
       thread: { id: threadA, parentId: CHANNEL_ID },
     });
     await waitFor(() => codexApi.executes.length === 1);
-    await waitFor(() => codexApi.streamCount === 1);
+    await waitFor(() => codexApi.hasStream(threadKey(threadA)));
 
     const mentionB = await dispatchMessage({
       channelId: threadB,
@@ -1239,6 +1504,12 @@ describe("discordbot", () => {
         (request) => request.threadKey === healthyKey,
       ),
     ).toHaveLength(1);
+    await waitFor(async () => {
+      const latest = await sharedState.get<Record<string, unknown>>(
+        `thread-state:${healthyKey}`,
+      );
+      return latest?.activeExecution === false && latest.renderObligation === null;
+    });
     const healthyState = await sharedState.get<Record<string, unknown>>(
       `thread-state:${healthyKey}`,
     );
@@ -1356,6 +1627,8 @@ function createTestBot(overrides: Partial<DiscordbotOptions> = {}): Discordbot {
     guildAllowlist: [GUILD_ID],
     publicKey: PUBLIC_KEY,
     recoverRenderObligationsOnStart: false,
+    renderRetryInitialDelayMs: 5,
+    renderRetryMaxDelayMs: 20,
     state: createMemoryState(),
     ...overrides,
   });
@@ -1379,6 +1652,7 @@ async function dispatchMessage(input: {
   content: string;
   guildId?: string;
   mention?: boolean;
+  replyToMessageId?: string;
   thread?: { id: string; parentId: string };
 }): Promise<string> {
   const raw = discordApi.seedRawMessage(input.channelId, {
@@ -1390,6 +1664,7 @@ async function dispatchMessage(input: {
       username: "tester",
     },
     content: input.content,
+    replyToMessageId: input.replyToMessageId,
   });
   const data: Record<string, unknown> = {
     ...raw,
@@ -1489,14 +1764,27 @@ async function waitForSettle(
   emoji: "✅" | "❌" = "✅",
   timeoutMs = 5000,
 ): Promise<void> {
-  await waitFor(
-    () => hasReaction(channelId, messageId, "PUT", emoji),
-    timeoutMs,
-  );
-  await waitFor(
-    () => hasReaction(channelId, messageId, "DELETE", "👀"),
-    timeoutMs,
-  );
+  try {
+    await waitFor(
+      () => hasReaction(channelId, messageId, "PUT", emoji),
+      timeoutMs,
+    );
+    await waitFor(
+      () => hasReaction(channelId, messageId, "DELETE", "👀"),
+      timeoutMs,
+    );
+  } catch (error) {
+    throw new Error(
+      `Timed out waiting for ${emoji} settlement: ${JSON.stringify({
+        answers: answerPostsIn(channelId),
+        eventRequests: codexApi.eventRequests,
+        executes: codexApi.executes.map((request) => request.threadKey),
+        reactions: reactionsOn(channelId, messageId),
+        streamCount: codexApi.streamCount,
+      })}`,
+      { cause: error },
+    );
+  }
 }
 
 function sessionMessageTexts(messages: DiscordbotSessionMessage[]): string[] {
@@ -1507,6 +1795,12 @@ function sessionMessageTexts(messages: DiscordbotSessionMessage[]): string[] {
         part.type === "text" &&
         typeof part.text === "string"
       ) {
+        if (
+          part.text.startsWith("# Discord Requester Context\n") ||
+          part.text.startsWith("# Discord Replied-To Context\n")
+        ) {
+          return [];
+        }
         return [part.text];
       }
       return [];
@@ -1701,6 +1995,9 @@ type RawDiscordMessage = {
   content: string;
   edited_timestamp: null;
   id: string;
+  message_reference?: { channel_id?: string; message_id: string };
+  message_snapshots?: Record<string, unknown>[];
+  referenced_message?: RawDiscordMessage;
   timestamp: string;
   type: number;
 };
@@ -1733,6 +2030,9 @@ type FakeDiscordApi = {
       attachments?: Record<string, unknown>[];
       author: RawDiscordAuthor;
       content: string;
+      messageSnapshots?: Record<string, unknown>[];
+      referenceChannelId?: string;
+      replyToMessageId?: string;
     },
   ): RawDiscordMessage;
   seedThreadChannel(threadId: string, parentId: string): void;
@@ -1768,6 +2068,11 @@ async function startFakeDiscordApi(): Promise<FakeDiscordApi> {
     channelId,
     input,
   ) => {
+    const referencedMessage = input.replyToMessageId
+      ? channelMessages(channelId).find(
+          (message) => message.id === input.replyToMessageId,
+        )
+      : undefined;
     const message: RawDiscordMessage = {
       attachments: input.attachments ?? [],
       author: input.author,
@@ -1775,6 +2080,22 @@ async function startFakeDiscordApi(): Promise<FakeDiscordApi> {
       content: input.content,
       edited_timestamp: null,
       id: nextId(),
+      ...(input.replyToMessageId
+        ? {
+            message_reference: {
+              ...(input.referenceChannelId
+                ? { channel_id: input.referenceChannelId }
+                : {}),
+              message_id: input.replyToMessageId,
+            },
+            ...(referencedMessage
+              ? { referenced_message: referencedMessage }
+              : {}),
+          }
+        : {}),
+      ...(input.messageSnapshots
+        ? { message_snapshots: input.messageSnapshots }
+        : {}),
       timestamp: new Date().toISOString(),
       type: 0,
     };
@@ -1991,6 +2312,14 @@ async function handleFakeDiscordRequest(
       content: String(body?.content ?? ""),
       edited_timestamp: null,
       id: input.nextId(),
+      ...(isRecord(body?.message_reference) &&
+      typeof body.message_reference.message_id === "string"
+        ? {
+            message_reference: {
+              message_id: body.message_reference.message_id,
+            },
+          }
+        : {}),
       timestamp: new Date().toISOString(),
       type: 0,
     };
@@ -2104,7 +2433,7 @@ type MockSessionApi = {
   failNextExecuteAfterAccept: boolean;
   hasStream(threadKey: string): boolean;
   holdNextExecute(): () => void;
-  reset(): void;
+  reset(): Promise<void>;
   streamCount: number;
   url: string;
 };
@@ -2193,24 +2522,38 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
     creates,
     eventRequests,
     executes,
-    reset() {
+    async reset() {
+      // A timed-out assertion can leave a detached render attempt holding an
+      // SSE response after Chat SDK shutdown. Make that prior attempt
+      // recoverable before clearing observations for the next test: otherwise
+      // closeStreams() preserves failAllEvents/idempotency from the failed
+      // case, starts the 33-second retry loop, and contaminates later counts.
+      const hadLiveStreams = streams.size > 0;
+      autoRespond = true;
+      failAllEvents = false;
+      failNextCreate = false;
+      failNextEvents = false;
+      failNextExecute = false;
+      failNextExecuteAfterAccept = false;
+      idempotentExecutions.clear();
+      events.length = 0;
+      executeHoldRelease?.();
+      executeHold = null;
+      executeHoldRelease = null;
+      closeStreams();
+      if (hadLiveStreams) {
+        // Production retry starts at 250ms. Give the detached attempt enough
+        // time to reopen against the now-healthy fake API and consume its
+        // auto-generated terminal event before resetting recorded calls.
+        await sleep(350);
+      }
       appends.length = 0;
       creates.length = 0;
       eventRequests.length = 0;
       events.length = 0;
       executes.length = 0;
       idempotentExecutions.clear();
-      executeHoldRelease?.();
-      executeHold = null;
-      executeHoldRelease = null;
-      closeStreams();
-      autoRespond = true;
       eventId = 0;
-      failAllEvents = false;
-      failNextCreate = false;
-      failNextEvents = false;
-      failNextExecute = false;
-      failNextExecuteAfterAccept = false;
     },
     url: `http://127.0.0.1:${port}`,
     closeStreams,
@@ -2279,6 +2622,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
         events,
         id: ++eventId,
         streams,
+        streamThreadKeys,
         threadKey,
       });
     },
@@ -2299,6 +2643,7 @@ async function startMockCodexApi(): Promise<MockSessionApi> {
         events,
         id: ++eventId,
         streams,
+        streamThreadKeys,
         threadKey,
       });
     },
@@ -2398,8 +2743,24 @@ async function handleMockCodexRequest(
       connection: "keep-alive",
       "content-type": "text/event-stream",
     });
+    // IncomingMessage "close" means the GET request body is complete and may
+    // fire while its SSE response is still live. Track the response lifecycle
+    // so live emissions cannot silently lose their registered stream.
+    res.once("close", () => {
+      input.streams.delete(res);
+      input.streamThreadKeys.delete(res);
+    });
+    // Flush and register synchronously. Waiting for the write callback is
+    // racy under Bun's fetch pool: it can be delayed until Node's keep-alive
+    // timeout even though the request reached this handler. All later SSE
+    // writes share this response and remain ordered in Node's output buffer.
+    res.flushHeaders();
+    res.write(": connected\n\n");
+    if (res.destroyed) return;
     input.streams.add(res);
     input.streamThreadKeys.set(res, threadKey);
+    // Events can arrive between request acceptance and stream registration.
+    // Replay the durable fake ledger after registration so none are lost.
     for (const event of input.events) {
       if (
         event.threadKey === threadKey &&
@@ -2411,10 +2772,6 @@ async function handleMockCodexRequest(
         writeMockSseEvent(res, event);
       }
     }
-    req.once("close", () => {
-      input.streams.delete(res);
-      input.streamThreadKeys.delete(res);
-    });
     return;
   }
 
@@ -2469,6 +2826,7 @@ async function handleMockCodexRequest(
         events: input.events,
         id: input.nextEventId(),
         streams: input.streams,
+        streamThreadKeys: input.streamThreadKeys,
         threadKey,
       });
     }
@@ -2502,6 +2860,7 @@ function emitMockSessionEvent(input: {
   events: MockSessionEvent[];
   id: number;
   streams: Set<ServerResponse>;
+  streamThreadKeys: Map<ServerResponse, string>;
   threadKey: string;
 }): void {
   const event: MockSessionEvent = {
@@ -2512,7 +2871,11 @@ function emitMockSessionEvent(input: {
     threadKey: input.threadKey,
   };
   input.events.push(event);
-  for (const stream of input.streams) writeMockSseEvent(stream, event);
+  for (const stream of input.streams) {
+    if (input.streamThreadKeys.get(stream) === input.threadKey) {
+      writeMockSseEvent(stream, event);
+    }
+  }
 }
 
 function writeMockSseEvent(
@@ -2577,6 +2940,12 @@ async function sendWebResponse(
   response.headers.forEach((value, key) => {
     res.setHeader(key, value);
   });
+  // Keep the node:http fakes deterministic under Bun's fetch pool. Completed
+  // JSON/REST responses do not need connection reuse, and a socket cancelled
+  // by the preceding SSE test can otherwise be selected until Node's 5-second
+  // keep-alive timeout expires. SSE responses bypass this helper and remain
+  // intentionally long-lived.
+  res.setHeader("connection", "close");
   if (response.body === null || response.status === 204) {
     res.end();
     return;
@@ -2604,12 +2973,12 @@ function closeServer(server: HttpServer): Promise<void> {
 }
 
 async function waitFor(
-  predicate: () => boolean,
+  predicate: () => boolean | Promise<boolean>,
   timeoutMs = 5000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error("Timed out waiting for condition");

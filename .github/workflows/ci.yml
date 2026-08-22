@@ -27,6 +27,7 @@ jobs:
       discordbot_checks: ${{ steps.filter.outputs.discordbot_checks }}
       githubbot_checks: ${{ steps.filter.outputs.githubbot_checks }}
       teamsbot_checks: ${{ steps.filter.outputs.teamsbot_checks }}
+      chart_checks: ${{ steps.filter.outputs.chart_checks }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -115,6 +116,28 @@ jobs:
             '^pnpm-lock\.yaml$' \
             '^pnpm-workspace\.yaml$' \
             '^\.github/workflows/ci\.yml$'
+          set_output chart_checks \
+            '^contrib/chart/' \
+            '^\.github/scripts/test-chart-images\.sh$' \
+            '^\.github/workflows/ci\.yml$'
+
+  chart-checks:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    needs: ci_changes
+    if: needs.ci_changes.outputs.chart_checks == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: Validate chart and image inheritance
+        run: |
+          helm dependency build contrib/chart
+          helm lint contrib/chart
+          .github/scripts/test-chart-images.sh
 
   migration-order:
     name: Migration order
@@ -203,8 +226,23 @@ jobs:
       - name: Test
         working-directory: services/api-rs
         env:
-          SESSION_SQLX_TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
-        run: cargo test --workspace
+          # The session runtime, warm-pool, and SQLx store suites deliberately
+          # skip when this is absent. CI starts Postgres above, so make those
+          # integration tests mandatory instead of reporting a partial pass.
+          PGPASSWORD: postgres
+        run: |
+          createdb -h localhost -U postgres centaur_store
+          createdb -h localhost -U postgres centaur_manager
+          createdb -h localhost -U postgres centaur_runtime
+          SESSION_SQLX_TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/centaur_store \
+            SESSION_RUNTIME_TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/centaur_store \
+            cargo test --workspace --exclude centaur-sandbox-manager --exclude centaur-session-runtime
+          SESSION_RUNTIME_TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/centaur_manager \
+            SESSION_SQLX_TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/centaur_manager \
+            cargo test -p centaur-sandbox-manager
+          SESSION_RUNTIME_TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/centaur_runtime \
+            SESSION_SQLX_TEST_DATABASE_URL=postgresql://postgres:postgres@localhost:5432/centaur_runtime \
+            cargo test -p centaur-session-runtime
 
       - name: Run API integration test
         working-directory: services/api-rs
@@ -537,10 +575,11 @@ jobs:
       - discordbot-checks
       - githubbot-checks
       - teamsbot-checks
+      - chart-checks
     timeout-minutes: 30
     steps:
       - name: Decide whether the needed jobs succeeded or failed
         uses: re-actors/alls-green@05ac9388f0aebcb5727afa17fcccfecd6f8ec5fe # v1.2.2
         with:
-          allowed-skips: migration-order, harness-server-checks, rust-api, sandbox-tests, workflow-python-tests, tool-tests, slackbotv2-tests, discordbot-checks, githubbot-checks, teamsbot-checks
+          allowed-skips: migration-order, harness-server-checks, rust-api, sandbox-tests, workflow-python-tests, tool-tests, slackbotv2-tests, discordbot-checks, githubbot-checks, teamsbot-checks, chart-checks
           jobs: ${{ toJSON(needs) }}

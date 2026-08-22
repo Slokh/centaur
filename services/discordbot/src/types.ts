@@ -2,6 +2,7 @@ import type { RustSessionStreamEvent } from "@centaur/harness-events";
 import type { CodexAppServerToChatStreamOptions } from "@centaur/rendering";
 import type { Attachment, Chat, Logger, StateAdapter } from "chat";
 import type { Hono } from "hono";
+import type { DiscordEventSinkOutbox } from "./discord-event-sink-outbox";
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonObject | JsonValue[];
@@ -29,12 +30,22 @@ export type DiscordbotApiAttachment = {
   width?: number;
 };
 
+export type DiscordbotReplyContext = {
+  attachments: DiscordbotApiAttachment[];
+  author: DiscordbotApiAuthor;
+  id: string;
+  text: string;
+  timestamp: string;
+};
+
 export type DiscordbotApiMessage = {
   attachments: DiscordbotApiAttachment[];
   author: DiscordbotApiAuthor;
   id: string;
   isMention: boolean;
   raw: unknown;
+  /** Immediate Discord reply target, authenticated and bounded by ingress. */
+  replyContext?: DiscordbotReplyContext;
   text: string;
   threadId: string;
   timestamp: string;
@@ -58,16 +69,50 @@ export type DiscordbotAppendMessagesRequest = {
 };
 
 export type DiscordbotCreateSessionRequest = {
+  chat_destination?: DiscordbotChatDestination;
   harness_type: string;
   metadata: JsonObject;
+};
+
+export type DiscordbotChatDestination = {
+  platform: "discord";
+  guild_id: string;
+  channel_id: string;
+  thread_id: string | null;
+  reply_to_message_id?: string;
 };
 
 export type DiscordbotExecuteSessionRequest = {
   idempotency_key?: string;
   idle_timeout_ms?: number;
   input_lines: string[];
+  invocation: DiscordbotInvocationContext;
   max_duration_ms?: number;
   metadata: JsonObject;
+};
+
+export type DiscordbotInvocationContext = {
+  version: 1;
+  kind: "discord_member";
+  actor: {
+    platform: "discord";
+    user_id: string;
+    guild_id: string;
+  };
+  conversation: {
+    platform: "discord";
+    channel_id: string;
+    thread_id: string | null;
+  };
+  source: {
+    event_id: string;
+    message_id: string;
+  };
+  authority: {
+    mutation: "current_member_request";
+    observed_at: string;
+    visible_channel_ids: string[];
+  };
 };
 
 export type DiscordbotExecuteSessionResponse = {
@@ -89,12 +134,24 @@ export type DiscordbotOptions = {
    * wedge the thread forever — Gateway ingress has no redelivery to kick it).
    */
   activeExecutionTtlMs?: number;
-  /** Discord delta: edit cadence for the in-progress answer message. */
-  answerEditIntervalMs?: number;
   apiKey?: string;
   apiUrl: string;
+  /** Optional private Discord event sink; requires the token too. */
+  eventSinkUrl?: string;
+  eventSinkToken?: string;
+  eventSinkOutbox?: DiscordEventSinkOutbox;
+  eventSinkDeliveryTimeoutMs?: number;
+  eventSinkRecoveryBatchSize?: number;
+  eventSinkRecoveryConcurrency?: number;
+  eventSinkRecoveryLeaseMs?: number;
+  /** Periodically reconcile Discord REST history into Discord event sink. */
+  applicationArchiveReconciliationEnabled?: boolean;
+  applicationArchiveReconciliationIntervalMs?: number;
+  applicationArchiveReconciliationConcurrency?: number;
   applicationId: string;
   botToken: string;
+  /** Layout for new channel mentions. Existing Discord threads remain threads. */
+  conversationMode?: "thread" | "inline_reply";
   discordApiUrl?: string;
   fetch?: DiscordbotFetch;
   guildAllowlist?: readonly string[];
@@ -110,8 +167,27 @@ export type DiscordbotOptions = {
   /** Rename auto-created threads to the message-derived title. Defaults to true. */
   nameThreads?: boolean;
   postgresUrl?: string;
+  /** Public progress surface. `reactions` never posts reasoning or statuses. */
+  progressMode?: "narration" | "reactions";
   publicKey: string;
+  /** Append model/harness/reasoning metadata to first, every, or no response. */
+  responseMetadataMode?: "first" | "always" | "never";
+  responseMetadataHarness?: string;
+  responseMetadataModel?: string;
+  responseMetadataReasoning?: string;
+  /** Include end-to-end turn latency in a rendered response metadata footer. */
+  responseLatencyEnabled?: boolean;
   recoverRenderObligationsOnStart?: boolean;
+  /** Initial exponential backoff for render recovery. Default 250ms. */
+  renderRetryInitialDelayMs?: number;
+  /** Maximum render recovery backoff. Default 5s. */
+  renderRetryMaxDelayMs?: number;
+  resolveVisibleChannelIds?: (input: {
+    currentChannelId: string;
+    currentThreadId?: string;
+    guildId: string;
+    userId: string;
+  }) => Promise<string[]>;
   state?: StateAdapter;
   stateKeyPrefix?: string;
   /**
@@ -126,6 +202,8 @@ export type Discordbot = {
   app: Hono;
   chat: Chat;
   adapter: GatewayCapableAdapter;
+  /** Wait until the durable state backend is available before accepting ingress. */
+  ready: () => Promise<void>;
 };
 
 export type DiscordbotThreadState = {
@@ -163,6 +241,8 @@ export type DiscordbotTrace = {
 };
 
 export type ForwardSessionInput = {
+  /** Acting member for a new execution; omitted for append-only steering. */
+  actorUserId?: string;
   afterEventId: number;
   /**
    * Human-readable channel name carried in the create-session metadata as
@@ -177,6 +257,7 @@ export type ForwardSessionInput = {
   openStream: boolean;
   threadId: string;
   trace?: DiscordbotTrace;
+  visibleChannelIds?: string[];
 };
 
 /** Minimal slice of the Discord adapter the Gateway runner needs. */

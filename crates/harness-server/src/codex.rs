@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, BufRead, Write};
 use std::process::{Child, ChildStdin, Command as ProcessCommand, Stdio};
@@ -12,10 +13,10 @@ use std::time::Duration;
 use codex_app_server_protocol::UserInput;
 use serde_json::{Value, json};
 
-use crate::otel::{TurnStatus as TelemetryTurnStatus, TurnTelemetry};
+use crate::otel::{self, TurnStatus as TelemetryTurnStatus, TurnTelemetry};
 use crate::server::{
-    BlocksCommand, BlocksState, parse_blocks_line_with_state, usage_span_input_value,
-    write_blocks_error,
+    BlocksCommand, BlocksState, apply_session_env, parse_blocks_line_with_state,
+    usage_span_input_value, write_blocks_error,
 };
 use crate::util::write_value;
 use crate::{AppServerRuntime, HarnessServerError, Result};
@@ -130,6 +131,7 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
     // thread start (the app-server protocol has no per-turn provider), so this
     // lets a later conflicting override be surfaced rather than silently dropped.
     let mut thread_provider: Option<String> = None;
+    let mut active_session_env = BTreeMap::new();
     let (command_tx, command_rx) = mpsc::channel();
     let (active_turn_tx, active_turn_rx) = mpsc::channel();
     let turn_active = Arc::new(AtomicBool::new(false));
@@ -196,6 +198,7 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                 provider,
                 reasoning,
                 trace_context,
+                session_env,
             }) => {
                 let traceparent = trace_context.effective_traceparent();
                 let model = model.or_else(|| config.default_model());
@@ -211,8 +214,10 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
                 );
                 turn_active.store(true, Ordering::SeqCst);
                 let result = (|| -> Result<()> {
+                    apply_session_env(&mut active_session_env, session_env)?;
                     if codex.is_none() {
-                        let mut child = CodexJsonRpcChild::spawn()?;
+                        otel::configure_codex_otel_for_startup(&trace_context)?;
+                        let mut child = CodexJsonRpcChild::spawn(&active_session_env)?;
                         initialize_codex(
                             &mut child,
                             &mut stdout,
@@ -270,6 +275,7 @@ pub(crate) fn run_codex_blocks_server(config: CodexHarnessServer) -> Result<()> 
     Ok(())
 }
 
+#[allow(clippy::large_enum_variant)]
 enum CodexBlocksReaderInput {
     Command(BlocksCommand),
     Error(String),
@@ -501,10 +507,11 @@ struct CodexJsonRpcChild {
 }
 
 impl CodexJsonRpcChild {
-    fn spawn() -> Result<Self> {
+    fn spawn(session_env: &BTreeMap<String, String>) -> Result<Self> {
         let bin = codex_bin();
         let mut child = ProcessCommand::new(&bin)
             .args(["app-server", "--listen", "stdio://"])
+            .envs(session_env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

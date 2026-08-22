@@ -1,13 +1,15 @@
 import { beforeEach, describe, expect, it } from "bun:test";
+import { createMemoryState } from "@chat-adapter/state-memory";
 import type { Logger, Thread } from "chat";
 import {
+  buildDiscordResponseFooter,
   clearConversationNameCacheForTests,
+  createDiscordbot,
   hasLiveActiveExecution,
+  postBufferedAnswerToThread,
   resolveDiscordConversationName,
-  streamAnswerToThread,
 } from "../src/index";
 import type { DiscordbotFetch, DiscordbotOptions } from "../src/types";
-import { AsyncTextQueue } from "../src/utils";
 
 const TTL_MS = 30 * 60 * 1000;
 
@@ -20,6 +22,32 @@ const noopLogger = {
     return noopLogger;
   },
 } as unknown as Logger;
+
+describe("Discordbot health", () => {
+  it("keeps process liveness separate from Gateway readiness", async () => {
+    const state = createMemoryState();
+    let gatewayActive = false;
+    const bot = createDiscordbot({
+      apiUrl: "http://localhost",
+      applicationId: "app",
+      botToken: "token",
+      guildAllowlist: ["guild"],
+      isGatewayActive: () => gatewayActive,
+      logger: noopLogger,
+      publicKey: "key",
+      recoverRenderObligationsOnStart: false,
+      state,
+    });
+    await bot.ready();
+
+    expect((await bot.app.request("/live")).status).toBe(200);
+    expect((await bot.app.request("/ready")).status).toBe(503);
+    gatewayActive = true;
+    expect((await bot.app.request("/ready")).status).toBe(200);
+    expect((await bot.app.request("/health")).status).toBe(200);
+    await bot.chat.shutdown();
+  });
+});
 
 describe("hasLiveActiveExecution", () => {
   it("is false when no execution is marked", () => {
@@ -76,9 +104,11 @@ type FakeMessage = { id: string; content: string };
 function fakeThread(input?: { failPostAfter?: number; failEdits?: boolean }): {
   thread: Thread;
   messages: FakeMessage[];
+  editCalls: () => number;
   postCalls: () => number;
 } {
   const messages: FakeMessage[] = [];
+  let edits = 0;
   let posts = 0;
   const adapter = {
     async postMessage(_threadId: string, message: { raw?: string }) {
@@ -95,6 +125,7 @@ function fakeThread(input?: { failPostAfter?: number; failEdits?: boolean }): {
       messageId: string,
       message: { raw?: string },
     ) {
+      edits += 1;
       if (input?.failEdits) throw new Error("edit failed");
       const target = messages.find((item) => item.id === messageId);
       if (!target) throw new Error("unknown message");
@@ -106,7 +137,12 @@ function fakeThread(input?: { failPostAfter?: number; failEdits?: boolean }): {
     id: "discord:G1:C1:T1",
     adapter,
   } as unknown as Thread;
-  return { thread, messages, postCalls: () => posts };
+  return {
+    thread,
+    messages,
+    editCalls: () => edits,
+    postCalls: () => posts,
+  };
 }
 
 function botOptions(): DiscordbotOptions {
@@ -118,20 +154,25 @@ function botOptions(): DiscordbotOptions {
   };
 }
 
-async function runStreamer(thread: Thread, pieces: string[]): Promise<void> {
-  const queue = new AsyncTextQueue();
-  const done = streamAnswerToThread(thread, queue, botOptions());
-  for (const piece of pieces) queue.push(piece);
-  queue.end();
-  await done;
-}
-
-describe("streamAnswerToThread", () => {
+describe("postBufferedAnswerToThread", () => {
   it("posts a short answer as a single message", async () => {
-    const { thread, messages } = fakeThread();
-    await runStreamer(thread, ["Hello ", "world"]);
+    const { thread, messages, editCalls } = fakeThread();
+    await postBufferedAnswerToThread(thread, "Hello world");
     expect(messages.length).toBe(1);
     expect(messages[0]?.content).toBe("Hello world");
+    expect(editCalls()).toBe(0);
+  });
+
+  it("suppresses embeds for links in the completed answer", async () => {
+    const { thread, messages } = fakeThread();
+    await postBufferedAnswerToThread(
+      thread,
+      "Explorer: https://explore.tempo.xyz/tx/0x123. [Docs](https://docs.tempo.xyz)",
+    );
+    expect(messages).toHaveLength(1);
+    expect(messages[0]?.content).toBe(
+      "Explorer: <https://explore.tempo.xyz/tx/0x123>. [Docs](<https://docs.tempo.xyz>)",
+    );
   });
 
   it("splits a long answer across multiple messages, each within the cap", async () => {
@@ -140,9 +181,9 @@ describe("streamAnswerToThread", () => {
       (_, i) => `paragraph ${i}: ${"lorem ipsum ".repeat(40)}`,
     );
     const { thread, messages } = fakeThread();
-    await runStreamer(
+    await postBufferedAnswerToThread(
       thread,
-      paragraphs.map((p) => `${p}\n\n`),
+      paragraphs.map((p) => `${p}\n\n`).join(""),
     );
     expect(messages.length).toBeGreaterThan(1);
     for (const message of messages) {
@@ -156,19 +197,61 @@ describe("streamAnswerToThread", () => {
     expect(combined).not.toContain("...");
   });
 
-  it("propagates a mid-stream post failure (deleted thread fails the run)", async () => {
+  it("propagates a post failure (deleted thread fails the run)", async () => {
     const { thread } = fakeThread({ failPostAfter: 0 });
-    await expect(runStreamer(thread, ["hello"])).rejects.toThrow("post failed");
+    await expect(postBufferedAnswerToThread(thread, "hello")).rejects.toThrow(
+      "post failed",
+    );
   });
 
-  it("does not reject when the final edit fails; partial content stands and a note is appended", async () => {
-    const { thread, messages } = fakeThread({ failEdits: true });
-    // The second piece lands within the edit cadence, so the in-progress
-    // message only gets its final content via the flush edit — which fails.
-    await runStreamer(thread, ["partial answer ", "with a tail"]);
-    expect(messages.length).toBe(2);
-    expect(messages[0]?.content).toBe("partial answer ");
-    expect(messages[1]?.content).toContain("⚠️");
+  it("never edits a posted answer", async () => {
+    const { thread, messages, editCalls } = fakeThread({ failEdits: true });
+    await postBufferedAnswerToThread(thread, "complete answer");
+    expect(messages).toEqual([{ id: "msg-1", content: "complete answer" }]);
+    expect(editCalls()).toBe(0);
+  });
+});
+
+describe("buildDiscordResponseFooter", () => {
+  it("renders model, harness, reasoning, and end-to-end latency", () => {
+    expect(
+      buildDiscordResponseFooter({
+        elapsedMs: 5_349,
+        isFirstAssistantMessage: false,
+        options: {
+          responseLatencyEnabled: true,
+          responseMetadataHarness: "codex",
+          responseMetadataMode: "always",
+          responseMetadataModel: "openai/gpt-5.6-terra",
+          responseMetadataReasoning: "medium",
+        },
+      }),
+    ).toBe("-# OPENAI/GPT-5.6-TERRA · Codex · Medium · 5.3s");
+  });
+
+  it("honors first and never modes", () => {
+    const options = {
+      responseMetadataHarness: "codex",
+      responseMetadataMode: "first" as const,
+    };
+    expect(
+      buildDiscordResponseFooter({
+        isFirstAssistantMessage: true,
+        options,
+      }),
+    ).toBe("-# Codex");
+    expect(
+      buildDiscordResponseFooter({
+        isFirstAssistantMessage: false,
+        options,
+      }),
+    ).toBeUndefined();
+    expect(
+      buildDiscordResponseFooter({
+        isFirstAssistantMessage: true,
+        options: { ...options, responseMetadataMode: "never" },
+      }),
+    ).toBeUndefined();
   });
 });
 

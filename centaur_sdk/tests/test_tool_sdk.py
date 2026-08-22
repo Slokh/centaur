@@ -12,7 +12,9 @@ from centaur_sdk import (
     current_github_thread,
     current_linear_thread,
     current_session_context,
+    current_scoped_discord_thread,
     current_slack_thread,
+    current_thread_key,
     reset_tool_context,
     save_attachment,
     secret,
@@ -35,6 +37,25 @@ class MappingBackend(SecretBackend):
 
     async def list_keys(self) -> list[str]:
         return sorted(k for k, v in self.values.items() if v is not None)
+
+
+def test_current_thread_key_falls_back_to_sandbox_environment(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "discord:guild:channel:reply~message")
+
+    assert current_thread_key() == "discord:guild:channel:reply~message"
+
+
+def test_current_thread_key_prefers_explicit_tool_context(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("CENTAUR_THREAD_KEY", "discord:environment")
+    token = set_tool_context(ToolContext(name="fake-tool", thread_key="discord:context"))
+    try:
+        assert current_thread_key() == "discord:context"
+    finally:
+        reset_tool_context(token)
 
 
 def test_secret_prefers_tool_context_over_backend(monkeypatch: pytest.MonkeyPatch):
@@ -178,6 +199,24 @@ def _discord_context(thread_key: str, monkeypatch: pytest.MonkeyPatch):
     )
 
 
+def _discord_reply_context(thread_key: str, monkeypatch: pytest.MonkeyPatch):
+    payload = (
+        b'{"thread_key":"' + thread_key.encode() + b'","platform":"discord",'
+        b'"discord":{"guild_id":"111","channel_id":"222",'
+        b'"reply_to_message_id":"444"}}'
+    )
+    monkeypatch.setattr(
+        "urllib.request.urlopen", lambda _request, timeout: _fake_context_response(payload)()
+    )
+    return set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key=thread_key,
+            secrets={"CENTAUR_API_URL": "http://api:8000", "CENTAUR_API_KEY": ""},
+        )
+    )
+
+
 def test_current_discord_thread_returns_api_discord_destination(
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -188,6 +227,70 @@ def test_current_discord_thread_returns_api_discord_destination(
             "channel_id": "222",
             "thread_id": "333",
         }
+    finally:
+        reset_tool_context(token)
+
+
+def test_current_discord_thread_returns_reply_destination(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    token = _discord_reply_context("discord:111:222:reply~444", monkeypatch)
+    try:
+        assert current_discord_thread() == {
+            "guild_id": "111",
+            "channel_id": "222",
+            "reply_to_message_id": "444",
+        }
+    finally:
+        reset_tool_context(token)
+
+
+def test_current_scoped_discord_thread_uses_authenticated_api_session(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    payload = (
+        b'{"thread_key":"discord:111:222:reply~444","platform":"discord",'
+        b'"discord":{"guild_id":"111","channel_id":"222",'
+        b'"reply_to_message_id":"444"}}'
+    )
+    seen = {}
+
+    def fake_open(request, timeout):
+        seen["url"] = request.full_url
+        seen["authorization"] = request.get_header("Authorization")
+        return _fake_context_response(payload)()
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_open)
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="discord:111:222:reply~444",
+            secrets={"CENTAUR_API_URL": "http://api:8000"},
+        )
+    )
+    try:
+        assert current_scoped_discord_thread()["reply_to_message_id"] == "444"
+        assert seen == {
+            "url": "http://api:8000/api/session/discord%3A111%3A222%3Areply~444/scoped-context",
+            "authorization": None,
+        }
+    finally:
+        reset_tool_context(token)
+
+
+def test_current_scoped_discord_thread_requires_api_server_capability(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    token = set_tool_context(
+        ToolContext(
+            name="fake-tool",
+            thread_key="discord:111:222:reply~444",
+            secrets={"CENTAUR_SANDBOX_API_SERVER_ENABLED": "false"},
+        )
+    )
+    try:
+        with pytest.raises(RuntimeError, match="API server sandbox capability"):
+            current_scoped_discord_thread()
     finally:
         reset_tool_context(token)
 

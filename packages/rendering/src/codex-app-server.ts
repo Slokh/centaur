@@ -72,6 +72,10 @@ export type CodexAppServerRendererEventMapperOptions = {
   logInfo?: RendererLogInfo
   unknownAgentMessagePhase?: AgentMessagePhase
   taskOutput?: 'full' | 'omit'
+  // Optional surface policy for user-visible terminal errors. Raw errors remain
+  // available on renderer.done for logs; the default preserves existing Slack
+  // rendering exactly.
+  mapPublicError?(error: string): string
   // How long buffered assistant text waits for plan/tasks to arrive before it
   // streams anyway. The check is event-driven — with no tasks and no further
   // events, buffered text sits until the next event or stream end — so
@@ -94,6 +98,7 @@ export class CodexAppServerRendererEventMapper
   private readonly unknownAgentMessagePhase: AgentMessagePhase
   private readonly includeTaskOutput: boolean
   private readonly preStreamGraceMs: number
+  private readonly mapPublicError: (error: string) => string
 
   constructor(options: CodexAppServerRendererEventMapperOptions = {}) {
     this.sessionId = options.sessionId ?? ''
@@ -101,6 +106,7 @@ export class CodexAppServerRendererEventMapper
     this.unknownAgentMessagePhase = options.unknownAgentMessagePhase ?? 'final_answer'
     this.includeTaskOutput = options.taskOutput === 'full'
     this.preStreamGraceMs = options.preStreamGraceMs ?? PRE_STREAM_GRACE_MS
+    this.mapPublicError = options.mapPublicError ?? (error => error || 'Execution failed')
   }
 
   process(source: ServerNotification | RustSessionStreamEvent | unknown): RendererEvent[] {
@@ -325,6 +331,7 @@ export class CodexAppServerRendererEventMapper
     if (this.state.done) return []
     this.state.done = true
     const out: RendererEvent[] = []
+    const publicError = this.mapPublicError(error)
     let hadOpenTask = false
     for (const [id, task] of this.state.taskByUseId) {
       if (task.status !== 'in_progress' && task.status !== 'pending') continue
@@ -336,12 +343,12 @@ export class CodexAppServerRendererEventMapper
         id: 'execution-error',
         title: 'Execution failed',
         status: 'error',
-        details: [section([text(error || 'Execution failed')])],
+        details: [section([text(publicError)])],
         output: []
       })
     }
     if (!this.state.answerText.trim()) {
-      this.state.harnessAnswerText += `Execution failed: ${error || 'Execution failed'}`
+      this.state.harnessAnswerText += `Execution failed: ${publicError}`
       recomposeBuffers(this.state)
     }
     this.emitActivitySummary(out, { final: true })

@@ -108,6 +108,84 @@ class ComposeSystemPromptTest(unittest.TestCase):
                 "base\n\n\n---\n\noverlay\n",
             )
 
+    def test_appends_inline_overlay_before_repo_overlays(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            (home / "AGENTS.md").write_text("base\n")
+
+            prompt = (
+                home
+                / "github"
+                / "acme"
+                / "overlay"
+                / "services"
+                / "sandbox"
+                / "SYSTEM_PROMPT.md"
+            )
+            prompt.parent.mkdir(parents=True)
+            prompt.write_text("repo overlay\n")
+
+            target = workspace / "AGENTS.md"
+            compose_system_prompt.compose_system_prompt(
+                home_dir=home,
+                target_prompt=target,
+                repo_mount=home / "github",
+                inline_overlay="inline overlay\n",
+            )
+
+            self.assertEqual(
+                target.read_text(),
+                "base\n\n\n---\n\ninline overlay\n\n\n---\n\nrepo overlay\n",
+            )
+
+    def test_deduplicates_inline_overlay_mounted_from_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            (home / "AGENTS.md").write_text("base\n")
+            prompt = home / "github" / "acme" / "overlay" / "services" / "sandbox" / "SYSTEM_PROMPT.md"
+            prompt.parent.mkdir(parents=True)
+            prompt.write_text("product prompt\n")
+
+            target = workspace / "AGENTS.md"
+            compose_system_prompt.compose_system_prompt(
+                home_dir=home,
+                target_prompt=target,
+                repo_mount=home / "github",
+                inline_overlay="product prompt\n",
+            )
+
+            self.assertEqual(
+                target.read_text(), "base\n\n\n---\n\nproduct prompt\n"
+            )
+
+    def test_replace_mode_uses_inline_prompt_without_baked_base(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            workspace = root / "workspace"
+            home.mkdir()
+            workspace.mkdir()
+            (home / "AGENTS.md").write_text("large development base\n")
+
+            target = workspace / "AGENTS.md"
+            compose_system_prompt.compose_system_prompt(
+                home_dir=home,
+                target_prompt=target,
+                repo_mount=home / "github",
+                inline_overlay="small product prompt\n",
+                prompt_mode="replace",
+            )
+
+            self.assertEqual(target.read_text(), "small product prompt\n")
+
 
 if __name__ == "__main__":
     unittest.main()

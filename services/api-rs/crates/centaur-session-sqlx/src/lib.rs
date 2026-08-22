@@ -3,9 +3,9 @@
 use std::{collections::BTreeMap, str::FromStr, time::Duration};
 
 use centaur_session_core::{
-    ExecutionStatus, HarnessType, MessageRole, SandboxCapabilities, SandboxRepoCacheAccess,
-    Session, SessionEvent, SessionExecution, SessionMessage, SessionMessageInput, SessionStatus,
-    ThreadKey, empty_object,
+    ChatDestination, ExecutionStatus, HarnessType, MessageRole, SandboxCapabilities,
+    SandboxRepoCacheAccess, Session, SessionEvent, SessionExecution, SessionMessage,
+    SessionMessageInput, SessionStatus, ThreadKey, empty_object,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -175,7 +175,7 @@ impl PgSessionStore {
     pub async fn get_session(&self, thread_key: &ThreadKey) -> Result<Session, SessionStoreError> {
         let row = sqlx::query_as::<_, SessionRow>(
             r#"
-            select thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            select thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, metadata, sandbox_last_active_at, created_at, updated_at
             from sessions
             where thread_key = $1
             "#,
@@ -1273,7 +1273,7 @@ impl PgSessionStore {
                 end,
                 updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, metadata, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1304,7 +1304,7 @@ impl PgSessionStore {
                 sandbox_last_active_at = now(),
                 updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, metadata, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1365,7 +1365,7 @@ impl PgSessionStore {
                 status = $3,
                 updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, metadata, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1390,7 +1390,7 @@ impl PgSessionStore {
             update sessions
             set iron_control_principal = $2, updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, metadata, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1416,7 +1416,7 @@ impl PgSessionStore {
             set iron_control_principal = $2, updated_at = now()
             where thread_key = $1
               and (iron_control_principal is null or iron_control_principal = $2)
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, metadata, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1499,7 +1499,7 @@ impl PgSessionStore {
         let sandbox_id = sqlx::query_scalar::<_, String>(
             r#"
             with candidate as (
-                select sandbox_id
+                select warm_candidate.sandbox_id
                 from session_warm_sandboxes
                 where workload_key = $1 and status = 'ready'
                 order by created_at, sandbox_id
@@ -1553,6 +1553,76 @@ impl PgSessionStore {
         Ok(rows)
     }
 
+    pub async fn reserve_obsolete_ready_warm_sandboxes(
+        &self,
+        current_workload_key: &str,
+        min_age: Duration,
+        limit: i64,
+    ) -> Result<Vec<String>, SessionStoreError> {
+        if limit < 1 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_scalar::<_, String>(
+            r#"
+            with candidates as (
+                select sandbox_id
+                from session_warm_sandboxes warm_candidate
+                where warm_candidate.status = 'ready'
+                  and warm_candidate.workload_key <> $1
+                  and warm_candidate.created_at <= now() - ($2::float8 * interval '1 second')
+                  and not exists (
+                      select 1
+                      from session_warm_pool_controllers controller
+                      where controller.workload_key = warm_candidate.workload_key
+                        and controller.lease_until > now()
+                  )
+                order by warm_candidate.created_at, warm_candidate.sandbox_id
+                limit $3
+                for update skip locked
+            )
+            update session_warm_sandboxes warm
+            set
+                status = 'evicting',
+                updated_at = now()
+            from candidates
+            where warm.sandbox_id = candidates.sandbox_id
+            returning warm.sandbox_id
+            "#,
+        )
+        .bind(current_workload_key)
+        .bind(min_age.as_secs_f64())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn heartbeat_warm_pool_controller(
+        &self,
+        workload_key: &str,
+        controller_id: &str,
+        lease: Duration,
+    ) -> Result<(), SessionStoreError> {
+        sqlx::query(
+            r#"
+            insert into session_warm_pool_controllers
+                (workload_key, controller_id, lease_until)
+            values ($1, $2, now() + ($3::float8 * interval '1 second'))
+            on conflict (workload_key, controller_id) do update
+            set lease_until = excluded.lease_until, updated_at = now()
+            "#,
+        )
+        .bind(workload_key)
+        .bind(controller_id)
+        .bind(lease.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("delete from session_warm_pool_controllers where lease_until <= now()")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn list_stale_evicting_warm_sandbox_ids(
         &self,
         min_age: Duration,
@@ -1601,7 +1671,7 @@ impl PgSessionStore {
             update sessions
             set harness_thread_id = $2, updated_at = now()
             where thread_key = $1
-            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, sandbox_last_active_at, created_at, updated_at
+            returning thread_key, title, sandbox_id, sandbox_repo_cache_enabled, sandbox_repo_cache_access, sandbox_observability_enabled, harness_type, harness_thread_id, persona_id, status, iron_control_principal, proxy_labels, metadata, sandbox_last_active_at, created_at, updated_at
             "#,
         )
         .bind(thread_key.as_str())
@@ -1756,6 +1826,7 @@ struct SessionRow {
     status: String,
     iron_control_principal: Option<String>,
     proxy_labels: Json<BTreeMap<String, String>>,
+    metadata: Value,
     sandbox_last_active_at: Option<OffsetDateTime>,
     created_at: OffsetDateTime,
     updated_at: OffsetDateTime,
@@ -1767,6 +1838,17 @@ impl TryFrom<SessionRow> for Session {
     fn try_from(row: SessionRow) -> Result<Self, Self::Error> {
         Ok(Self {
             thread_key: parse_persisted(row.thread_key)?,
+            chat_destination: row
+                .metadata
+                .get("chat_destination")
+                .cloned()
+                .map(serde_json::from_value::<ChatDestination>)
+                .transpose()
+                .map_err(|error| {
+                    SessionStoreError::InvalidPersistedValue(format!(
+                        "session chat_destination: {error}"
+                    ))
+                })?,
             title: row.title,
             sandbox_id: row.sandbox_id,
             sandbox_capabilities: match (
@@ -2174,6 +2256,35 @@ mod tests {
                 .expect("get session")
                 .proxy_labels,
             labels
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binding_principal_returns_complete_session_row() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:principal-binding-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({"source": "principal-binding-test"}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+
+        let session = store
+            .bind_iron_control_principal(&thread_key, "principal-test")
+            .await
+            .expect("bind principal");
+
+        assert_eq!(
+            session.iron_control_principal.as_deref(),
+            Some("principal-test")
         );
     }
 
