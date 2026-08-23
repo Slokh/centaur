@@ -1,5 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { MemoryDiscordEventSinkOutbox } from "../src/discord-event-sink-outbox";
+import {
+  MemoryDiscordEventSinkOutbox,
+  PostgresDiscordEventSinkOutbox,
+} from "../src/discord-event-sink-outbox";
 import {
   discordAttachmentExpiry,
   ingestObservedDiscordMessage,
@@ -9,6 +12,32 @@ import {
 import type { DiscordbotOptions } from "../src/types";
 
 describe("Discord event sink", () => {
+  it("owns its schema migration namespace", async () => {
+    const queries: string[] = [];
+    const client = {
+      query: async (text: string) => {
+        queries.push(text);
+        return { rows: [] };
+      },
+      release: () => undefined,
+    };
+    const pool = {
+      connect: async () => client,
+      end: async () => undefined,
+      query: async () => ({ rows: [] }),
+    };
+    const outbox = new PostgresDiscordEventSinkOutbox({
+      pool: pool as never,
+    });
+
+    await outbox.connect();
+
+    const schema = queries.join("\n");
+    expect(schema).toContain("component = 'discord_event_sink_outbox'");
+    expect(schema).toContain("VALUES ('discord_event_sink_outbox', 1)");
+    expect(schema).toContain("CREATE TABLE IF NOT EXISTS discord_event_sink_outbox");
+  });
+
   it("discards successful sink response bodies", async () => {
     let cancelled = false;
     const options = {

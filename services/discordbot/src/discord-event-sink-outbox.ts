@@ -60,7 +60,7 @@ implements DiscordEventSinkOutbox {
       await client.query("BEGIN");
       await client.query(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-        ["centaur:discord-discord-event-sink-outbox:schema"],
+        ["centaur:discord-event-sink-outbox:schema"],
       );
       await client.query(`
         CREATE TABLE IF NOT EXISTS discordbot_schema_migrations (
@@ -72,7 +72,7 @@ implements DiscordEventSinkOutbox {
       `);
       const applied = await client.query<{ version: number }>(`
         SELECT version FROM discordbot_schema_migrations
-        WHERE component = 'event_sink_outbox'
+        WHERE component = 'discord_event_sink_outbox'
       `);
       const versions = new Set(applied.rows.map((row) => row.version));
       if (!versions.has(1)) {
@@ -98,7 +98,7 @@ implements DiscordEventSinkOutbox {
         `);
         await client.query(`
           INSERT INTO discordbot_schema_migrations(component, version)
-          VALUES ('event_sink_outbox', 1)
+          VALUES ('discord_event_sink_outbox', 1)
         `);
       }
       if (!versions.has(2)) {
@@ -109,7 +109,7 @@ implements DiscordEventSinkOutbox {
         `);
         await client.query(`
           INSERT INTO discordbot_schema_migrations(component, version)
-          VALUES ('event_sink_outbox', 2)
+          VALUES ('discord_event_sink_outbox', 2)
         `);
       }
       await client.query("COMMIT");
