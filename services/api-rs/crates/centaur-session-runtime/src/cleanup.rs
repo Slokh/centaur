@@ -177,10 +177,12 @@ fn orphan_reap_eligible(sandbox: &ObservedSandbox, referenced: &BTreeSet<String>
     if sandbox.labels.get(COMPONENT_LABEL).map(String::as_str) == Some(WORKFLOW_RUN_COMPONENT) {
         return false;
     }
-    !matches!(
-        sandbox.status,
-        SandboxStatus::Created | SandboxStatus::Stopped | SandboxStatus::Gone
-    )
+    // `list_observed` only returns backend resources that still exist. In the
+    // Kubernetes backend, a Sandbox CR with a terminal pod is reported as
+    // `Stopped` or `Gone`; those resources still need an idempotent `stop` so
+    // the CR and its proxy resources are deleted. Only `Created` is excluded
+    // because it may still be racing normal startup and assignment.
+    sandbox.status != SandboxStatus::Created
 }
 
 #[cfg(test)]
@@ -233,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn created_and_terminal_sandboxes_are_not_reaped() {
+    fn created_sandbox_is_not_reaped_but_terminal_resources_are() {
         let observed = [
             observed("asbx-created", SandboxStatus::Created),
             observed("asbx-stopped", SandboxStatus::Stopped),
@@ -247,9 +249,12 @@ mod tests {
 
         assert_eq!(
             select_orphan_reap_candidates(&observed, &referenced(&[]), &mut pending),
-            Vec::<String>::new()
+            vec!["asbx-gone".to_owned(), "asbx-stopped".to_owned()]
         );
-        assert!(pending.is_empty());
+        assert_eq!(
+            pending,
+            BTreeSet::from(["asbx-gone".to_owned(), "asbx-stopped".to_owned()])
+        );
     }
 
     #[test]

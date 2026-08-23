@@ -74,6 +74,10 @@ pub struct AgentSandboxConfig {
     pub tolerations: Vec<Toleration>,
     /// RuntimeClass for sandbox and iron-proxy pods (e.g. `gvisor`).
     pub runtime_class_name: Option<String>,
+    /// PriorityClass shared by sandbox and iron-proxy pods. Operators can set
+    /// this below control-plane workloads so core services preempt disposable
+    /// execution capacity during node loss or saturation.
+    pub priority_class_name: Option<String>,
     pub state_volume: Option<StateVolumeConfig>,
     pub iron_proxy: Option<IronProxyConfig>,
     pub iron_control: IronControlSettings,
@@ -130,6 +134,7 @@ impl AgentSandboxConfig {
             node_selector: BTreeMap::new(),
             tolerations: Vec::new(),
             runtime_class_name: None,
+            priority_class_name: None,
             state_volume: None,
             iron_proxy: None,
             iron_control,
@@ -241,9 +246,8 @@ impl AgentSandboxBackend {
         id: &SandboxId,
         sandbox: &crd::Sandbox,
     ) -> SandboxResult<ObservedSandbox> {
-        let replicas = sandbox.spec.replicas.unwrap_or(1);
         let pod = self.get_pod(id).await?;
-        let status = sandbox_status_from_pod(replicas, pod.as_ref());
+        let status = sandbox_status(sandbox, pod.as_ref());
         Ok(ObservedSandbox::new(id.clone(), BACKEND_NAME, status)
             .with_labels(sandbox.metadata.labels.clone().unwrap_or_default())
             .with_created_at(sandbox_creation_time(sandbox))
@@ -414,9 +418,8 @@ impl SandboxBackend for AgentSandboxBackend {
         let Some(sandbox) = self.get_sandbox(id).await? else {
             return Ok(SandboxStatus::Gone);
         };
-        let replicas = sandbox.spec.replicas.unwrap_or(1);
         let pod = self.get_pod(id).await?;
-        Ok(sandbox_status_from_pod(replicas, pod.as_ref()))
+        Ok(sandbox_status(&sandbox, pod.as_ref()))
     }
 
     async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
@@ -492,7 +495,11 @@ impl SandboxBackend for AgentSandboxBackend {
 
     async fn pause(&self, id: &SandboxId) -> SandboxResult<()> {
         self.patch_sandbox_merge(id, sandbox_pause_patch(jiff::Timestamp::now()))
-            .await
+            .await?;
+        // A paused agent consumes no compute, so its one-to-one managed proxy
+        // must not keep consuming a pod slot. `resume` recreates and re-adopts
+        // all proxy resources before scaling the agent back up.
+        self.delete_iron_proxy_resources(id).await
     }
 
     async fn resume(&self, id: &SandboxId) -> SandboxResult<()> {
@@ -613,6 +620,19 @@ fn sandbox_paused_at(sandbox: &crd::Sandbox) -> Option<SystemTime> {
         .get(PAUSED_AT_ANNOTATION)?;
     let timestamp = raw.parse::<jiff::Timestamp>().ok()?;
     Some(SystemTime::from(timestamp))
+}
+
+fn sandbox_status(sandbox: &crd::Sandbox, pod: Option<&Pod>) -> SandboxStatus {
+    // Kubernetes keeps terminating objects readable until finalization. They
+    // cannot be resumed: patches may be accepted while their backing pod is
+    // permanently stuck terminating on a lost node. Treat the assignment as
+    // gone so callers replace it immediately instead of waiting the full
+    // sandbox readiness timeout and recreating proxy resources for a doomed
+    // owner.
+    if sandbox.metadata.deletion_timestamp.is_some() {
+        return SandboxStatus::Gone;
+    }
+    sandbox_status_from_pod(sandbox.spec.replicas.unwrap_or(1), pod)
 }
 
 fn sandbox_status_from_pod(replicas: i32, pod: Option<&Pod>) -> SandboxStatus {
@@ -823,6 +843,15 @@ fn build_agent_sandbox(
         "runtimeClassName",
         config
             .runtime_class_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty()),
+    );
+    insert_optional(
+        &mut pod_spec,
+        "priorityClassName",
+        config
+            .priority_class_name
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty()),
@@ -1116,6 +1145,7 @@ mod tests {
             ..Default::default()
         }];
         config.runtime_class_name = Some("gvisor".to_owned());
+        config.priority_class_name = Some("sandbox-low".to_owned());
 
         let sandbox = build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
         let pod_spec = &sandbox.spec.pod_template.spec;
@@ -1136,6 +1166,7 @@ mod tests {
         assert_eq!(tolerations[0].key.as_deref(), Some("example.com/sandbox"));
         assert_eq!(tolerations[0].effect.as_deref(), Some("NoSchedule"));
         assert_eq!(pod_spec.runtime_class_name.as_deref(), Some("gvisor"));
+        assert_eq!(pod_spec.priority_class_name.as_deref(), Some("sandbox-low"));
     }
 
     #[test]
@@ -1147,6 +1178,7 @@ mod tests {
         let pod_spec = &sandbox.spec.pod_template.spec;
 
         assert!(pod_spec.node_selector.is_none());
+        assert!(pod_spec.priority_class_name.is_none());
         assert!(pod_spec.tolerations.is_none());
         assert!(pod_spec.runtime_class_name.is_none());
     }
@@ -1450,6 +1482,23 @@ mod tests {
         assert_eq!(
             sandbox_status_from_pod(1, Some(&failed_pod)),
             SandboxStatus::Stopped
+        );
+    }
+
+    #[test]
+    fn deleting_agent_sandbox_is_gone_even_while_suspended_pod_remains() {
+        let spec = SandboxSpec::new("centaur-agent:latest");
+        let config = AgentSandboxConfig::new("centaur", test_iron_control_settings());
+        let mut sandbox =
+            build_agent_sandbox(&SandboxId::new("asbx-test"), &spec, &config).unwrap();
+        sandbox.spec.replicas = Some(0);
+        sandbox.metadata.deletion_timestamp =
+            Some(serde_json::from_value(json!("2026-08-17T22:00:00Z")).unwrap());
+
+        let ready_pod = pod_with_phase_and_ready("Running", true);
+        assert_eq!(
+            sandbox_status(&sandbox, Some(&ready_pod)),
+            SandboxStatus::Gone
         );
     }
 

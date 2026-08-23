@@ -39,6 +39,25 @@ app.kubernetes.io/component: {{ .component }}
 {{- printf "%s-%s" (include "centaur.fullname" .root) .component | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{- define "centaur.imageRef" -}}
+{{- if .digest -}}
+{{- printf "%s@%s" .repository .digest -}}
+{{- else -}}
+{{- printf "%s:%s" .repository .tag -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "centaur.inheritedImageRef" -}}
+{{- $customImage := or .override.repository .override.tag .override.digest -}}
+{{- $repository := default .base.repository .override.repository -}}
+{{- $tag := default .base.tag .override.tag -}}
+{{- $digest := .base.digest -}}
+{{- if $customImage -}}
+{{- $digest = .override.digest -}}
+{{- end -}}
+{{- include "centaur.imageRef" (dict "repository" $repository "tag" $tag "digest" $digest) -}}
+{{- end -}}
+
 {{- define "centaur.secretEnvName" -}}
 {{- required "secretManager.existingSecretName is required" .Values.secretManager.existingSecretName | trunc 63 | trimSuffix "-" -}}
 {{- end -}}

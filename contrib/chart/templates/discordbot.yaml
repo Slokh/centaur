@@ -23,6 +23,9 @@ spec:
       labels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "discordbot") | nindent 8 }}
     spec:
+      {{- with .Values.global.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
       automountServiceAccountToken: false
       # Allow the Gateway to drain and close cleanly on SIGTERM (protects the IDENTIFY budget).
       terminationGracePeriodSeconds: 35
@@ -32,7 +35,7 @@ spec:
       {{- end }}
       containers:
         - name: discordbot
-          image: {{ printf "%s:%s" .Values.discordbot.image.repository .Values.discordbot.image.tag | quote }}
+          image: {{ include "centaur.imageRef" .Values.discordbot.image | quote }}
           imagePullPolicy: {{ .Values.discordbot.image.pullPolicy }}
           env:
             - name: PORT

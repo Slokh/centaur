@@ -1611,6 +1611,76 @@ impl PgSessionStore {
         Ok(rows)
     }
 
+    pub async fn reserve_obsolete_ready_warm_sandboxes(
+        &self,
+        current_workload_key: &str,
+        min_age: Duration,
+        limit: i64,
+    ) -> Result<Vec<String>, SessionStoreError> {
+        if limit < 1 {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query_scalar::<_, String>(
+            r#"
+            with candidates as (
+                select sandbox_id
+                from session_warm_sandboxes warm_candidate
+                where warm_candidate.status = 'ready'
+                  and warm_candidate.workload_key <> $1
+                  and warm_candidate.created_at <= now() - ($2::float8 * interval '1 second')
+                  and not exists (
+                      select 1
+                      from session_warm_pool_controllers controller
+                      where controller.workload_key = warm_candidate.workload_key
+                        and controller.lease_until > now()
+                  )
+                order by warm_candidate.created_at, warm_candidate.sandbox_id
+                limit $3
+                for update skip locked
+            )
+            update session_warm_sandboxes warm
+            set
+                status = 'evicting',
+                updated_at = now()
+            from candidates
+            where warm.sandbox_id = candidates.sandbox_id
+            returning warm.sandbox_id
+            "#,
+        )
+        .bind(current_workload_key)
+        .bind(min_age.as_secs_f64())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    pub async fn heartbeat_warm_pool_controller(
+        &self,
+        workload_key: &str,
+        controller_id: &str,
+        lease: Duration,
+    ) -> Result<(), SessionStoreError> {
+        sqlx::query(
+            r#"
+            insert into session_warm_pool_controllers
+                (workload_key, controller_id, lease_until)
+            values ($1, $2, now() + ($3::float8 * interval '1 second'))
+            on conflict (workload_key, controller_id) do update
+            set lease_until = excluded.lease_until, updated_at = now()
+            "#,
+        )
+        .bind(workload_key)
+        .bind(controller_id)
+        .bind(lease.as_secs_f64())
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("delete from session_warm_pool_controllers where lease_until <= now()")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn list_stale_evicting_warm_sandbox_ids(
         &self,
         min_age: Duration,
