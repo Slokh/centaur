@@ -53,6 +53,17 @@ ingress**. `GET /live` reflects the process; `GET /ready` (and compatibility
 | `DISCORDBOT_PROGRESS_MODE` | – | `narration` (default) or `reactions` to suppress public progress text. |
 | `DISCORDBOT_RESPONSE_METADATA_MODE` | – | `first`, `always`, or `never` (default) for the completed-response metadata footer. |
 | `DISCORDBOT_RESPONSE_LATENCY_ENABLED` | – | Set `true` to include end-to-end latency when the metadata footer is rendered. |
+| `DISCORDBOT_EVENT_SINK_URL` / `DISCORDBOT_EVENT_SINK_TOKEN` | – | Optional private Discord event sink. Both are required to enable delivery. |
+| `DISCORDBOT_EVENT_SINK_WORKER_ENABLED` | – | Set `true` when the separate durable delivery worker is running. The chart wires this automatically. Without it, live observations use direct best-effort delivery. |
+| `DISCORDBOT_EVENT_SINK_RECOVERY_INTERVAL_MS` | – | Worker recovery poll interval (default `1000`). |
+| `DISCORDBOT_EVENT_SINK_RECOVERY_BATCH_SIZE` | – | Worker claim size (default `25`, maximum `1000`). |
+| `DISCORDBOT_EVENT_SINK_RECOVERY_CONCURRENCY` | – | Worker delivery concurrency (default `4`). |
+| `DISCORDBOT_EVENT_SINK_RECOVERY_LEASE_MS` | – | Claim lease before crashed work is eligible again (default `300000`). |
+| `DISCORDBOT_EVENT_SINK_DELIVERY_TIMEOUT_MS` | – | Per-delivery HTTP deadline (default `15000`). |
+| `DISCORDBOT_EVENT_SINK_ARCHIVE_RECONCILIATION_ENABLED` | – | Worker-only opt-in switch for Discord REST history reconciliation (default `false`). |
+| `DISCORDBOT_EVENT_SINK_ARCHIVE_RECONCILIATION_INTERVAL_SECONDS` | – | Worker archive interval in seconds (default `60`). Overlapping passes are coalesced. |
+| `DISCORDBOT_EVENT_SINK_ARCHIVE_RECONCILIATION_CONCURRENCY` | – | Maximum concurrent Discord REST requests during archive reconciliation (default `4`). |
+| `DISCORDBOT_EVENT_SINK_ARCHIVE_BACKLOG_HIGH_WATERMARK` | – | Pause archive growth when pending sink deliveries reach this count (default `10000`). |
 | `DISCORDBOT_USER_NAME` | – | Bot display name used for mention parsing/thread naming (default `centaur`; the chart sets it from `discordbot.userName`). |
 | `DISCORDBOT_STATE_KEY_PREFIX` | – | Prefix for rows in the Postgres thread-state store (default `centaur-discordbot`). |
 | `DISCORD_API_URL` | – | Override Discord API base. |
@@ -89,13 +100,15 @@ reply end-to-end. The spike has served its purpose and been removed.
 bun run check:types   # tsgo
 bun test test         # allowlist, threading, gateway controller (no Discord needed)
 bun run dev           # run the server locally (needs env above)
+bun run start:worker  # run the Discord event sink worker
 ```
 
 ## Known limitations
 
 - The Gateway listener can't expose the precise close code on a fatal end. An
   unexpected end or connection that stays stale exits the process so
-  Kubernetes replaces it.
+  Kubernetes replaces it. Archive reconciliation and application delivery run
+  in the separately restartable event-sink worker and cannot OOM the Gateway.
 - Concurrency uses a bounded queue per logical conversation. Follow-ups that arrive during a run
   are appended in order; overflowing or expired queue entries are surfaced to the member.
 - Thread renaming is best-effort, applies on the first execution, and only touches threads the
