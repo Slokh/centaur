@@ -1557,7 +1557,7 @@ impl PgSessionStore {
         let sandbox_id = sqlx::query_scalar::<_, String>(
             r#"
             with candidate as (
-                select warm_candidate.sandbox_id
+                select sandbox_id
                 from session_warm_sandboxes
                 where workload_key = $1 and status = 'ready'
                 order by created_at, sandbox_id
@@ -2786,6 +2786,43 @@ mod tests {
                 .expect("release for peer")
                 .is_empty()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_warm_sandbox_can_be_claimed() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let sandbox_id = format!("sbx-warm-claim-{}", Uuid::new_v4());
+        let workload_key = format!("workload-warm-claim-{}", Uuid::new_v4());
+        let thread_key = ThreadKey::parse(format!("test:warm-claim-{}", Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(
+                &thread_key,
+                &HarnessType::Codex,
+                None,
+                json!({"source": "warm-claim-test"}),
+                Default::default(),
+            )
+            .await
+            .expect("create session");
+        store
+            .insert_ready_warm_sandbox(&sandbox_id, &workload_key)
+            .await
+            .expect("insert warm sandbox");
+
+        assert_eq!(
+            store
+                .claim_ready_warm_sandbox(&workload_key, thread_key.as_str())
+                .await
+                .expect("claim ready warm sandbox"),
+            Some(sandbox_id.clone())
+        );
+
+        store
+            .mark_warm_sandbox_failed(&sandbox_id, "test cleanup")
+            .await
+            .expect("mark claimed warm sandbox failed");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
